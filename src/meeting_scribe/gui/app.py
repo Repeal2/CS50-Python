@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from meeting_scribe.ai.search import ask as ask_project
 from meeting_scribe.config import Settings, load_settings
@@ -43,6 +43,18 @@ class MeetingScribeApp(tk.Tk):
         self._record_tab.refresh_projects()
         self._projects_tab.refresh_projects()
 
+    def prompt_new_project(self) -> None:
+        """Opens a small dialog to create a project by name, then refreshes both tabs and selects the
+        new project in whichever one triggered this, so it's immediately usable without hunting for it
+        in the list."""
+        name = simpledialog.askstring("New Project", "Project name:", parent=self)
+        if not name or not name.strip():
+            return
+        project = self.db.get_or_create_project(name.strip())
+        self.refresh_project_lists()
+        self._record_tab.select_project(project.name)
+        self._projects_tab.select_project(project.name)
+
     def _on_close(self) -> None:
         self.db.close()
         self.destroy()
@@ -63,6 +75,9 @@ class RecordTab(ttk.Frame):
         self.project_var = tk.StringVar()
         self.project_combo = ttk.Combobox(form, textvariable=self.project_var, width=40)
         self.project_combo.grid(row=0, column=1, sticky="we", padx=6, pady=4)
+        ttk.Button(form, text="Add Project", command=self.app.prompt_new_project).grid(
+            row=0, column=2, padx=(6, 0)
+        )
 
         ttk.Label(form, text="Meeting title").grid(row=1, column=0, sticky="w")
         self.title_var = tk.StringVar(value="Untitled meeting")
@@ -91,8 +106,13 @@ class RecordTab(ttk.Frame):
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=12, pady=(8, 0))
 
-        self.output = tk.Text(self, wrap="word")
-        self.output.pack(fill="both", expand=True, padx=12, pady=12)
+        output_frame = ttk.Frame(self)
+        output_frame.pack(fill="both", expand=True, padx=12, pady=12)
+        self.output = tk.Text(output_frame, wrap="word")
+        output_scrollbar = ttk.Scrollbar(output_frame, orient="vertical", command=self.output.yview)
+        self.output.configure(yscrollcommand=output_scrollbar.set)
+        self.output.pack(side="left", fill="both", expand=True)
+        output_scrollbar.pack(side="right", fill="y")
 
         self.refresh_projects()
         self._refresh_windows()
@@ -100,6 +120,9 @@ class RecordTab(ttk.Frame):
     def refresh_projects(self) -> None:
         names = [p.name for p in self.app.db.list_projects()]
         self.project_combo["values"] = names
+
+    def select_project(self, name: str) -> None:
+        self.project_var.set(name)
 
     def _refresh_windows(self) -> None:
         """Repopulates the screen-source dropdown with currently open, titled windows the user can
@@ -185,14 +208,34 @@ class ProjectsTab(ttk.Frame):
         left = ttk.Frame(self)
         left.pack(side="left", fill="y", padx=12, pady=12)
 
-        ttk.Label(left, text="Projects").pack(anchor="w")
-        self.project_list = tk.Listbox(left, width=28, height=10, exportselection=False)
-        self.project_list.pack()
+        projects_header = ttk.Frame(left)
+        projects_header.pack(fill="x")
+        ttk.Label(projects_header, text="Projects").pack(side="left")
+        ttk.Button(projects_header, text="Add Project", command=self.app.prompt_new_project).pack(
+            side="right"
+        )
+
+        project_list_frame = ttk.Frame(left)
+        project_list_frame.pack(fill="both", expand=True)
+        self.project_list = tk.Listbox(project_list_frame, width=28, height=10, exportselection=False)
+        project_list_scrollbar = ttk.Scrollbar(
+            project_list_frame, orient="vertical", command=self.project_list.yview
+        )
+        self.project_list.configure(yscrollcommand=project_list_scrollbar.set)
+        self.project_list.pack(side="left", fill="both", expand=True)
+        project_list_scrollbar.pack(side="right", fill="y")
         self.project_list.bind("<<ListboxSelect>>", self._on_project_selected)
 
         ttk.Label(left, text="Meetings").pack(anchor="w", pady=(12, 0))
-        self.meeting_list = tk.Listbox(left, width=28, height=10, exportselection=False)
-        self.meeting_list.pack()
+        meeting_list_frame = ttk.Frame(left)
+        meeting_list_frame.pack(fill="both", expand=True)
+        self.meeting_list = tk.Listbox(meeting_list_frame, width=28, height=10, exportselection=False)
+        meeting_list_scrollbar = ttk.Scrollbar(
+            meeting_list_frame, orient="vertical", command=self.meeting_list.yview
+        )
+        self.meeting_list.configure(yscrollcommand=meeting_list_scrollbar.set)
+        self.meeting_list.pack(side="left", fill="both", expand=True)
+        meeting_list_scrollbar.pack(side="right", fill="y")
         self.meeting_list.bind("<<ListboxSelect>>", self._on_meeting_selected)
 
         ttk.Button(left, text="Upload Document…", command=self._upload_document).pack(
@@ -202,8 +245,13 @@ class ProjectsTab(ttk.Frame):
         right = ttk.Frame(self)
         right.pack(side="left", fill="both", expand=True, padx=12, pady=12)
 
-        self.viewer = tk.Text(right, wrap="word", height=18)
-        self.viewer.pack(fill="both", expand=True)
+        viewer_frame = ttk.Frame(right)
+        viewer_frame.pack(fill="both", expand=True)
+        self.viewer = tk.Text(viewer_frame, wrap="word", height=18)
+        viewer_scrollbar = ttk.Scrollbar(viewer_frame, orient="vertical", command=self.viewer.yview)
+        self.viewer.configure(yscrollcommand=viewer_scrollbar.set)
+        self.viewer.pack(side="left", fill="both", expand=True)
+        viewer_scrollbar.pack(side="right", fill="y")
 
         ask_row = ttk.Frame(right)
         ask_row.pack(fill="x", pady=(8, 0))
@@ -226,6 +274,15 @@ class ProjectsTab(ttk.Frame):
         if not selection:
             return None
         return self._projects[selection[0]]
+
+    def select_project(self, name: str) -> None:
+        for index, project in enumerate(self._projects):
+            if project.name == name:
+                self.project_list.selection_clear(0, "end")
+                self.project_list.selection_set(index)
+                self.project_list.see(index)
+                self._on_project_selected(None)
+                return
 
     def _on_project_selected(self, _event) -> None:
         project = self._selected_project()
