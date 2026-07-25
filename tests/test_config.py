@@ -1,6 +1,12 @@
 import sys
 
-from meeting_scribe.config import DEFAULT_MODEL, load_settings, resolve_tesseract_cmd, update_settings
+from meeting_scribe.config import (
+    DEFAULT_MODEL,
+    load_settings,
+    resolve_tesseract_cmd,
+    update_audio_devices,
+    update_settings,
+)
 
 
 def test_explicit_path_wins(monkeypatch):
@@ -78,3 +84,45 @@ def test_update_settings_treats_blank_key_as_cleared(tmp_path, monkeypatch):
     cleared = update_settings(load_settings(), anthropic_api_key="", anthropic_model=DEFAULT_MODEL)
 
     assert cleared.anthropic_api_key is None
+
+
+def test_load_settings_defaults_to_no_device_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = load_settings()
+
+    assert settings.mic_device_name is None
+    assert settings.system_device_name is None
+
+
+def test_update_audio_devices_persists_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_audio_devices(
+        load_settings(), mic_device_name="USB Mic", system_device_name="Speakers (Realtek)"
+    )
+
+    reloaded = load_settings()
+    assert reloaded.mic_device_name == "USB Mic"
+    assert reloaded.system_device_name == "Speakers (Realtek)"
+
+
+def test_update_audio_devices_can_reset_to_system_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    cleared = update_audio_devices(load_settings(), mic_device_name=None, system_device_name=None)
+
+    assert cleared.mic_device_name is None
+    assert cleared.system_device_name is None
+
+
+def test_update_audio_devices_does_not_clobber_api_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = update_settings(load_settings(), anthropic_api_key="sk-test", anthropic_model=DEFAULT_MODEL)
+    update_audio_devices(settings, mic_device_name="USB Mic", system_device_name=None)
+
+    reloaded = load_settings()
+    assert reloaded.anthropic_api_key == "sk-test"
+    assert reloaded.mic_device_name == "USB Mic"

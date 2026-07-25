@@ -8,7 +8,7 @@ from meeting_scribe.storage.database import Database
 from meeting_scribe.transcription.engine import TranscriptLine
 
 
-def _settings(tmp_path: Path) -> Settings:
+def _settings(tmp_path: Path, mic_device_name=None, system_device_name=None) -> Settings:
     return Settings(
         data_dir=tmp_path,
         anthropic_api_key=None,
@@ -16,6 +16,8 @@ def _settings(tmp_path: Path) -> Settings:
         whisper_model_size="tiny",
         tesseract_cmd=None,
         screen_capture_interval_seconds=3.0,
+        mic_device_name=mic_device_name,
+        system_device_name=system_device_name,
     )
 
 
@@ -67,3 +69,37 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
             assert meeting.transcript_text == result
             segments = db.get_segments(session.meeting_id)
             assert len(segments) == 3
+
+
+def test_session_passes_chosen_devices_to_recorder(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path, mic_device_name="USB Mic", system_device_name="Speakers")
+            MeetingSession(settings, db, "Test Project", "Kickoff")
+
+            _args, kwargs = MockRecorder.call_args
+            assert kwargs["mic_device_name"] == "USB Mic"
+            assert kwargs["system_device_name"] == "Speakers"
+
+
+def test_session_audio_levels_reads_through_to_recorder(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.mic_level = 0.42
+        recorder_instance.system_level = 0.13
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            assert session.audio_levels() == (0.42, 0.13)

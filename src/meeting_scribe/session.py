@@ -38,7 +38,11 @@ class MeetingSession:
         meeting_dir = settings.meeting_dir(self.project.slug, self.meeting_id)
         meeting_dir.mkdir(parents=True, exist_ok=True)
 
-        self._recorder = Recorder(meeting_dir)
+        self._recorder = Recorder(
+            meeting_dir,
+            mic_device_name=settings.mic_device_name,
+            system_device_name=settings.system_device_name,
+        )
         self._screen_events: list[ScreenTextEvent] = []
         self._screen_watcher = ScreenWatcher(
             on_text=self._screen_events.append,
@@ -51,6 +55,11 @@ class MeetingSession:
     def start(self) -> None:
         self._recorder.start()
         self._screen_watcher.start()
+
+    def audio_levels(self) -> tuple[float, float]:
+        """Current (mic, system) input levels, roughly 0..1 — lets the GUI show a live "is this actually
+        picking up audio" meter while recording. Both are 0.0 before start() or after stop()."""
+        return self._recorder.mic_level, self._recorder.system_level
 
     def stop(self) -> str:
         """Stops recording, transcribes, generates notes, and saves the meeting. Returns the notes

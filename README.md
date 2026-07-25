@@ -6,7 +6,10 @@ screen, and turns the meeting into a searchable record.
 ## What it does
 
 - **Records audio** from the microphone *and* the system output (WASAPI loopback), so it captures both
-  sides of a call even when remote participants' audio never touches the mic.
+  sides of a call even when remote participants' audio never touches the mic. If a machine has more than
+  one mic or speaker, the Settings tab lets you pick which one gets recorded instead of always trusting
+  whatever Windows currently calls "default" — and the Record tab shows a live input-level meter for
+  each, so you can actually see it's picking up audio rather than guessing.
 - **Watches the screen** at a low frame rate and OCRs it, so on-screen captions, shared slides, and chat
   messages become part of the transcript even if they're never spoken aloud. You can point this at the
   whole screen or at a single selected window (e.g. just the Teams/Zoom window), so it doesn't also OCR

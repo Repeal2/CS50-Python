@@ -62,6 +62,10 @@ class Settings:
     whisper_model_size: str
     tesseract_cmd: str | None
     screen_capture_interval_seconds: float
+    # None means "use whatever Windows currently considers the default" for that device — the
+    # historical/simple behavior, and still the default until the user picks something explicit.
+    mic_device_name: str | None = None
+    system_device_name: str | None = None
 
     @property
     def db_path(self) -> Path:
@@ -95,20 +99,33 @@ def _load_user_config(data_dir: Path) -> dict:
 
 
 def save_user_config(settings: Settings) -> None:
-    """Persists the user-editable settings (API key, model) so they survive a restart without the user
-    needing to set environment variables — the GUI's Settings tab calls this after Save."""
+    """Persists the user-editable settings (API key, model, chosen audio devices) so they survive a
+    restart without the user needing to set environment variables — the GUI's Settings tab calls this
+    after Save."""
     path = _user_config_path(settings.data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "anthropic_api_key": settings.anthropic_api_key,
         "anthropic_model": settings.anthropic_model,
+        "mic_device_name": settings.mic_device_name,
+        "system_device_name": settings.system_device_name,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def update_settings(settings: Settings, *, anthropic_api_key: str | None, anthropic_model: str) -> Settings:
-    """Applies and persists a Settings tab edit, returning the new Settings to use from then on."""
+    """Applies and persists an API key / model edit from the Settings tab."""
     updated = replace(settings, anthropic_api_key=anthropic_api_key or None, anthropic_model=anthropic_model)
+    save_user_config(updated)
+    return updated
+
+
+def update_audio_devices(
+    settings: Settings, *, mic_device_name: str | None, system_device_name: str | None
+) -> Settings:
+    """Applies and persists a microphone / system-audio device choice from the Settings tab. None means
+    "use whatever Windows currently considers the default" for that device."""
+    updated = replace(settings, mic_device_name=mic_device_name, system_device_name=system_device_name)
     save_user_config(updated)
     return updated
 
@@ -136,4 +153,6 @@ def load_settings() -> Settings:
         screen_capture_interval_seconds=float(
             os.environ.get("MEETING_SCRIBE_SCREEN_INTERVAL", "3.0")
         ),
+        mic_device_name=user_config.get("mic_device_name"),
+        system_device_name=user_config.get("system_device_name"),
     )

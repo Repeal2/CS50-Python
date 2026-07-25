@@ -14,7 +14,13 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from meeting_scribe.ai.search import ask as ask_project
-from meeting_scribe.config import AVAILABLE_MODELS, Settings, load_settings, update_settings
+from meeting_scribe.config import (
+    AVAILABLE_MODELS,
+    Settings,
+    load_settings,
+    update_audio_devices,
+    update_settings,
+)
 from meeting_scribe.session import MeetingSession
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text
@@ -150,6 +156,27 @@ class RecordTab(ttk.Frame):
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=12, pady=(8, 0))
 
+        # Live input meters — the only way to actually confirm a device is picking up audio, rather
+        # than just trusting that "Recording" means something is coming through.
+        levels_frame = ttk.Frame(self)
+        levels_frame.pack(fill="x", padx=12, pady=(8, 0))
+        ttk.Label(levels_frame, text="Mic level").grid(row=0, column=0, sticky="w")
+        self.mic_level_bar = ttk.Progressbar(
+            levels_frame, orient="horizontal", mode="determinate", maximum=100
+        )
+        self.mic_level_bar.grid(row=0, column=1, sticky="we", padx=(6, 0))
+        ttk.Label(levels_frame, text="System level").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.system_level_bar = ttk.Progressbar(
+            levels_frame, orient="horizontal", mode="determinate", maximum=100
+        )
+        self.system_level_bar.grid(row=1, column=1, sticky="we", padx=(6, 0), pady=(2, 0))
+        levels_frame.columnconfigure(1, weight=1)
+
+        self.devices_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.devices_var, foreground="#555").pack(
+            anchor="w", padx=12, pady=(4, 0)
+        )
+
         output_frame = ttk.Frame(self)
         output_frame.pack(fill="both", expand=True, padx=12, pady=12)
         self.output = tk.Text(output_frame, wrap="word")
@@ -160,10 +187,27 @@ class RecordTab(ttk.Frame):
 
         self.refresh_projects()
         self._refresh_windows()
+        self._poll_audio_levels()
 
     def refresh_projects(self) -> None:
         names = [p.name for p in self.app.db.list_projects()]
         self.project_combo["values"] = names
+
+    def _poll_audio_levels(self) -> None:
+        """Runs continuously (not just while recording) so the meters and device labels are always
+        current — cheap enough (two float reads, ~7x/sec) that there's no need to start/stop it."""
+        session = self.app._session
+        mic_level, system_level = session.audio_levels() if session is not None else (0.0, 0.0)
+        self.mic_level_bar["value"] = mic_level * 100
+        self.system_level_bar["value"] = system_level * 100
+
+        mic_name = self.app.settings.mic_device_name or "system default"
+        system_name = self.app.settings.system_device_name or "system default"
+        self.devices_var.set(
+            f"Devices — mic: {mic_name}; system audio: {system_name} (change in Settings)"
+        )
+
+        self.after(150, self._poll_audio_levels)
 
     def select_project(self, name: str) -> None:
         self.project_var.set(name)
@@ -498,12 +542,17 @@ class ProjectsTab(ttk.Frame):
 
 
 class SettingsTab(ttk.Frame):
-    """API key and model, editable without touching environment variables. Saved settings are written
-    to disk (see config.save_user_config) and take effect immediately for this running session."""
+    """API key, model, and audio device selection — all editable without touching environment
+    variables. Saved settings are written to disk (see config.save_user_config) and take effect
+    immediately for this running session."""
+
+    SYSTEM_DEFAULT_LABEL = "System default"
 
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
         self.app = app
+        self._input_devices: list = []
+        self._loopback_devices: list = []
 
         form = ttk.Frame(self)
         form.pack(fill="x", padx=12, pady=12, anchor="n")
@@ -524,6 +573,22 @@ class SettingsTab(ttk.Frame):
             form, textvariable=self.model_var, width=45, values=AVAILABLE_MODELS
         )
         self.model_combo.grid(row=1, column=1, sticky="we", padx=6, pady=4)
+
+        ttk.Label(form, text="Microphone").grid(row=2, column=0, sticky="w")
+        self.mic_var = tk.StringVar(value=self.app.settings.mic_device_name or self.SYSTEM_DEFAULT_LABEL)
+        self.mic_combo = ttk.Combobox(form, textvariable=self.mic_var, width=45, state="readonly")
+        self.mic_combo.grid(row=2, column=1, sticky="we", padx=6, pady=4)
+
+        ttk.Label(form, text="System audio (speaker)").grid(row=3, column=0, sticky="w")
+        self.system_var = tk.StringVar(
+            value=self.app.settings.system_device_name or self.SYSTEM_DEFAULT_LABEL
+        )
+        self.system_combo = ttk.Combobox(form, textvariable=self.system_var, width=45, state="readonly")
+        self.system_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
+
+        ttk.Button(form, text="Refresh devices", command=self._refresh_devices).grid(
+            row=2, column=2, rowspan=2, padx=(6, 0)
+        )
         form.columnconfigure(1, weight=1)
 
         ttk.Button(self, text="Save", command=self._save).pack(anchor="w", padx=12)
@@ -534,13 +599,18 @@ class SettingsTab(ttk.Frame):
         note = (
             "The API key is used to generate meeting notes and answer questions about a project — "
             "recording, transcription, and screen OCR all work without one. Get a key at "
-            "console.anthropic.com."
+            "console.anthropic.com.\n\n"
+            "Microphone / system audio pick which device gets recorded — useful if you have more than "
+            "one mic, or the wrong one is the Windows default. \"System default\" always follows "
+            "whatever Windows currently has set as default. Watch the level meters on the Record tab "
+            "to confirm a device is actually picking up audio."
         )
         ttk.Label(self, text=note, wraplength=560, justify="left", foreground="#555").pack(
             anchor="w", padx=12, pady=(12, 0)
         )
 
         self._refresh_status()
+        self._refresh_devices()
 
     def _toggle_key_visibility(self) -> None:
         self.api_key_entry.configure(show="" if self.show_key_var.get() else "*")
@@ -551,10 +621,40 @@ class SettingsTab(ttk.Frame):
         else:
             self.status_var.set("No API key set — notes generation and Ask are disabled until one is.")
 
+    def _refresh_devices(self) -> None:
+        """Repopulates the microphone/system-audio dropdowns with currently available devices."""
+        from meeting_scribe.audio.device_picker import list_input_devices, list_loopback_devices
+
+        try:
+            self._input_devices = list_input_devices()
+        except RuntimeError:
+            self._input_devices = []  # not on Windows (e.g. dev machine)
+        try:
+            self._loopback_devices = list_loopback_devices()
+        except RuntimeError:
+            self._loopback_devices = []
+
+        mic_values = [self.SYSTEM_DEFAULT_LABEL] + [d.name for d in self._input_devices]
+        system_values = [self.SYSTEM_DEFAULT_LABEL] + [d.name for d in self._loopback_devices]
+        self.mic_combo["values"] = mic_values
+        self.system_combo["values"] = system_values
+        if self.mic_var.get() not in mic_values:
+            self.mic_var.set(self.SYSTEM_DEFAULT_LABEL)
+        if self.system_var.get() not in system_values:
+            self.system_var.set(self.SYSTEM_DEFAULT_LABEL)
+
     def _save(self) -> None:
         model = self.model_var.get().strip() or self.app.settings.anthropic_model
+        mic_name = None if self.mic_var.get() == self.SYSTEM_DEFAULT_LABEL else self.mic_var.get()
+        system_name = (
+            None if self.system_var.get() == self.SYSTEM_DEFAULT_LABEL else self.system_var.get()
+        )
+
         self.app.settings = update_settings(
             self.app.settings, anthropic_api_key=self.api_key_var.get().strip(), anthropic_model=model
+        )
+        self.app.settings = update_audio_devices(
+            self.app.settings, mic_device_name=mic_name, system_device_name=system_name
         )
         self.model_var.set(self.app.settings.anthropic_model)
         self._refresh_status()
