@@ -14,7 +14,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from meeting_scribe.ai.search import ask as ask_project
-from meeting_scribe.config import Settings, load_settings
+from meeting_scribe.config import AVAILABLE_MODELS, Settings, load_settings, update_settings
 from meeting_scribe.session import MeetingSession
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text
@@ -76,8 +76,10 @@ class MeetingScribeApp(tk.Tk):
 
         self._record_tab = RecordTab(notebook, self)
         self._projects_tab = ProjectsTab(notebook, self)
+        self._settings_tab = SettingsTab(notebook, self)
         notebook.add(self._record_tab, text="Record Meeting")
         notebook.add(self._projects_tab, text="Projects & Search")
+        notebook.add(self._settings_tab, text="Settings")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -408,7 +410,7 @@ class ProjectsTab(ttk.Frame):
 
         notes = meeting.notes_markdown
         _set_text(
-            self.notes_text, notes or "(no AI notes yet — set ANTHROPIC_API_KEY to generate them)"
+            self.notes_text, notes or "(no AI notes yet — set your API key in the Settings tab)"
         )
         action_items = _extract_section(notes, "Action Items") if notes else None
         _set_text(self.actions_text, action_items or "(no action items)")
@@ -472,7 +474,7 @@ class ProjectsTab(ttk.Frame):
         if project is None or not question:
             return
         if not self.app.settings.anthropic_api_key:
-            messagebox.showerror("Meeting Scribe", "Set ANTHROPIC_API_KEY to ask questions.")
+            messagebox.showerror("Meeting Scribe", "Set your API key in the Settings tab to ask questions.")
             return
         _set_text(self.answer_text, "Thinking…")
 
@@ -493,3 +495,67 @@ class ProjectsTab(ttk.Frame):
 
     def _show_answer(self, answer: str) -> None:
         _set_text(self.answer_text, answer)
+
+
+class SettingsTab(ttk.Frame):
+    """API key and model, editable without touching environment variables. Saved settings are written
+    to disk (see config.save_user_config) and take effect immediately for this running session."""
+
+    def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
+        super().__init__(parent)
+        self.app = app
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=12, pady=12, anchor="n")
+
+        ttk.Label(form, text="Anthropic API key").grid(row=0, column=0, sticky="w")
+        self.api_key_var = tk.StringVar(value=self.app.settings.anthropic_api_key or "")
+        self.api_key_entry = ttk.Entry(form, textvariable=self.api_key_var, width=48, show="*")
+        self.api_key_entry.grid(row=0, column=1, sticky="we", padx=6, pady=4)
+
+        self.show_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            form, text="Show", variable=self.show_key_var, command=self._toggle_key_visibility
+        ).grid(row=0, column=2, padx=(6, 0))
+
+        ttk.Label(form, text="Model").grid(row=1, column=0, sticky="w")
+        self.model_var = tk.StringVar(value=self.app.settings.anthropic_model)
+        self.model_combo = ttk.Combobox(
+            form, textvariable=self.model_var, width=45, values=AVAILABLE_MODELS
+        )
+        self.model_combo.grid(row=1, column=1, sticky="we", padx=6, pady=4)
+        form.columnconfigure(1, weight=1)
+
+        ttk.Button(self, text="Save", command=self._save).pack(anchor="w", padx=12)
+
+        self.status_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=12, pady=(8, 0))
+
+        note = (
+            "The API key is used to generate meeting notes and answer questions about a project — "
+            "recording, transcription, and screen OCR all work without one. Get a key at "
+            "console.anthropic.com."
+        )
+        ttk.Label(self, text=note, wraplength=560, justify="left", foreground="#555").pack(
+            anchor="w", padx=12, pady=(12, 0)
+        )
+
+        self._refresh_status()
+
+    def _toggle_key_visibility(self) -> None:
+        self.api_key_entry.configure(show="" if self.show_key_var.get() else "*")
+
+    def _refresh_status(self) -> None:
+        if self.app.settings.anthropic_api_key:
+            self.status_var.set(f"API key is set. Using model: {self.app.settings.anthropic_model}")
+        else:
+            self.status_var.set("No API key set — notes generation and Ask are disabled until one is.")
+
+    def _save(self) -> None:
+        model = self.model_var.get().strip() or self.app.settings.anthropic_model
+        self.app.settings = update_settings(
+            self.app.settings, anthropic_api_key=self.api_key_var.get().strip(), anthropic_model=model
+        )
+        self.model_var.set(self.app.settings.anthropic_model)
+        self._refresh_status()
+        messagebox.showinfo("Meeting Scribe", "Settings saved.")

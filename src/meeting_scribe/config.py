@@ -5,10 +5,19 @@ Everything lives under a single data directory so the whole app is relocatable/b
 
 from __future__ import annotations
 
+import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+
+USER_CONFIG_FILENAME = "settings.json"
+
+# Offered as presets in the GUI's Settings tab; the field itself accepts any string so an advanced user
+# can type a model ID that isn't listed here.
+AVAILABLE_MODELS = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
+
+DEFAULT_MODEL = "claude-opus-5"
 
 
 def _default_data_dir() -> Path:
@@ -69,13 +78,59 @@ class Settings:
         return self.project_dir(project_slug) / "meetings" / str(meeting_id)
 
 
+def _user_config_path(data_dir: Path) -> Path:
+    return data_dir / USER_CONFIG_FILENAME
+
+
+def _load_user_config(data_dir: Path) -> dict:
+    """Reads the GUI Settings tab's saved API key/model, if any. Missing or corrupt is treated the
+    same as "nothing saved yet" — this is a soft preference, not something to crash startup over."""
+    path = _user_config_path(data_dir)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_user_config(settings: Settings) -> None:
+    """Persists the user-editable settings (API key, model) so they survive a restart without the user
+    needing to set environment variables — the GUI's Settings tab calls this after Save."""
+    path = _user_config_path(settings.data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "anthropic_api_key": settings.anthropic_api_key,
+        "anthropic_model": settings.anthropic_model,
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def update_settings(settings: Settings, *, anthropic_api_key: str | None, anthropic_model: str) -> Settings:
+    """Applies and persists a Settings tab edit, returning the new Settings to use from then on."""
+    updated = replace(settings, anthropic_api_key=anthropic_api_key or None, anthropic_model=anthropic_model)
+    save_user_config(updated)
+    return updated
+
+
 def load_settings() -> Settings:
     data_dir = _default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
+    user_config = _load_user_config(data_dir)
+
+    # Precedence: a value saved via the Settings tab wins (it's an explicit, recent user action), then
+    # the environment variable (useful for CI/scripting), then the hardcoded default.
+    anthropic_api_key = user_config.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+    anthropic_model = (
+        user_config.get("anthropic_model")
+        or os.environ.get("MEETING_SCRIBE_MODEL")
+        or DEFAULT_MODEL
+    )
+
     return Settings(
         data_dir=data_dir,
-        anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY"),
-        anthropic_model=os.environ.get("MEETING_SCRIBE_MODEL", "claude-opus-5"),
+        anthropic_api_key=anthropic_api_key,
+        anthropic_model=anthropic_model,
         whisper_model_size=os.environ.get("MEETING_SCRIBE_WHISPER_MODEL", "small"),
         tesseract_cmd=resolve_tesseract_cmd(os.environ.get("MEETING_SCRIBE_TESSERACT_PATH")),
         screen_capture_interval_seconds=float(

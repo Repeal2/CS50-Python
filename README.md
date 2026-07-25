@@ -76,7 +76,11 @@ pip install -r requirements.txt
 python -m meeting_scribe.main       # launches the GUI by default (equivalent to `... main.py gui`)
 ```
 
-Set `ANTHROPIC_API_KEY` in the environment before generating notes or asking questions about a project.
+Set your Anthropic API key and pick a model in the app's **Settings** tab — no environment variable
+needed. It's saved to `settings.json` in the app's data directory and takes effect immediately. (Setting
+`ANTHROPIC_API_KEY` / `MEETING_SCRIBE_MODEL` in the environment still works too, e.g. for scripted/CLI
+use, but a value saved via the Settings tab takes precedence.) Recording, transcription, and screen OCR
+all work with no key configured — only note generation and "Ask" need one.
 
 For development, install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) and make sure
 `tesseract.exe` is on `PATH` (or point `MEETING_SCRIBE_TESSERACT_PATH` at it). The packaged `.exe` (below)
