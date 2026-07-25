@@ -93,3 +93,19 @@ def test_project_isolation(tmp_path):
 
         assert len(db.search_project(p1.id, "zzyzx")) == 1
         assert len(db.search_project(p2.id, "zzyzx")) == 0
+
+
+def test_list_documents_for_meeting_scopes_to_that_meeting(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        project = db.create_project("Doc Scoping")
+        meeting_a = db.create_meeting(project.id, "Meeting A")
+        meeting_b = db.create_meeting(project.id, "Meeting B")
+
+        db.add_document(project.id, "invite.png", "invite text", meeting_id=meeting_a)
+        db.add_document(project.id, "spec.pdf", "project-wide spec, no meeting")
+
+        meeting_a_docs = db.list_documents_for_meeting(meeting_a)
+        meeting_b_docs = db.list_documents_for_meeting(meeting_b)
+
+        assert [d["filename"] for d in meeting_a_docs] == ["invite.png"]
+        assert meeting_b_docs == []

@@ -269,6 +269,12 @@ class Database:
                 "SELECT * FROM documents WHERE project_id = ? ORDER BY added_at DESC", (project_id,)
             ).fetchall()
 
+    def list_documents_for_meeting(self, meeting_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM documents WHERE meeting_id = ? ORDER BY added_at DESC", (meeting_id,)
+            ).fetchall()
+
     # -- Search ----------------------------------------------------------------
 
     def search_project(self, project_id: int, query: str, limit: int = 8) -> list[SearchHit]:

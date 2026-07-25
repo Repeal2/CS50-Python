@@ -18,6 +18,7 @@ from meeting_scribe.config import Settings, load_settings
 from meeting_scribe.session import MeetingSession
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text
+from meeting_scribe.transcription.engine import TranscriptLine, render_transcript
 
 
 def _format_meeting_timestamp(iso_string: str) -> str:
@@ -29,11 +30,42 @@ def _format_meeting_timestamp(iso_string: str) -> str:
         return iso_string
 
 
+def _extract_section(markdown: str, heading: str) -> str | None:
+    """Pulls the body of a `## {heading}` section out of generated notes markdown, up to the next `## `
+    heading or the end of the text. Returns None if the heading isn't present (e.g. the model omitted
+    it because there was nothing to report, per the notes prompt)."""
+    marker = f"## {heading}"
+    start = markdown.find(marker)
+    if start == -1:
+        return None
+    content_start = start + len(marker)
+    end = markdown.find("\n## ", content_start)
+    section = markdown[content_start:end] if end != -1 else markdown[content_start:]
+    return section.strip() or None
+
+
+def _add_scrollable_text_tab(notebook: ttk.Notebook, title: str) -> tk.Text:
+    """Adds a read-only-by-convention Text+Scrollbar pair as a new tab and returns the Text widget."""
+    frame = ttk.Frame(notebook)
+    notebook.add(frame, text=title)
+    text_widget = tk.Text(frame, wrap="word")
+    scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text_widget.yview)
+    text_widget.configure(yscrollcommand=scrollbar.set)
+    text_widget.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    return text_widget
+
+
+def _set_text(widget: tk.Text, content: str) -> None:
+    widget.delete("1.0", "end")
+    widget.insert("1.0", content)
+
+
 class MeetingScribeApp(tk.Tk):
     def __init__(self, settings: Settings | None = None):
         super().__init__()
         self.title("Meeting Scribe")
-        self.geometry("760x560")
+        self.geometry("980x680")
 
         self.settings = settings or load_settings()
         self.db = Database(self.settings.db_path)
@@ -255,13 +287,17 @@ class ProjectsTab(ttk.Frame):
         right = ttk.Frame(self)
         right.pack(side="left", fill="both", expand=True, padx=12, pady=12)
 
-        viewer_frame = ttk.Frame(right)
-        viewer_frame.pack(fill="both", expand=True)
-        self.viewer = tk.Text(viewer_frame, wrap="word", height=18)
-        viewer_scrollbar = ttk.Scrollbar(viewer_frame, orient="vertical", command=self.viewer.yview)
-        self.viewer.configure(yscrollcommand=viewer_scrollbar.set)
-        self.viewer.pack(side="left", fill="both", expand=True)
-        viewer_scrollbar.pack(side="right", fill="y")
+        # Selecting a meeting fans its details out across these tabs, rather than dumping everything
+        # into one pane — the raw on-screen OCR log, the spoken-audio transcript, the full AI notes, and
+        # just the action items are different things a user reaches for at different times.
+        self.detail_notebook = ttk.Notebook(right)
+        self.detail_notebook.pack(fill="both", expand=True)
+
+        self.ocr_text = _add_scrollable_text_tab(self.detail_notebook, "OCR Transcript")
+        self.audio_text = _add_scrollable_text_tab(self.detail_notebook, "Audio Transcript")
+        self.notes_text = _add_scrollable_text_tab(self.detail_notebook, "AI Notes")
+        self.actions_text = _add_scrollable_text_tab(self.detail_notebook, "Action Items")
+        self._build_documents_tab()
 
         ask_row = ttk.Frame(right)
         ask_row.pack(fill="x", pady=(8, 0))
@@ -269,9 +305,47 @@ class ProjectsTab(ttk.Frame):
         ttk.Entry(ask_row, textvariable=self.question_var).pack(side="left", fill="x", expand=True)
         ttk.Button(ask_row, text="Ask", command=self._ask).pack(side="left", padx=(6, 0))
 
+        answer_frame = ttk.Frame(right)
+        answer_frame.pack(fill="both", pady=(6, 0))
+        self.answer_text = tk.Text(answer_frame, wrap="word", height=6)
+        answer_scrollbar = ttk.Scrollbar(
+            answer_frame, orient="vertical", command=self.answer_text.yview
+        )
+        self.answer_text.configure(yscrollcommand=answer_scrollbar.set)
+        self.answer_text.pack(side="left", fill="both", expand=True)
+        answer_scrollbar.pack(side="right", fill="y")
+
         self._projects: list = []
         self._meetings: list = []
+        self._meeting_documents: list = []
         self.refresh_projects()
+
+    def _build_documents_tab(self) -> None:
+        frame = ttk.Frame(self.detail_notebook)
+        self.detail_notebook.add(frame, text="Additional Documents")
+
+        docs_list_frame = ttk.Frame(frame)
+        docs_list_frame.pack(side="left", fill="y", padx=(0, 8))
+        self.meeting_documents_list = tk.Listbox(
+            docs_list_frame, width=24, height=14, exportselection=False
+        )
+        docs_list_scrollbar = ttk.Scrollbar(
+            docs_list_frame, orient="vertical", command=self.meeting_documents_list.yview
+        )
+        self.meeting_documents_list.configure(yscrollcommand=docs_list_scrollbar.set)
+        self.meeting_documents_list.pack(side="left", fill="both", expand=True)
+        docs_list_scrollbar.pack(side="right", fill="y")
+        self.meeting_documents_list.bind("<<ListboxSelect>>", self._on_meeting_document_selected)
+
+        docs_viewer_frame = ttk.Frame(frame)
+        docs_viewer_frame.pack(side="left", fill="both", expand=True)
+        self.meeting_document_viewer = tk.Text(docs_viewer_frame, wrap="word")
+        docs_viewer_scrollbar = ttk.Scrollbar(
+            docs_viewer_frame, orient="vertical", command=self.meeting_document_viewer.yview
+        )
+        self.meeting_document_viewer.configure(yscrollcommand=docs_viewer_scrollbar.set)
+        self.meeting_document_viewer.pack(side="left", fill="both", expand=True)
+        docs_viewer_scrollbar.pack(side="right", fill="y")
 
     def refresh_projects(self) -> None:
         self._projects = self.app.db.list_projects()
@@ -284,6 +358,12 @@ class ProjectsTab(ttk.Frame):
         if not selection:
             return None
         return self._projects[selection[0]]
+
+    def _selected_meeting(self):
+        selection = self.meeting_list.curselection()
+        if not selection:
+            return None
+        return self._meetings[selection[0]]
 
     def select_project(self, name: str) -> None:
         for index, project in enumerate(self._projects):
@@ -298,6 +378,7 @@ class ProjectsTab(ttk.Frame):
         project = self._selected_project()
         self.meeting_list.delete(0, "end")
         self._meetings = []
+        self._clear_meeting_details()
         if project is None:
             return
         self._meetings = self.app.db.list_meetings(project.id)
@@ -305,14 +386,51 @@ class ProjectsTab(ttk.Frame):
             timestamp = _format_meeting_timestamp(meeting.started_at)
             self.meeting_list.insert("end", f"{meeting.title} — {timestamp}")
 
+    def _clear_meeting_details(self) -> None:
+        for widget in (self.ocr_text, self.audio_text, self.notes_text, self.actions_text):
+            _set_text(widget, "")
+        self._meeting_documents = []
+        self.meeting_documents_list.delete(0, "end")
+        _set_text(self.meeting_document_viewer, "")
+
     def _on_meeting_selected(self, _event) -> None:
-        selection = self.meeting_list.curselection()
-        if not selection:
+        meeting = self._selected_meeting()
+        if meeting is None:
             return
-        meeting = self._meetings[selection[0]]
-        self.viewer.delete("1.0", "end")
-        content = meeting.notes_markdown or meeting.transcript_text or "(no transcript yet)"
-        self.viewer.insert("1.0", content)
+
+        segments = self.app.db.get_segments(meeting.id)
+        lines = [TranscriptLine(row["timestamp_seconds"], row["source"], row["text"]) for row in segments]
+        ocr_lines = [line for line in lines if line.source == "screen_ocr"]
+        audio_lines = [line for line in lines if line.source in ("mic", "system")]
+
+        _set_text(self.ocr_text, render_transcript(ocr_lines) or "(no on-screen text captured)")
+        _set_text(self.audio_text, render_transcript(audio_lines) or "(no speech captured)")
+
+        notes = meeting.notes_markdown
+        _set_text(
+            self.notes_text, notes or "(no AI notes yet — set ANTHROPIC_API_KEY to generate them)"
+        )
+        action_items = _extract_section(notes, "Action Items") if notes else None
+        _set_text(self.actions_text, action_items or "(no action items)")
+
+        self._load_meeting_documents(meeting.id)
+
+    def _load_meeting_documents(self, meeting_id: int) -> None:
+        self._meeting_documents = self.app.db.list_documents_for_meeting(meeting_id)
+        self.meeting_documents_list.delete(0, "end")
+        _set_text(self.meeting_document_viewer, "")
+        if not self._meeting_documents:
+            self.meeting_documents_list.insert("end", "(none uploaded)")
+            return
+        for document in self._meeting_documents:
+            self.meeting_documents_list.insert("end", document["filename"])
+
+    def _on_meeting_document_selected(self, _event) -> None:
+        selection = self.meeting_documents_list.curselection()
+        if not selection or not self._meeting_documents:
+            return
+        document = self._meeting_documents[selection[0]]
+        _set_text(self.meeting_document_viewer, document["content_text"])
 
     def _upload_document(self) -> None:
         project = self._selected_project()
@@ -334,7 +452,18 @@ class ProjectsTab(ttk.Frame):
         except UnsupportedDocumentError as exc:
             messagebox.showerror("Meeting Scribe", str(exc))
             return
-        self.app.db.add_document(project.id, path.name, text)
+
+        meeting = self._selected_meeting()
+        meeting_id = None
+        if meeting is not None and messagebox.askyesno(
+            "Meeting Scribe",
+            f'Attach to the selected meeting "{meeting.title}" instead of the whole project?',
+        ):
+            meeting_id = meeting.id
+
+        self.app.db.add_document(project.id, path.name, text, meeting_id=meeting_id)
+        if meeting_id is not None and self._selected_meeting() is meeting:
+            self._load_meeting_documents(meeting_id)
         messagebox.showinfo("Meeting Scribe", f"Added {path.name} to {project.name}.")
 
     def _ask(self) -> None:
@@ -345,8 +474,7 @@ class ProjectsTab(ttk.Frame):
         if not self.app.settings.anthropic_api_key:
             messagebox.showerror("Meeting Scribe", "Set ANTHROPIC_API_KEY to ask questions.")
             return
-        self.viewer.delete("1.0", "end")
-        self.viewer.insert("1.0", "Thinking…")
+        _set_text(self.answer_text, "Thinking…")
 
         def worker() -> None:
             try:
@@ -364,5 +492,4 @@ class ProjectsTab(ttk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _show_answer(self, answer: str) -> None:
-        self.viewer.delete("1.0", "end")
-        self.viewer.insert("1.0", answer)
+        _set_text(self.answer_text, answer)
