@@ -1,3 +1,6 @@
+import sys
+from types import ModuleType
+
 from meeting_scribe.transcription.engine import (
     TranscriptLine,
     WhisperTranscriber,
@@ -11,6 +14,28 @@ def test_constructing_transcriber_does_not_load_model():
     # must not try to load anything until .transcribe() is actually called.
     transcriber = WhisperTranscriber(model_size="tiny")
     assert transcriber._model is None
+
+
+def test_ensure_model_forces_cpu_device(monkeypatch):
+    # Regression test: with no device argument, ctranslate2 auto-detects and tries CUDA on any machine
+    # with an NVIDIA GPU, then crashes trying to load cublas64_12.dll since we don't bundle the CUDA
+    # runtime. device="cpu" must always be passed explicitly.
+    captured_kwargs = {}
+
+    class FakeWhisperModel:
+        def __init__(self, model_size_or_path, **kwargs):
+            captured_kwargs["model_size_or_path"] = model_size_or_path
+            captured_kwargs.update(kwargs)
+
+    fake_module = ModuleType("faster_whisper")
+    fake_module.WhisperModel = FakeWhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_module)
+
+    transcriber = WhisperTranscriber(model_size="small")
+    transcriber._ensure_model()
+
+    assert captured_kwargs["model_size_or_path"] == "small"
+    assert captured_kwargs["device"] == "cpu"
 
 
 def test_merge_interleaves_by_timestamp():

@@ -101,6 +101,22 @@ This produces `dist/MeetingScribe.exe`. `packaging/meeting_scribe.spec` bundles 
 `config.py` finds the bundled binary automatically via PyInstaller's `sys._MEIPASS`); if that folder is
 absent it builds without Tesseract bundled, matching the pre-existing PATH-based behavior.
 
+## CI builds and releases
+
+`.github/workflows/build-windows-exe.yml` builds the exe on a real `windows-latest` runner on every push
+to this branch (PyInstaller doesn't cross-compile, so this can't happen on Linux CI). Each build:
+
+1. Runs the test suite as a gate — a failing test blocks the build.
+2. Vendors Tesseract (via Chocolatey) and runs `packaging/build.py`.
+3. Computes a version as `{meeting_scribe.__version__}-build{run number}` (e.g. `0.1.0-build7`), so every
+   build is uniquely identifiable even between deliberate version bumps.
+4. Publishes a **GitHub Release** tagged `v{version}` with the versioned exe attached, pinned to the exact
+   commit it was built from. Releases are permanent — unlike the workflow-run artifact (also uploaded,
+   for convenience, but expires after 90 days), a Release is the durable record of what shipped when.
+
+Bump `__version__` in `src/meeting_scribe/__init__.py` for a meaningful milestone; every push still gets
+its own release regardless, tagged off whatever the base version currently is.
+
 ## Status
 
 This is the initial scaffold: the storage layer, document ingestion, transcript merging, notes generation,

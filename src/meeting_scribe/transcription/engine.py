@@ -29,7 +29,11 @@ class WhisperTranscriber:
         if self._model is None:
             from faster_whisper import WhisperModel
 
-            self._model = WhisperModel(self._model_size, compute_type="int8")
+            # device="cpu" is deliberate: with no device specified, ctranslate2 auto-detects and will
+            # try CUDA on any machine with an NVIDIA GPU, then fail trying to load cuBLAS — we don't
+            # bundle the CUDA runtime (it would add gigabytes for a benefit most users can't use), so
+            # CPU is the only device this app actually supports.
+            self._model = WhisperModel(self._model_size, device="cpu", compute_type="int8")
         return self._model
 
     def transcribe(self, audio_path: Path, source: str) -> list[TranscriptLine]:

@@ -7,6 +7,10 @@ on:
       - claude/windows-meeting-transcription-7bbck5
   workflow_dispatch: {}
 
+# Needed to create tags/releases (contents: write) below.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -36,9 +40,41 @@ jobs:
       - name: Build MeetingScribe.exe
         run: python packaging/build.py
 
-      - name: Upload MeetingScribe.exe
+      # Every build gets a permanent, uniquely identifiable version: the product version from
+      # meeting_scribe.__version__ (bump that for meaningful milestones) plus this run's number, so
+      # consecutive CI builds against the same product version are still distinguishable and every
+      # build is traceable back to an exact commit via the release/tag it lands on.
+      - name: Compute build version
+        id: version
+        shell: bash
+        run: |
+          BASE_VERSION=$(python -c "import sys; sys.path.insert(0, 'src'); import meeting_scribe; print(meeting_scribe.__version__)")
+          FULL_VERSION="${BASE_VERSION}-build${{ github.run_number }}"
+          echo "full_version=$FULL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Rename executable with version
+        shell: pwsh
+        run: |
+          Copy-Item packaging\dist\MeetingScribe.exe "packaging\dist\MeetingScribe-${{ steps.version.outputs.full_version }}.exe"
+
+      - name: Upload MeetingScribe.exe as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MeetingScribe-windows
-          path: packaging/dist/MeetingScribe.exe
+          name: MeetingScribe-v${{ steps.version.outputs.full_version }}
+          path: packaging/dist/MeetingScribe-${{ steps.version.outputs.full_version }}.exe
           if-no-files-found: error
+
+      # Workflow artifacts expire after 90 days; a tagged Release is permanent and gives every build
+      # its own page with the exact commit it was built from, so past builds are never lost or
+      # ambiguous about which fix they do or don't contain.
+      - name: Create versioned GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.version.outputs.full_version }}" \
+            "packaging/dist/MeetingScribe-${{ steps.version.outputs.full_version }}.exe" \
+            --repo "${{ github.repository }}" \
+            --title "MeetingScribe v${{ steps.version.outputs.full_version }}" \
+            --notes "Automated build from commit ${{ github.sha }} on branch \`${{ github.ref_name }}\`." \
+            --target "${{ github.sha }}"
