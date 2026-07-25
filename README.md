@@ -7,13 +7,14 @@ screen, and turns the meeting into a searchable record.
 
 - **Records audio** from the microphone *and* the system output (WASAPI loopback), so it captures both
   sides of a call even when remote participants' audio never touches the mic. If a machine has more than
-  one mic or speaker, the Settings tab lets you pick which one gets recorded instead of always trusting
-  whatever Windows currently calls "default" — and the Record tab shows a live input-level meter for
-  each, so you can actually see it's picking up audio rather than guessing.
+  one mic or speaker, a dropdown right on the Record tab (also in Settings) lets you pick which one gets
+  recorded instead of always trusting whatever Windows currently calls "default" — and a live input-level
+  meter for each confirms it's actually picking up audio rather than guessing.
 - **Watches the screen** at a low frame rate and OCRs it, so on-screen captions, shared slides, and chat
   messages become part of the transcript even if they're never spoken aloud. You can point this at the
-  whole screen or at a single selected window (e.g. just the Teams/Zoom window), so it doesn't also OCR
-  unrelated desktop content.
+  whole screen, a single selected window (e.g. just the Teams/Zoom window), or a custom rectangle you
+  drag out yourself (e.g. just a captions bar) — the app draws a live boundary around whichever custom
+  area is active so it's always visible on screen what's being captured.
 - **Transcribes** the recorded audio locally (no audio ever leaves the machine unless you opt into a
   cloud model) and merges it with the OCR stream into one time-ordered transcript.
 - **Generates notes and action items** by sending the finished transcript to Claude, guided by a system
@@ -45,8 +46,10 @@ src/meeting_scribe/
   config.py          # data directory, API keys, per-project paths
   session.py          # orchestrates one meeting: start/stop recording, merge, notes, save
   audio/recorder.py   # mic + WASAPI loopback capture (Windows-only at runtime)
-  screen/capture.py   # periodic screenshot + OCR, deduplicated, optionally scoped to one window
+  audio/device_picker.py  # enumerates mic/speaker devices so one can be picked instead of the OS default
+  screen/capture.py   # periodic screenshot + OCR, deduplicated, optionally scoped to one window or area
   screen/window_picker.py  # enumerates open windows so one can be picked as the OCR target
+  screen/region_picker.py  # drag-to-select a custom OCR rectangle + its on-screen boundary outline
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
   ai/notes.py          # Claude call that turns a transcript into notes + action items
   ai/search.py          # Ask-a-question-about-a-project flow (retrieve + Claude synthesis)

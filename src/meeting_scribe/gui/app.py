@@ -23,10 +23,15 @@ from meeting_scribe.config import (
     update_notes_system_prompt,
     update_settings,
 )
+from meeting_scribe.screen.region_picker import RegionOutline, RegionTarget, pick_region_interactively
 from meeting_scribe.session import MeetingSession
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text
 from meeting_scribe.transcription.engine import TranscriptLine, render_transcript
+
+# Shown in a device dropdown in place of a device name, meaning "follow whatever Windows currently
+# considers the default" rather than a specific device — used on both the Record tab and Settings tab.
+SYSTEM_DEFAULT_LABEL = "System default"
 
 
 def _format_meeting_timestamp(iso_string: str) -> str:
@@ -95,6 +100,12 @@ class MeetingScribeApp(tk.Tk):
         self._record_tab.refresh_projects()
         self._projects_tab.refresh_projects()
 
+    def sync_device_displays(self) -> None:
+        """The mic/system audio choice can be changed from either the Record tab or the Settings tab —
+        whichever one didn't make the change calls this so it doesn't keep showing a stale value."""
+        self._record_tab.sync_from_settings()
+        self._settings_tab.sync_from_settings()
+
     def prompt_new_project(self) -> None:
         """Opens a small dialog to create a project by name, then refreshes both tabs and selects the
         new project in whichever one triggered this, so it's immediately usable without hunting for it
@@ -108,6 +119,7 @@ class MeetingScribeApp(tk.Tk):
         self._projects_tab.select_project(project.name)
 
     def _on_close(self) -> None:
+        self._record_tab.close_region_outline()
         self.db.close()
         self.destroy()
 
@@ -119,6 +131,10 @@ class RecordTab(ttk.Frame):
         super().__init__(parent)
         self.app = app
         self._window_targets: list = []
+        self._region_target: RegionTarget | None = None
+        self._region_outline: RegionOutline | None = None
+        self._input_devices: list = []
+        self._loopback_devices: list = []
 
         form = ttk.Frame(self)
         form.pack(fill="x", padx=12, pady=12)
@@ -143,8 +159,32 @@ class RecordTab(ttk.Frame):
             form, textvariable=self.source_var, width=40, state="readonly"
         )
         self.source_combo.grid(row=2, column=1, sticky="we", padx=6, pady=4)
-        ttk.Button(form, text="Refresh windows", command=self._refresh_windows).grid(
-            row=2, column=2, padx=(6, 0)
+        self.source_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_region_outline())
+        source_buttons = ttk.Frame(form)
+        source_buttons.grid(row=2, column=2, padx=(6, 0))
+        ttk.Button(source_buttons, text="Refresh windows", command=self._refresh_windows).pack(
+            side="left"
+        )
+        ttk.Button(source_buttons, text="Select area…", command=self._pick_region).pack(
+            side="left", padx=(4, 0)
+        )
+
+        ttk.Label(form, text="Microphone").grid(row=3, column=0, sticky="w")
+        self.mic_var = tk.StringVar(value=self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
+        self.mic_combo = ttk.Combobox(form, textvariable=self.mic_var, width=40, state="readonly")
+        self.mic_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
+        self.mic_combo.bind("<<ComboboxSelected>>", self._on_devices_changed)
+
+        ttk.Label(form, text="System audio (speaker)").grid(row=4, column=0, sticky="w")
+        self.system_var = tk.StringVar(
+            value=self.app.settings.system_device_name or SYSTEM_DEFAULT_LABEL
+        )
+        self.system_combo = ttk.Combobox(form, textvariable=self.system_var, width=40, state="readonly")
+        self.system_combo.grid(row=4, column=1, sticky="we", padx=6, pady=4)
+        self.system_combo.bind("<<ComboboxSelected>>", self._on_devices_changed)
+
+        ttk.Button(form, text="Refresh devices", command=self._refresh_devices).grid(
+            row=3, column=2, rowspan=2, padx=(6, 0)
         )
         form.columnconfigure(1, weight=1)
 
@@ -174,11 +214,6 @@ class RecordTab(ttk.Frame):
         self.system_level_bar.grid(row=1, column=1, sticky="we", padx=(6, 0), pady=(2, 0))
         levels_frame.columnconfigure(1, weight=1)
 
-        self.devices_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.devices_var, foreground="#555").pack(
-            anchor="w", padx=12, pady=(4, 0)
-        )
-
         output_frame = ttk.Frame(self)
         output_frame.pack(fill="both", expand=True, padx=12, pady=12)
         self.output = tk.Text(output_frame, wrap="word")
@@ -189,6 +224,7 @@ class RecordTab(ttk.Frame):
 
         self.refresh_projects()
         self._refresh_windows()
+        self._refresh_devices()
         self._poll_audio_levels()
 
     def refresh_projects(self) -> None:
@@ -196,43 +232,109 @@ class RecordTab(ttk.Frame):
         self.project_combo["values"] = names
 
     def _poll_audio_levels(self) -> None:
-        """Runs continuously (not just while recording) so the meters and device labels are always
-        current — cheap enough (two float reads, ~7x/sec) that there's no need to start/stop it."""
+        """Runs continuously (not just while recording) so the meters are always current — cheap enough
+        (two float reads, ~7x/sec) that there's no need to start/stop it."""
         session = self.app._session
         mic_level, system_level = session.audio_levels() if session is not None else (0.0, 0.0)
         self.mic_level_bar["value"] = mic_level * 100
         self.system_level_bar["value"] = system_level * 100
-
-        mic_name = self.app.settings.mic_device_name or "system default"
-        system_name = self.app.settings.system_device_name or "system default"
-        self.devices_var.set(
-            f"Devices — mic: {mic_name}; system audio: {system_name} (change in Settings)"
-        )
-
         self.after(150, self._poll_audio_levels)
 
     def select_project(self, name: str) -> None:
         self.project_var.set(name)
 
+    def sync_from_settings(self) -> None:
+        """Reflects a device change made elsewhere (e.g. the Settings tab) so this tab's dropdowns
+        don't show a stale value for the same setting."""
+        self.mic_var.set(self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
+        self.system_var.set(self.app.settings.system_device_name or SYSTEM_DEFAULT_LABEL)
+
     def _refresh_windows(self) -> None:
         """Repopulates the screen-source dropdown with currently open, titled windows the user can
-        pick as an OCR target instead of the whole screen (e.g. just the Teams/Zoom window)."""
+        pick as an OCR target instead of the whole screen (e.g. just the Teams/Zoom window). Keeps
+        whatever custom area is currently picked (if any) as an option alongside them."""
         from meeting_scribe.screen.window_picker import list_capturable_windows
 
         try:
             self._window_targets = list_capturable_windows()
         except RuntimeError:
             self._window_targets = []  # not on Windows (e.g. dev machine) — whole-screen only
-        values = [self.ENTIRE_SCREEN_LABEL] + [w.title for w in self._window_targets]
+        region_labels = [self._region_target.label] if self._region_target else []
+        values = [self.ENTIRE_SCREEN_LABEL] + region_labels + [w.title for w in self._window_targets]
         self.source_combo["values"] = values
         if self.source_var.get() not in values:
             self.source_var.set(self.ENTIRE_SCREEN_LABEL)
+        self._sync_region_outline()
+
+    def _pick_region(self) -> None:
+        """Opens the drag-to-select overlay, and if the user completes a selection, adds it to the
+        screen-source dropdown as a new option and switches to it immediately."""
+        region = pick_region_interactively(self)
+        if region is None:
+            return
+        self._region_target = region
+        self._refresh_windows()
+        self.source_var.set(region.label)
+        self._sync_region_outline()
+
+    def _sync_region_outline(self) -> None:
+        """Shows a live boundary around the custom area on screen for as long as it's the selected
+        screen source — not just at the moment it was drawn — so it's always obvious what's being
+        captured, the same idea as the audio level meters. Hides it the moment something else is
+        picked instead."""
+        if self._region_outline is not None:
+            self._region_outline.close()
+            self._region_outline = None
+        if self._region_target is not None and self.source_var.get() == self._region_target.label:
+            self._region_outline = RegionOutline(self, self._region_target)
+
+    def close_region_outline(self) -> None:
+        """Called on app shutdown so the boundary windows don't outlive the main window."""
+        if self._region_outline is not None:
+            self._region_outline.close()
+            self._region_outline = None
 
     def _selected_screen_target(self):
         selected = self.source_var.get()
         if selected == self.ENTIRE_SCREEN_LABEL:
             return None
+        if self._region_target is not None and selected == self._region_target.label:
+            return self._region_target
         return next((w for w in self._window_targets if w.title == selected), None)
+
+    def _refresh_devices(self) -> None:
+        """Repopulates the microphone/system-audio dropdowns with currently available devices — the
+        same picker as the Settings tab, surfaced here too so switching devices doesn't require leaving
+        the Record tab."""
+        from meeting_scribe.audio.device_picker import list_input_devices, list_loopback_devices
+
+        try:
+            self._input_devices = list_input_devices()
+        except RuntimeError:
+            self._input_devices = []  # not on Windows (e.g. dev machine)
+        try:
+            self._loopback_devices = list_loopback_devices()
+        except RuntimeError:
+            self._loopback_devices = []
+
+        mic_values = [SYSTEM_DEFAULT_LABEL] + [d.name for d in self._input_devices]
+        system_values = [SYSTEM_DEFAULT_LABEL] + [d.name for d in self._loopback_devices]
+        self.mic_combo["values"] = mic_values
+        self.system_combo["values"] = system_values
+        if self.mic_var.get() not in mic_values:
+            self.mic_var.set(SYSTEM_DEFAULT_LABEL)
+        if self.system_var.get() not in system_values:
+            self.system_var.set(SYSTEM_DEFAULT_LABEL)
+
+    def _on_devices_changed(self, _event=None) -> None:
+        """Persists the mic/system choice immediately (rather than waiting for a Settings-tab Save) so
+        it takes effect the next time the user hits Start Meeting."""
+        mic_name = None if self.mic_var.get() == SYSTEM_DEFAULT_LABEL else self.mic_var.get()
+        system_name = None if self.system_var.get() == SYSTEM_DEFAULT_LABEL else self.system_var.get()
+        self.app.settings = update_audio_devices(
+            self.app.settings, mic_device_name=mic_name, system_device_name=system_name
+        )
+        self.app.sync_device_displays()
 
     def _start(self) -> None:
         project_name = self.project_var.get().strip()
@@ -548,8 +650,6 @@ class SettingsTab(ttk.Frame):
     variables. Saved settings are written to disk (see config.save_user_config) and take effect
     immediately for this running session."""
 
-    SYSTEM_DEFAULT_LABEL = "System default"
-
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
         self.app = app
@@ -577,13 +677,13 @@ class SettingsTab(ttk.Frame):
         self.model_combo.grid(row=1, column=1, sticky="we", padx=6, pady=4)
 
         ttk.Label(form, text="Microphone").grid(row=2, column=0, sticky="w")
-        self.mic_var = tk.StringVar(value=self.app.settings.mic_device_name or self.SYSTEM_DEFAULT_LABEL)
+        self.mic_var = tk.StringVar(value=self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
         self.mic_combo = ttk.Combobox(form, textvariable=self.mic_var, width=45, state="readonly")
         self.mic_combo.grid(row=2, column=1, sticky="we", padx=6, pady=4)
 
         ttk.Label(form, text="System audio (speaker)").grid(row=3, column=0, sticky="w")
         self.system_var = tk.StringVar(
-            value=self.app.settings.system_device_name or self.SYSTEM_DEFAULT_LABEL
+            value=self.app.settings.system_device_name or SYSTEM_DEFAULT_LABEL
         )
         self.system_combo = ttk.Combobox(form, textvariable=self.system_var, width=45, state="readonly")
         self.system_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
@@ -658,20 +758,20 @@ class SettingsTab(ttk.Frame):
         except RuntimeError:
             self._loopback_devices = []
 
-        mic_values = [self.SYSTEM_DEFAULT_LABEL] + [d.name for d in self._input_devices]
-        system_values = [self.SYSTEM_DEFAULT_LABEL] + [d.name for d in self._loopback_devices]
+        mic_values = [SYSTEM_DEFAULT_LABEL] + [d.name for d in self._input_devices]
+        system_values = [SYSTEM_DEFAULT_LABEL] + [d.name for d in self._loopback_devices]
         self.mic_combo["values"] = mic_values
         self.system_combo["values"] = system_values
         if self.mic_var.get() not in mic_values:
-            self.mic_var.set(self.SYSTEM_DEFAULT_LABEL)
+            self.mic_var.set(SYSTEM_DEFAULT_LABEL)
         if self.system_var.get() not in system_values:
-            self.system_var.set(self.SYSTEM_DEFAULT_LABEL)
+            self.system_var.set(SYSTEM_DEFAULT_LABEL)
 
     def _save(self) -> None:
         model = self.model_var.get().strip() or self.app.settings.anthropic_model
-        mic_name = None if self.mic_var.get() == self.SYSTEM_DEFAULT_LABEL else self.mic_var.get()
+        mic_name = None if self.mic_var.get() == SYSTEM_DEFAULT_LABEL else self.mic_var.get()
         system_name = (
-            None if self.system_var.get() == self.SYSTEM_DEFAULT_LABEL else self.system_var.get()
+            None if self.system_var.get() == SYSTEM_DEFAULT_LABEL else self.system_var.get()
         )
 
         self.app.settings = update_settings(
@@ -685,4 +785,11 @@ class SettingsTab(ttk.Frame):
         )
         self.model_var.set(self.app.settings.anthropic_model)
         self._refresh_status()
+        self.app.sync_device_displays()
         messagebox.showinfo("Meeting Scribe", "Settings saved.")
+
+    def sync_from_settings(self) -> None:
+        """Reflects a device change made elsewhere (e.g. the Record tab's own dropdowns) so this tab's
+        dropdowns don't show a stale value for the same setting."""
+        self.mic_var.set(self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
+        self.system_var.set(self.app.settings.system_device_name or SYSTEM_DEFAULT_LABEL)

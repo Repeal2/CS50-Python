@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from meeting_scribe.screen.region_picker import RegionTarget
 from meeting_scribe.screen.window_picker import WindowTarget
 
 
@@ -30,7 +31,7 @@ class ScreenWatcher:
         on_text: Callable[[ScreenTextEvent], None],
         interval_seconds: float = 3.0,
         tesseract_cmd: str | None = None,
-        target: WindowTarget | None = None,
+        target: WindowTarget | RegionTarget | None = None,
     ):
         self._on_text = on_text
         self._interval = interval_seconds
@@ -71,11 +72,14 @@ class ScreenWatcher:
                 self._stop_event.wait(max(0.0, self._interval - elapsed))
 
     def _resolve_region(self, sct) -> dict | None:
-        """Returns the mss region to capture: the whole virtual screen, or the selected window's
-        current bounds — None if a selected window has since closed or been minimized, in which case
-        the caller skips that capture cycle rather than falling back to the whole screen."""
+        """Returns the mss region to capture: the whole virtual screen, a fixed user-drawn rectangle,
+        or the selected window's current bounds — None if a selected window has since closed or been
+        minimized, in which case the caller skips that capture cycle rather than falling back to the
+        whole screen."""
         if self._target is None:
             return sct.monitors[0]  # index 0 == a single virtual monitor spanning all displays
+        if isinstance(self._target, RegionTarget):
+            return self._target.mss_region
         from meeting_scribe.screen.window_picker import get_window_region
 
         return get_window_region(self._target.hwnd)

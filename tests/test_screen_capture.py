@@ -1,4 +1,5 @@
 from meeting_scribe.screen.capture import ScreenWatcher
+from meeting_scribe.screen.region_picker import RegionTarget
 
 
 class FakeShot:
@@ -82,3 +83,19 @@ def test_new_frame_new_text_fires_again():
     watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
 
     assert [e.text for e in events] == ["Slide 1", "Slide 2"]
+
+
+def test_resolve_region_returns_the_fixed_rectangle_for_a_region_target():
+    target = RegionTarget(left=10, top=20, width=300, height=200)
+    watcher = ScreenWatcher(on_text=lambda e: None, target=target)
+
+    assert watcher._resolve_region(sct=None) == {"left": 10, "top": 20, "width": 300, "height": 200}
+
+
+def test_resolve_region_returns_the_whole_virtual_screen_with_no_target():
+    class FakeSctWithMonitors:
+        monitors = ["whole-virtual-screen"]
+
+    watcher = ScreenWatcher(on_text=lambda e: None, target=None)
+
+    assert watcher._resolve_region(FakeSctWithMonitors()) == "whole-virtual-screen"
