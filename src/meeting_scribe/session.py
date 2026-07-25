@@ -9,6 +9,7 @@ from meeting_scribe.ai.notes import generate_notes
 from meeting_scribe.audio.recorder import Recorder
 from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
+from meeting_scribe.screen.window_picker import WindowTarget
 from meeting_scribe.storage.database import Database
 from meeting_scribe.transcription.engine import (
     TranscriptLine,
@@ -19,7 +20,16 @@ from meeting_scribe.transcription.engine import (
 
 
 class MeetingSession:
-    def __init__(self, settings: Settings, db: Database, project_name: str, title: str):
+    def __init__(
+        self,
+        settings: Settings,
+        db: Database,
+        project_name: str,
+        title: str,
+        screen_target: WindowTarget | None = None,
+    ):
+        """`screen_target` selects a single window to OCR instead of the whole screen — e.g. just the
+        Teams/Zoom window. Leave it None to capture the whole screen."""
         self._settings = settings
         self._db = db
         self.project = db.get_or_create_project(project_name)
@@ -34,6 +44,7 @@ class MeetingSession:
             on_text=self._screen_events.append,
             interval_seconds=settings.screen_capture_interval_seconds,
             tesseract_cmd=settings.tesseract_cmd,
+            target=screen_target,
         )
         self._transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
 

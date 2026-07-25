@@ -14,3 +14,7 @@ dist/
 
 .pytest_cache/
 .mypy_cache/
+
+# Staged by packaging/vendor_tesseract.py — a local Tesseract install copied in at build time, not
+# something to check into the repo.
+packaging/vendor/

@@ -49,9 +49,12 @@ class MeetingScribeApp(tk.Tk):
 
 
 class RecordTab(ttk.Frame):
+    ENTIRE_SCREEN_LABEL = "Entire screen"
+
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
         self.app = app
+        self._window_targets: list = []
 
         form = ttk.Frame(self)
         form.pack(fill="x", padx=12, pady=12)
@@ -65,6 +68,16 @@ class RecordTab(ttk.Frame):
         self.title_var = tk.StringVar(value="Untitled meeting")
         ttk.Entry(form, textvariable=self.title_var, width=42).grid(
             row=1, column=1, sticky="we", padx=6, pady=4
+        )
+
+        ttk.Label(form, text="Screen source").grid(row=2, column=0, sticky="w")
+        self.source_var = tk.StringVar(value=self.ENTIRE_SCREEN_LABEL)
+        self.source_combo = ttk.Combobox(
+            form, textvariable=self.source_var, width=40, state="readonly"
+        )
+        self.source_combo.grid(row=2, column=1, sticky="we", padx=6, pady=4)
+        ttk.Button(form, text="Refresh windows", command=self._refresh_windows).grid(
+            row=2, column=2, padx=(6, 0)
         )
         form.columnconfigure(1, weight=1)
 
@@ -82,10 +95,31 @@ class RecordTab(ttk.Frame):
         self.output.pack(fill="both", expand=True, padx=12, pady=12)
 
         self.refresh_projects()
+        self._refresh_windows()
 
     def refresh_projects(self) -> None:
         names = [p.name for p in self.app.db.list_projects()]
         self.project_combo["values"] = names
+
+    def _refresh_windows(self) -> None:
+        """Repopulates the screen-source dropdown with currently open, titled windows the user can
+        pick as an OCR target instead of the whole screen (e.g. just the Teams/Zoom window)."""
+        from meeting_scribe.screen.window_picker import list_capturable_windows
+
+        try:
+            self._window_targets = list_capturable_windows()
+        except RuntimeError:
+            self._window_targets = []  # not on Windows (e.g. dev machine) — whole-screen only
+        values = [self.ENTIRE_SCREEN_LABEL] + [w.title for w in self._window_targets]
+        self.source_combo["values"] = values
+        if self.source_var.get() not in values:
+            self.source_var.set(self.ENTIRE_SCREEN_LABEL)
+
+    def _selected_screen_target(self):
+        selected = self.source_var.get()
+        if selected == self.ENTIRE_SCREEN_LABEL:
+            return None
+        return next((w for w in self._window_targets if w.title == selected), None)
 
     def _start(self) -> None:
         project_name = self.project_var.get().strip()
@@ -93,7 +127,13 @@ class RecordTab(ttk.Frame):
             messagebox.showerror("Meeting Scribe", "Enter a project name first.")
             return
         try:
-            session = MeetingSession(self.app.settings, self.app.db, project_name, self.title_var.get())
+            session = MeetingSession(
+                self.app.settings,
+                self.app.db,
+                project_name,
+                self.title_var.get(),
+                screen_target=self._selected_screen_target(),
+            )
             session.start()
         except RuntimeError as exc:
             messagebox.showerror("Meeting Scribe", str(exc))

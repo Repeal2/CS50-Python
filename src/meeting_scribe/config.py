@@ -6,6 +6,7 @@ Everything lives under a single data directory so the whole app is relocatable/b
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,29 @@ def _default_data_dir() -> Path:
     if appdata:
         return Path(appdata) / "MeetingScribe"
     return Path.home() / ".meeting_scribe_data"
+
+
+def _bundled_tesseract_path() -> Path | None:
+    """Locates the Tesseract install vendored into the .exe by packaging/vendor_tesseract.py, if any.
+
+    PyInstaller's onefile build (see packaging/meeting_scribe.spec) extracts bundled data files to a
+    temp directory at startup, exposed as `sys._MEIPASS`. That attribute only exists when running from
+    a frozen build, so this is naturally a no-op in normal `python -m meeting_scribe.main` development.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass is None:
+        return None
+    candidate = Path(meipass) / "tesseract" / "tesseract.exe"
+    return candidate if candidate.exists() else None
+
+
+def resolve_tesseract_cmd(explicit: str | None) -> str | None:
+    """Picks the Tesseract binary to use: an explicit override wins, then a bundled copy inside the
+    .exe, otherwise None (pytesseract falls back to finding `tesseract` on PATH itself)."""
+    if explicit:
+        return explicit
+    bundled = _bundled_tesseract_path()
+    return str(bundled) if bundled else None
 
 
 @dataclass(frozen=True)
@@ -53,7 +77,7 @@ def load_settings() -> Settings:
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY"),
         anthropic_model=os.environ.get("MEETING_SCRIBE_MODEL", "claude-opus-5"),
         whisper_model_size=os.environ.get("MEETING_SCRIBE_WHISPER_MODEL", "small"),
-        tesseract_cmd=os.environ.get("MEETING_SCRIBE_TESSERACT_PATH"),
+        tesseract_cmd=resolve_tesseract_cmd(os.environ.get("MEETING_SCRIBE_TESSERACT_PATH")),
         screen_capture_interval_seconds=float(
             os.environ.get("MEETING_SCRIBE_SCREEN_INTERVAL", "3.0")
         ),

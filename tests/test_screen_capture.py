@@ -47,10 +47,10 @@ def test_dedup_skips_unchanged_frames_and_repeated_text():
     tess = FakePytesseract(["Slide 1", "Slide 1", "Slide 1", "Slide 2"])
 
     # 1st call: new frame, new text -> event fired
-    watcher._capture_once(sct, monitor=None, Image=FakeImage, pytesseract=tess)
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
     # 2nd call: identical frame hash -> OCR skipped entirely (no text consumed for it, but our fake
     # queue still advances only for calls that actually reach image_to_string)
-    watcher._capture_once(sct, monitor=None, Image=FakeImage, pytesseract=tess)
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
 
     assert len(events) == 1
     assert events[0].text == "Slide 1"
@@ -64,8 +64,8 @@ def test_new_frame_but_same_text_does_not_refire():
     sct = FakeSct([b"frame-a", b"frame-b"])
     tess = FakePytesseract(["Slide 1", "Slide 1"])
 
-    watcher._capture_once(sct, monitor=None, Image=FakeImage, pytesseract=tess)
-    watcher._capture_once(sct, monitor=None, Image=FakeImage, pytesseract=tess)
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
 
     assert len(events) == 1
 
@@ -78,7 +78,7 @@ def test_new_frame_new_text_fires_again():
     sct = FakeSct([b"frame-a", b"frame-b"])
     tess = FakePytesseract(["Slide 1", "Slide 2"])
 
-    watcher._capture_once(sct, monitor=None, Image=FakeImage, pytesseract=tess)
-    watcher._capture_once(sct, monitor=None, Image=FakeImage, pytesseract=tess)
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
 
     assert [e.text for e in events] == ["Slide 1", "Slide 2"]

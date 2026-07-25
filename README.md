@@ -8,7 +8,9 @@ screen, and turns the meeting into a searchable record.
 - **Records audio** from the microphone *and* the system output (WASAPI loopback), so it captures both
   sides of a call even when remote participants' audio never touches the mic.
 - **Watches the screen** at a low frame rate and OCRs it, so on-screen captions, shared slides, and chat
-  messages become part of the transcript even if they're never spoken aloud.
+  messages become part of the transcript even if they're never spoken aloud. You can point this at the
+  whole screen or at a single selected window (e.g. just the Teams/Zoom window), so it doesn't also OCR
+  unrelated desktop content.
 - **Transcribes** the recorded audio locally (no audio ever leaves the machine unless you opt into a
   cloud model) and merges it with the OCR stream into one time-ordered transcript.
 - **Generates notes and action items** by sending the finished transcript to Claude.
@@ -25,6 +27,7 @@ screen, and turns the meeting into a searchable record.
 | Speech-to-text | [faster-whisper](https://github.com/SYSTRAN/faster-whisper), local | Claude has no audio input; running Whisper locally keeps meeting audio on the machine and avoids per-minute STT billing. |
 | Screen OCR | [pytesseract](https://github.com/madmaze/pytesseract) (wraps Tesseract) | Lightweight, no GPU, no ML runtime to bundle — important for a single-file Windows executable. Requires the Tesseract binary (see Packaging). |
 | System audio capture | [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) | A PyAudio fork with WASAPI loopback support, i.e. it can record "what the speakers are playing" on Windows without a virtual audio cable. |
+| Window selection for OCR | [pywin32](https://github.com/mhammond/pywin32) (`win32gui`) | Enumerates open windows and re-reads a selected window's bounding box every capture cycle (it may move/resize), so OCR can be scoped to one app instead of the whole desktop. |
 | Notes/actions generation | Anthropic Claude | Given a finished transcript, produces a structured summary, decisions, and action items. |
 | Project search | SQLite FTS5 (full-text search), then Claude synthesizes the answer | Keeps the app dependency-light (no torch/embedding model to bundle) while still giving good keyword recall; Claude does the reasoning over the retrieved passages. This is intentionally swappable — see `storage/embeddings.py` stub if semantic search is wanted later. |
 | Packaging | PyInstaller, one-file build | Produces the standalone `.exe` the project requires. |
@@ -37,7 +40,8 @@ src/meeting_scribe/
   config.py          # data directory, API keys, per-project paths
   session.py          # orchestrates one meeting: start/stop recording, merge, notes, save
   audio/recorder.py   # mic + WASAPI loopback capture (Windows-only at runtime)
-  screen/capture.py   # periodic screenshot + OCR, deduplicated
+  screen/capture.py   # periodic screenshot + OCR, deduplicated, optionally scoped to one window
+  screen/window_picker.py  # enumerates open windows so one can be picked as the OCR target
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
   ai/notes.py          # Claude call that turns a transcript into notes + action items
   ai/search.py          # Ask-a-question-about-a-project flow (retrieve + Claude synthesis)
@@ -74,19 +78,28 @@ python -m meeting_scribe.main --gui
 
 Set `ANTHROPIC_API_KEY` in the environment before generating notes or asking questions about a project.
 
-Install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) and make sure `tesseract.exe` is on
-`PATH` (or point `MEETING_SCRIBE_TESSERACT_PATH` at it) for the screen-capture feature to work.
+For development, install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) and make sure
+`tesseract.exe` is on `PATH` (or point `MEETING_SCRIBE_TESSERACT_PATH` at it). The packaged `.exe` (below)
+bundles its own copy, so end users running the built app don't need to install Tesseract at all.
 
 ## Building the .exe
 
 ```bash
 pip install pyinstaller
+
+# Optional but recommended: fold your local Tesseract install into the exe so end users don't need
+# to install Tesseract themselves. Requires Tesseract to already be installed on the build machine —
+# see the link above. Skip this and the exe still works, but Tesseract must then be present on PATH
+# on whatever machine runs it.
+python packaging/vendor_tesseract.py
+
 python packaging/build.py
 ```
 
-This produces `dist/MeetingScribe.exe`. See `packaging/meeting_scribe.spec` for what gets bundled
-(Tesseract's data files still need to ship alongside the exe or be installed system-wide on the target
-machine — see the comment at the top of that file).
+This produces `dist/MeetingScribe.exe`. `packaging/meeting_scribe.spec` bundles whatever
+`vendor_tesseract.py` staged into `packaging/vendor/tesseract/` (nothing extra needed at runtime —
+`config.py` finds the bundled binary automatically via PyInstaller's `sys._MEIPASS`); if that folder is
+absent it builds without Tesseract bundled, matching the pre-existing PATH-based behavior.
 
 ## Status
 
@@ -102,4 +115,6 @@ everything together but likewise needs a Windows desktop session to click throug
 - Speaker diarization (who said what) — faster-whisper alone doesn't separate speakers; mic vs. system
   audio gives a coarse "you" vs. "everyone else" split today.
 - Auto-detect meeting start (e.g. when Teams/Zoom is foregrounded) instead of a manual start button.
-- Bundle a portable Tesseract build in the PyInstaller output so end users don't install it separately.
+- A selected window that's moved to another monitor still captures correctly (bounds are re-read every
+  cycle), but there's no UI feedback yet if the selected window closes mid-meeting — it just silently
+  stops contributing screen text for the rest of the meeting.
