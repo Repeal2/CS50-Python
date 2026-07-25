@@ -1,0 +1,44 @@
+name: Build Windows executable
+
+# Runs on a real Windows runner (PyInstaller doesn't cross-compile — a Linux box can't produce a .exe).
+on:
+  push:
+    branches:
+      - claude/windows-meeting-transcription-7bbck5
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install Tesseract OCR (build-time, so it can be vendored into the exe)
+        run: choco install tesseract --no-progress --yes
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Vendor Tesseract into the build
+        run: python packaging/vendor_tesseract.py
+
+      - name: Build MeetingScribe.exe
+        run: python packaging/build.py
+
+      - name: Upload MeetingScribe.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeetingScribe-windows
+          path: packaging/dist/MeetingScribe.exe
+          if-no-files-found: error
