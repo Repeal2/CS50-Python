@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -133,10 +134,21 @@ class SearchHit:
 
 
 class Database:
+    """One Database instance is shared across the GUI's main thread and the background worker threads
+    that run meeting-finalization and search (so the UI doesn't freeze during transcription/API calls).
+    sqlite3 connections are tied to the thread that created them by default (`check_same_thread=True`
+    raises "SQLite objects created in a thread can only be used in that same thread" otherwise) and
+    aren't safe for concurrent use from multiple threads even with that check disabled — so this opens
+    with `check_same_thread=False` and serializes every access with `self._lock`, since this instance is
+    used across threads (never truly concurrently in practice, but a lock removes that as a requirement
+    to reason about) rather than only within one.
+    """
+
     def __init__(self, path: Path | str):
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._path)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
@@ -156,7 +168,7 @@ class Database:
     def create_project(self, name: str) -> Project:
         slug = _slugify(name)
         created_at = _now()
-        with closing(self._conn.cursor()) as cur:
+        with self._lock, closing(self._conn.cursor()) as cur:
             cur.execute(
                 "INSERT INTO projects (name, slug, created_at) VALUES (?, ?, ?)",
                 (name, slug, created_at),
@@ -171,17 +183,19 @@ class Database:
         return self.create_project(name)
 
     def get_project_by_name(self, name: str) -> Project | None:
-        row = self._conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
         return Project(**dict(row)) if row else None
 
     def list_projects(self) -> list[Project]:
-        rows = self._conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
         return [Project(**dict(row)) for row in rows]
 
     # -- Meetings -----------------------------------------------------------
 
     def create_meeting(self, project_id: int, title: str, started_at: str | None = None) -> int:
-        with closing(self._conn.cursor()) as cur:
+        with self._lock, closing(self._conn.cursor()) as cur:
             cur.execute(
                 "INSERT INTO meetings (project_id, title, started_at) VALUES (?, ?, ?)",
                 (project_id, title, started_at or _now()),
@@ -194,12 +208,13 @@ class Database:
     ) -> None:
         if not text.strip():
             return
-        self._conn.execute(
-            "INSERT INTO transcript_segments (meeting_id, source, timestamp_seconds, text) "
-            "VALUES (?, ?, ?, ?)",
-            (meeting_id, source, timestamp_seconds, text),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO transcript_segments (meeting_id, source, timestamp_seconds, text) "
+                "VALUES (?, ?, ?, ?)",
+                (meeting_id, source, timestamp_seconds, text),
+            )
+            self._conn.commit()
 
     def finish_meeting(
         self,
@@ -208,34 +223,38 @@ class Database:
         notes_markdown: str | None = None,
         ended_at: str | None = None,
     ) -> None:
-        self._conn.execute(
-            "UPDATE meetings SET transcript_text = ?, notes_markdown = ?, ended_at = ? WHERE id = ?",
-            (transcript_text, notes_markdown, ended_at or _now(), meeting_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE meetings SET transcript_text = ?, notes_markdown = ?, ended_at = ? WHERE id = ?",
+                (transcript_text, notes_markdown, ended_at or _now(), meeting_id),
+            )
+            self._conn.commit()
 
     def get_meeting(self, meeting_id: int) -> Meeting | None:
-        row = self._conn.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
         return Meeting(**dict(row)) if row else None
 
     def list_meetings(self, project_id: int) -> list[Meeting]:
-        rows = self._conn.execute(
-            "SELECT * FROM meetings WHERE project_id = ? ORDER BY started_at DESC", (project_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM meetings WHERE project_id = ? ORDER BY started_at DESC", (project_id,)
+            ).fetchall()
         return [Meeting(**dict(row)) for row in rows]
 
     def get_segments(self, meeting_id: int) -> list[sqlite3.Row]:
-        return self._conn.execute(
-            "SELECT * FROM transcript_segments WHERE meeting_id = ? ORDER BY timestamp_seconds",
-            (meeting_id,),
-        ).fetchall()
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? ORDER BY timestamp_seconds",
+                (meeting_id,),
+            ).fetchall()
 
     # -- Documents ------------------------------------------------------------
 
     def add_document(
         self, project_id: int, filename: str, content_text: str, meeting_id: int | None = None
     ) -> int:
-        with closing(self._conn.cursor()) as cur:
+        with self._lock, closing(self._conn.cursor()) as cur:
             cur.execute(
                 "INSERT INTO documents (project_id, meeting_id, filename, content_text, added_at) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -245,9 +264,10 @@ class Database:
             return cur.lastrowid
 
     def list_documents(self, project_id: int) -> list[sqlite3.Row]:
-        return self._conn.execute(
-            "SELECT * FROM documents WHERE project_id = ? ORDER BY added_at DESC", (project_id,)
-        ).fetchall()
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM documents WHERE project_id = ? ORDER BY added_at DESC", (project_id,)
+            ).fetchall()
 
     # -- Search ----------------------------------------------------------------
 
@@ -258,17 +278,42 @@ class Database:
             return []
         hits: list[SearchHit] = []
 
-        for row in self._conn.execute(
-            """
-            SELECT ts.meeting_id, ts.source, ts.text, bm25(segments_fts) AS rank
-            FROM segments_fts
-            JOIN transcript_segments ts ON ts.id = segments_fts.rowid
-            JOIN meetings m ON m.id = ts.meeting_id
-            WHERE segments_fts MATCH ? AND m.project_id = ?
-            ORDER BY rank LIMIT ?
-            """,
-            (fts_query, project_id, limit),
-        ):
+        with self._lock:
+            segment_rows = self._conn.execute(
+                """
+                SELECT ts.meeting_id, ts.source, ts.text, bm25(segments_fts) AS rank
+                FROM segments_fts
+                JOIN transcript_segments ts ON ts.id = segments_fts.rowid
+                JOIN meetings m ON m.id = ts.meeting_id
+                WHERE segments_fts MATCH ? AND m.project_id = ?
+                ORDER BY rank LIMIT ?
+                """,
+                (fts_query, project_id, limit),
+            ).fetchall()
+
+            document_rows = self._conn.execute(
+                """
+                SELECT d.meeting_id, d.filename, d.content_text, bm25(documents_fts) AS rank
+                FROM documents_fts
+                JOIN documents d ON d.id = documents_fts.rowid
+                WHERE documents_fts MATCH ? AND d.project_id = ?
+                ORDER BY rank LIMIT ?
+                """,
+                (fts_query, project_id, limit),
+            ).fetchall()
+
+            meeting_rows = self._conn.execute(
+                """
+                SELECT mf.rowid AS meeting_id, m.title, m.notes_markdown, bm25(meetings_fts) AS rank
+                FROM meetings_fts mf
+                JOIN meetings m ON m.id = mf.rowid
+                WHERE meetings_fts MATCH ? AND m.project_id = ?
+                ORDER BY rank LIMIT ?
+                """,
+                (fts_query, project_id, limit),
+            ).fetchall()
+
+        for row in segment_rows:
             hits.append(
                 SearchHit(
                     kind="segment",
@@ -279,16 +324,7 @@ class Database:
                 )
             )
 
-        for row in self._conn.execute(
-            """
-            SELECT d.meeting_id, d.filename, d.content_text, bm25(documents_fts) AS rank
-            FROM documents_fts
-            JOIN documents d ON d.id = documents_fts.rowid
-            WHERE documents_fts MATCH ? AND d.project_id = ?
-            ORDER BY rank LIMIT ?
-            """,
-            (fts_query, project_id, limit),
-        ):
+        for row in document_rows:
             hits.append(
                 SearchHit(
                     kind="document",
@@ -299,16 +335,7 @@ class Database:
                 )
             )
 
-        for row in self._conn.execute(
-            """
-            SELECT mf.rowid AS meeting_id, m.title, m.notes_markdown, bm25(meetings_fts) AS rank
-            FROM meetings_fts mf
-            JOIN meetings m ON m.id = mf.rowid
-            WHERE meetings_fts MATCH ? AND m.project_id = ?
-            ORDER BY rank LIMIT ?
-            """,
-            (fts_query, project_id, limit),
-        ):
+        for row in meeting_rows:
             hits.append(
                 SearchHit(
                     kind="meeting",

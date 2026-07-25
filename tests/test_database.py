@@ -1,4 +1,33 @@
+import threading
+
 from meeting_scribe.storage.database import Database
+
+
+def test_database_usable_from_a_different_thread_than_it_was_created_on(tmp_path):
+    # Regression test: the GUI creates one Database on the main thread but writes to it from
+    # background worker threads (finishing a meeting, answering a question) so the UI doesn't freeze.
+    # sqlite3 connections default to check_same_thread=True, which raises "SQLite objects created in a
+    # thread can only be used in that same thread" the moment a worker thread touches them.
+    with Database(tmp_path / "test.db") as db:
+        project = db.create_project("Cross Thread")
+        result = {}
+
+        def worker():
+            try:
+                meeting_id = db.create_meeting(project.id, "From a worker thread")
+                db.add_transcript_segment(meeting_id, "mic", 0.0, "hello from a worker thread")
+                db.finish_meeting(meeting_id, transcript_text="hello from a worker thread")
+                result["meeting_id"] = meeting_id
+            except Exception as exc:  # noqa: BLE001 - want to assert on any exception, not just one type
+                result["error"] = exc
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert "error" not in result, f"worker thread raised: {result.get('error')}"
+        meeting = db.get_meeting(result["meeting_id"])
+        assert meeting.transcript_text == "hello from a worker thread"
 
 
 def test_create_project_and_meeting(tmp_path):
