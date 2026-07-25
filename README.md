@@ -73,7 +73,7 @@ question before handing them to Claude.
 python -m venv .venv
 .venv\Scripts\activate            # Windows
 pip install -r requirements.txt
-python -m meeting_scribe.main --gui
+python -m meeting_scribe.main       # launches the GUI by default (equivalent to `... main.py gui`)
 ```
 
 Set `ANTHROPIC_API_KEY` in the environment before generating notes or asking questions about a project.
