@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -17,6 +18,15 @@ from meeting_scribe.config import Settings, load_settings
 from meeting_scribe.session import MeetingSession
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text
+
+
+def _format_meeting_timestamp(iso_string: str) -> str:
+    """Renders a stored UTC ISO timestamp (e.g. "2026-07-25T12:17:32.123456+00:00") in the user's local
+    time and a human-readable format, instead of the raw string."""
+    try:
+        return datetime.fromisoformat(iso_string).astimezone().strftime("%b %d, %Y %I:%M %p")
+    except ValueError:
+        return iso_string
 
 
 class MeetingScribeApp(tk.Tk):
@@ -217,7 +227,7 @@ class ProjectsTab(ttk.Frame):
 
         project_list_frame = ttk.Frame(left)
         project_list_frame.pack(fill="both", expand=True)
-        self.project_list = tk.Listbox(project_list_frame, width=28, height=10, exportselection=False)
+        self.project_list = tk.Listbox(project_list_frame, width=36, height=10, exportselection=False)
         project_list_scrollbar = ttk.Scrollbar(
             project_list_frame, orient="vertical", command=self.project_list.yview
         )
@@ -229,7 +239,7 @@ class ProjectsTab(ttk.Frame):
         ttk.Label(left, text="Meetings").pack(anchor="w", pady=(12, 0))
         meeting_list_frame = ttk.Frame(left)
         meeting_list_frame.pack(fill="both", expand=True)
-        self.meeting_list = tk.Listbox(meeting_list_frame, width=28, height=10, exportselection=False)
+        self.meeting_list = tk.Listbox(meeting_list_frame, width=36, height=10, exportselection=False)
         meeting_list_scrollbar = ttk.Scrollbar(
             meeting_list_frame, orient="vertical", command=self.meeting_list.yview
         )
@@ -292,7 +302,8 @@ class ProjectsTab(ttk.Frame):
             return
         self._meetings = self.app.db.list_meetings(project.id)
         for meeting in self._meetings:
-            self.meeting_list.insert("end", f"{meeting.started_at}  {meeting.title}")
+            timestamp = _format_meeting_timestamp(meeting.started_at)
+            self.meeting_list.insert("end", f"{meeting.title} — {timestamp}")
 
     def _on_meeting_selected(self, _event) -> None:
         selection = self.meeting_list.curselection()
