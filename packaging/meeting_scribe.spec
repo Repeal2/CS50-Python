@@ -10,13 +10,17 @@
 # vendor_tesseract.py, the app still works as long as Tesseract is installed and on PATH on the target
 # machine — see the README's "Prerequisites" note.
 #
-# faster-whisper downloads its model weights on first use (cached under the user's home directory) —
-# they are intentionally not bundled into the exe to keep the initial download small.
+# faster-whisper downloads its speech model weights on first use (cached under the user's home
+# directory) — those are intentionally not bundled into the exe to keep the initial download small.
+# It does, however, ship a *fixed* voice-activity-detection model (silero_vad_v6.onnx) as package data
+# inside faster_whisper/assets/ — collect_submodules() only walks Python code, not that kind of data
+# file, so without collect_data_files() below it silently doesn't make it into the onefile bundle and
+# transcription fails at runtime with an ONNXRuntimeError "NO_SUCHFILE" the moment VAD filtering runs.
 
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
@@ -28,6 +32,7 @@ hidden_imports = (
 
 vendored_tesseract = Path(SPECPATH) / "vendor" / "tesseract"
 datas = [(str(vendored_tesseract), "tesseract")] if vendored_tesseract.exists() else []
+datas += collect_data_files("faster_whisper")
 
 a = Analysis(
     ["../src/meeting_scribe/main.py"],
