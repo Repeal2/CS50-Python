@@ -16,7 +16,9 @@ screen, and turns the meeting into a searchable record.
   unrelated desktop content.
 - **Transcribes** the recorded audio locally (no audio ever leaves the machine unless you opt into a
   cloud model) and merges it with the OCR stream into one time-ordered transcript.
-- **Generates notes and action items** by sending the finished transcript to Claude.
+- **Generates notes and action items** by sending the finished transcript to Claude, guided by a system
+  prompt you can edit in the Settings tab (prepopulated with a recommended default that explains what
+  Claude is receiving and how the output gets used).
 - **Files the meeting under a project.** Every meeting, plus any documents you attach to it (meeting
   invites, agendas, screenshots), is indexed so you can later ask "what did we decide about X" and get an
   answer synthesized from everything on file for that project.
@@ -84,6 +86,13 @@ needed. It's saved to `settings.json` in the app's data directory and takes effe
 `ANTHROPIC_API_KEY` / `MEETING_SCRIBE_MODEL` in the environment still works too, e.g. for scripted/CLI
 use, but a value saved via the Settings tab takes precedence.) Recording, transcription, and screen OCR
 all work with no key configured — only note generation and "Ask" need one.
+
+The Settings tab also has the **notes system prompt** sent to Claude alongside every transcript when a
+meeting finishes. It ships prepopulated with a recommended default that tells Claude what it's receiving
+(a merged, automated transcript from mic audio, system audio, and screen OCR — timestamped but imperfect)
+and how the output is used (saved as the meeting's permanent record, later retrieved to answer questions
+across a project), plus the section structure the app expects back. Edit it to change tone, sections, or
+detail level; "Reset to recommended default" restores the original text.
 
 For development, install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) and make sure
 `tesseract.exe` is on `PATH` (or point `MEETING_SCRIBE_TESSERACT_PATH` at it). The packaged `.exe` (below)

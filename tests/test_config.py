@@ -2,9 +2,11 @@ import sys
 
 from meeting_scribe.config import (
     DEFAULT_MODEL,
+    DEFAULT_NOTES_SYSTEM_PROMPT,
     load_settings,
     resolve_tesseract_cmd,
     update_audio_devices,
+    update_notes_system_prompt,
     update_settings,
 )
 
@@ -126,3 +128,38 @@ def test_update_audio_devices_does_not_clobber_api_settings(tmp_path, monkeypatc
     reloaded = load_settings()
     assert reloaded.anthropic_api_key == "sk-test"
     assert reloaded.mic_device_name == "USB Mic"
+
+
+def test_load_settings_defaults_to_the_recommended_notes_system_prompt(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    assert load_settings().notes_system_prompt == DEFAULT_NOTES_SYSTEM_PROMPT
+
+
+def test_update_notes_system_prompt_persists_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_notes_system_prompt(load_settings(), notes_system_prompt="Custom prompt text.")
+
+    assert load_settings().notes_system_prompt == "Custom prompt text."
+
+
+def test_update_notes_system_prompt_treats_blank_as_reset_to_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_notes_system_prompt(load_settings(), notes_system_prompt="Custom prompt text.")
+    cleared = update_notes_system_prompt(load_settings(), notes_system_prompt="   \n  ")
+
+    assert cleared.notes_system_prompt == DEFAULT_NOTES_SYSTEM_PROMPT
+    assert load_settings().notes_system_prompt == DEFAULT_NOTES_SYSTEM_PROMPT
+
+
+def test_update_notes_system_prompt_does_not_clobber_api_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = update_settings(load_settings(), anthropic_api_key="sk-test", anthropic_model=DEFAULT_MODEL)
+    update_notes_system_prompt(settings, notes_system_prompt="Custom prompt text.")
+
+    reloaded = load_settings()
+    assert reloaded.anthropic_api_key == "sk-test"
+    assert reloaded.notes_system_prompt == "Custom prompt text."

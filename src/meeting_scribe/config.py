@@ -19,6 +19,38 @@ AVAILABLE_MODELS = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
 
 DEFAULT_MODEL = "claude-opus-5"
 
+# Prepopulated into the Settings tab's system prompt field. Explains to the model what it's being handed
+# (a merged, automated, imperfect transcript) and what happens to what it produces (saved as the permanent
+# record of the meeting, later retrieved to answer questions across a project) so a user who edits this
+# has a template for what information matters to include.
+DEFAULT_NOTES_SYSTEM_PROMPT = """You are a meeting assistant. You will receive a single merged transcript \
+of a meeting, combining three sources: audio from the user's own microphone, audio from the meeting's \
+system/speaker output (everyone else on the call), and text OCR'd from the screen during the meeting \
+(slides, captions, shared chat). Lines are in chronological order, but the transcription and OCR are \
+automated and may contain errors, misattributions, or gaps.
+
+Turn this into concise, well-structured notes formatted as Markdown with these sections, in this order:
+
+## Summary
+2-4 sentences on what the meeting was about and its outcome.
+
+## Key Discussion Points
+Bullet list of the topics covered.
+
+## Decisions
+Bullet list of decisions made. Omit this section if none were made.
+
+## Action Items
+A markdown table with columns: Owner | Action | Due date (use "unspecified" when the transcript doesn't \
+say). Omit this section if there are none.
+
+Base everything strictly on the transcript. Do not invent names, dates, or commitments that aren't in it.
+
+These notes become the permanent record of this meeting: they're shown to the user directly, and later \
+indexed so they (or a future search) can ask "what did we decide about X" across every meeting in the \
+project. Write for that audience — someone who wasn't necessarily in the meeting and is relying on these \
+notes to reconstruct what happened."""
+
 
 def _default_data_dir() -> Path:
     override = os.environ.get("MEETING_SCRIBE_DATA_DIR")
@@ -66,6 +98,7 @@ class Settings:
     # historical/simple behavior, and still the default until the user picks something explicit.
     mic_device_name: str | None = None
     system_device_name: str | None = None
+    notes_system_prompt: str = DEFAULT_NOTES_SYSTEM_PROMPT
 
     @property
     def db_path(self) -> Path:
@@ -109,6 +142,7 @@ def save_user_config(settings: Settings) -> None:
         "anthropic_model": settings.anthropic_model,
         "mic_device_name": settings.mic_device_name,
         "system_device_name": settings.system_device_name,
+        "notes_system_prompt": settings.notes_system_prompt,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -126,6 +160,14 @@ def update_audio_devices(
     """Applies and persists a microphone / system-audio device choice from the Settings tab. None means
     "use whatever Windows currently considers the default" for that device."""
     updated = replace(settings, mic_device_name=mic_device_name, system_device_name=system_device_name)
+    save_user_config(updated)
+    return updated
+
+
+def update_notes_system_prompt(settings: Settings, *, notes_system_prompt: str) -> Settings:
+    """Applies and persists an edit to the notes system prompt from the Settings tab. A blank value
+    resets to the recommended default rather than sending Claude an empty system prompt."""
+    updated = replace(settings, notes_system_prompt=notes_system_prompt.strip() or DEFAULT_NOTES_SYSTEM_PROMPT)
     save_user_config(updated)
     return updated
 
@@ -155,4 +197,5 @@ def load_settings() -> Settings:
         ),
         mic_device_name=user_config.get("mic_device_name"),
         system_device_name=user_config.get("system_device_name"),
+        notes_system_prompt=user_config.get("notes_system_prompt") or DEFAULT_NOTES_SYSTEM_PROMPT,
     )

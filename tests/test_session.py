@@ -8,16 +8,26 @@ from meeting_scribe.storage.database import Database
 from meeting_scribe.transcription.engine import TranscriptLine
 
 
-def _settings(tmp_path: Path, mic_device_name=None, system_device_name=None) -> Settings:
+def _settings(
+    tmp_path: Path,
+    mic_device_name=None,
+    system_device_name=None,
+    anthropic_api_key=None,
+    notes_system_prompt=None,
+) -> Settings:
+    kwargs = {}
+    if notes_system_prompt is not None:
+        kwargs["notes_system_prompt"] = notes_system_prompt
     return Settings(
         data_dir=tmp_path,
-        anthropic_api_key=None,
+        anthropic_api_key=anthropic_api_key,
         anthropic_model="claude-opus-5",
         whisper_model_size="tiny",
         tesseract_cmd=None,
         screen_capture_interval_seconds=3.0,
         mic_device_name=mic_device_name,
         system_device_name=system_device_name,
+        **kwargs,
     )
 
 
@@ -103,3 +113,31 @@ def test_session_audio_levels_reads_through_to_recorder(tmp_path):
         with Database(tmp_path / "test.db") as db:
             session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
             assert session.audio_levels() == (0.42, 0.13)
+
+
+def test_session_passes_configured_system_prompt_to_notes_generation(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.generate_notes") as mock_generate_notes,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        mock_generate_notes.return_value = "Notes."
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(
+                tmp_path, anthropic_api_key="sk-test", notes_system_prompt="Custom prompt text."
+            )
+            session = MeetingSession(settings, db, "Test Project", "Kickoff")
+            session.start()
+            session.stop()
+
+            _args, kwargs = mock_generate_notes.call_args
+            assert kwargs["system_prompt"] == "Custom prompt text."

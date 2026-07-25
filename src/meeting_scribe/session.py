@@ -88,6 +88,7 @@ class MeetingSession:
                 transcript_text,
                 api_key=self._settings.anthropic_api_key,
                 model=self._settings.anthropic_model,
+                system_prompt=self._settings.notes_system_prompt,
             )
 
         self._db.finish_meeting(self.meeting_id, transcript_text=transcript_text, notes_markdown=notes)

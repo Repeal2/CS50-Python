@@ -16,9 +16,11 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from meeting_scribe.ai.search import ask as ask_project
 from meeting_scribe.config import (
     AVAILABLE_MODELS,
+    DEFAULT_NOTES_SYSTEM_PROMPT,
     Settings,
     load_settings,
     update_audio_devices,
+    update_notes_system_prompt,
     update_settings,
 )
 from meeting_scribe.session import MeetingSession
@@ -591,6 +593,22 @@ class SettingsTab(ttk.Frame):
         )
         form.columnconfigure(1, weight=1)
 
+        prompt_header = ttk.Frame(self)
+        prompt_header.pack(fill="x", padx=12, pady=(4, 0))
+        ttk.Label(prompt_header, text="Notes system prompt").pack(side="left")
+        ttk.Button(
+            prompt_header, text="Reset to recommended default", command=self._reset_system_prompt
+        ).pack(side="right")
+
+        prompt_frame = ttk.Frame(self)
+        prompt_frame.pack(fill="both", expand=True, padx=12, pady=(4, 4))
+        self.prompt_text = tk.Text(prompt_frame, wrap="word", height=12)
+        prompt_scrollbar = ttk.Scrollbar(prompt_frame, orient="vertical", command=self.prompt_text.yview)
+        self.prompt_text.configure(yscrollcommand=prompt_scrollbar.set)
+        self.prompt_text.insert("1.0", self.app.settings.notes_system_prompt)
+        self.prompt_text.pack(side="left", fill="both", expand=True)
+        prompt_scrollbar.pack(side="right", fill="y")
+
         ttk.Button(self, text="Save", command=self._save).pack(anchor="w", padx=12)
 
         self.status_var = tk.StringVar()
@@ -603,7 +621,9 @@ class SettingsTab(ttk.Frame):
             "Microphone / system audio pick which device gets recorded — useful if you have more than "
             "one mic, or the wrong one is the Windows default. \"System default\" always follows "
             "whatever Windows currently has set as default. Watch the level meters on the Record tab "
-            "to confirm a device is actually picking up audio."
+            "to confirm a device is actually picking up audio.\n\n"
+            "The notes system prompt is sent to Claude alongside every meeting transcript when you finish "
+            "a meeting — edit it to change the tone, sections, or level of detail of the generated notes."
         )
         ttk.Label(self, text=note, wraplength=560, justify="left", foreground="#555").pack(
             anchor="w", padx=12, pady=(12, 0)
@@ -614,6 +634,10 @@ class SettingsTab(ttk.Frame):
 
     def _toggle_key_visibility(self) -> None:
         self.api_key_entry.configure(show="" if self.show_key_var.get() else "*")
+
+    def _reset_system_prompt(self) -> None:
+        self.prompt_text.delete("1.0", "end")
+        self.prompt_text.insert("1.0", DEFAULT_NOTES_SYSTEM_PROMPT)
 
     def _refresh_status(self) -> None:
         if self.app.settings.anthropic_api_key:
@@ -655,6 +679,9 @@ class SettingsTab(ttk.Frame):
         )
         self.app.settings = update_audio_devices(
             self.app.settings, mic_device_name=mic_name, system_device_name=system_name
+        )
+        self.app.settings = update_notes_system_prompt(
+            self.app.settings, notes_system_prompt=self.prompt_text.get("1.0", "end")
         )
         self.model_var.set(self.app.settings.anthropic_model)
         self._refresh_status()

@@ -4,28 +4,14 @@ from __future__ import annotations
 
 import anthropic
 
-NOTES_SYSTEM_PROMPT = """You are a meeting assistant. Given a raw meeting transcript, produce concise, \
-well-structured notes formatted as Markdown with these sections, in this order:
-
-## Summary
-2-4 sentences on what the meeting was about and its outcome.
-
-## Key Discussion Points
-Bullet list of the topics covered.
-
-## Decisions
-Bullet list of decisions made. Omit this section if none were made.
-
-## Action Items
-A markdown table with columns: Owner | Action | Due date (use "unspecified" when the transcript \
-doesn't say). Omit this section if there are none.
-
-Base everything strictly on the transcript. Do not invent names, dates, or commitments that aren't \
-in it."""
+from meeting_scribe.config import DEFAULT_NOTES_SYSTEM_PROMPT
 
 
-def generate_notes(transcript_text: str, *, api_key: str, model: str) -> str:
-    """Calls Claude once to turn a transcript into Markdown notes + action items."""
+def generate_notes(
+    transcript_text: str, *, api_key: str, model: str, system_prompt: str = DEFAULT_NOTES_SYSTEM_PROMPT
+) -> str:
+    """Calls Claude once to turn a transcript into Markdown notes + action items. `system_prompt` is
+    user-editable (Settings tab) so defaults to the recommended prompt rather than being hardcoded."""
     if not transcript_text.strip():
         raise ValueError("Cannot generate notes from an empty transcript")
 
@@ -33,7 +19,7 @@ def generate_notes(transcript_text: str, *, api_key: str, model: str) -> str:
     response = client.messages.create(
         model=model,
         max_tokens=8192,
-        system=NOTES_SYSTEM_PROMPT,
+        system=system_prompt,
         output_config={"effort": "medium"},
         messages=[{"role": "user", "content": transcript_text}],
     )
