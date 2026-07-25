@@ -1,0 +1,19 @@
+[project]
+name = "meeting-scribe"
+version = "0.1.0"
+description = "Windows meeting recorder: audio + screen capture, transcription, AI notes, and a searchable project archive."
+requires-python = ">=3.10"
+
+[project.scripts]
+meeting-scribe = "meeting_scribe.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

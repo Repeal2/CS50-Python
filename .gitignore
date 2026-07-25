@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+*.spec.bak
+
+# Runtime data (recordings, transcripts, the sqlite db)
+.meeting_scribe_data/
+*.db
+*.wav
+
+.pytest_cache/
+.mypy_cache/
