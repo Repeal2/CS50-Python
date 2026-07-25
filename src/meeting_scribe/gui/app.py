@@ -2,7 +2,8 @@
 documents, and ask questions about a project.
 
 Windows desktop only (ships with Python's standard install there). Recording and note generation run on
-a background thread so the UI doesn't freeze during transcription or the Claude call.
+a background thread so the UI doesn't freeze during transcription or the (now much slower, since it
+round-trips through a Power Automate/Copilot Studio flow) notes-generation wait.
 """
 
 from __future__ import annotations
@@ -13,15 +14,15 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from meeting_scribe.ai.copilot_bridge import CopilotResponseTimeout
 from meeting_scribe.ai.search import ask as ask_project
 from meeting_scribe.config import (
-    AVAILABLE_MODELS,
     DEFAULT_NOTES_SYSTEM_PROMPT,
     Settings,
     load_settings,
     update_audio_devices,
+    update_copilot_settings,
     update_notes_system_prompt,
-    update_settings,
 )
 from meeting_scribe.screen.region_picker import RegionOutline, RegionTarget, pick_region_interactively
 from meeting_scribe.session import MeetingSession
@@ -365,7 +366,9 @@ class RecordTab(ttk.Frame):
         if session is None:
             return
         self.stop_button["state"] = "disabled"
-        self.status_var.set("Transcribing and generating notes… this can take a minute.")
+        self.status_var.set(
+            "Transcribing, then waiting on Copilot Studio for notes… this can take a few minutes."
+        )
 
         def worker() -> None:
             try:
@@ -373,14 +376,17 @@ class RecordTab(ttk.Frame):
             except Exception as exc:  # surfaced to the user regardless of cause
                 self.after(0, self._on_stop_failed, exc)
                 return
-            self.after(0, self._on_stop_done, result)
+            self.after(0, self._on_stop_done, result, session.notes_timed_out)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_stop_done(self, result: str) -> None:
+    def _on_stop_done(self, result: str, notes_timed_out: bool) -> None:
         self.output.delete("1.0", "end")
         self.output.insert("1.0", result)
-        self.status_var.set("Saved.")
+        if notes_timed_out:
+            self.status_var.set("Saved — but notes generation timed out; the plain transcript was saved.")
+        else:
+            self.status_var.set("Saved.")
         self.start_button["state"] = "normal"
         self.app._session = None
         self.app.refresh_project_lists()
@@ -558,7 +564,7 @@ class ProjectsTab(ttk.Frame):
 
         notes = meeting.notes_markdown
         _set_text(
-            self.notes_text, notes or "(no AI notes yet — set your API key in the Settings tab)"
+            self.notes_text, notes or "(no AI notes yet — set up the Copilot sync folder in the Settings tab)"
         )
         action_items = _extract_section(notes, "Action Items") if notes else None
         _set_text(self.actions_text, action_items or "(no action items)")
@@ -621,10 +627,13 @@ class ProjectsTab(ttk.Frame):
         question = self.question_var.get().strip()
         if project is None or not question:
             return
-        if not self.app.settings.anthropic_api_key:
-            messagebox.showerror("Meeting Scribe", "Set your API key in the Settings tab to ask questions.")
+        settings = self.app.settings
+        if settings.copilot_sync_dir is None:
+            messagebox.showerror(
+                "Meeting Scribe", "Set up the Copilot sync folder in the Settings tab to ask questions."
+            )
             return
-        _set_text(self.answer_text, "Thinking…")
+        _set_text(self.answer_text, "Waiting on Copilot Studio… this can take a while.")
 
         def worker() -> None:
             try:
@@ -632,9 +641,13 @@ class ProjectsTab(ttk.Frame):
                     self.app.db,
                     project.id,
                     question,
-                    api_key=self.app.settings.anthropic_api_key,
-                    model=self.app.settings.anthropic_model,
+                    inbox_dir=settings.copilot_inbox_dir,
+                    outbox_dir=settings.copilot_outbox_dir,
+                    poll_interval_seconds=settings.copilot_poll_interval_seconds,
+                    timeout_seconds=settings.copilot_timeout_seconds,
                 )
+            except CopilotResponseTimeout as exc:
+                answer = str(exc)
             except Exception as exc:  # surfaced to the user regardless of cause
                 answer = f"Couldn't answer that: {exc}"
             self.after(0, self._show_answer, answer)
@@ -646,9 +659,9 @@ class ProjectsTab(ttk.Frame):
 
 
 class SettingsTab(ttk.Frame):
-    """API key, model, and audio device selection — all editable without touching environment
-    variables. Saved settings are written to disk (see config.save_user_config) and take effect
-    immediately for this running session."""
+    """Copilot Studio bridge folder, notes prompt, and audio device selection — all editable without
+    touching environment variables. Saved settings are written to disk (see config.save_user_config)
+    and take effect immediately for this running session."""
 
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
@@ -659,37 +672,41 @@ class SettingsTab(ttk.Frame):
         form = ttk.Frame(self)
         form.pack(fill="x", padx=12, pady=12, anchor="n")
 
-        ttk.Label(form, text="Anthropic API key").grid(row=0, column=0, sticky="w")
-        self.api_key_var = tk.StringVar(value=self.app.settings.anthropic_api_key or "")
-        self.api_key_entry = ttk.Entry(form, textvariable=self.api_key_var, width=48, show="*")
-        self.api_key_entry.grid(row=0, column=1, sticky="we", padx=6, pady=4)
-
-        self.show_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            form, text="Show", variable=self.show_key_var, command=self._toggle_key_visibility
-        ).grid(row=0, column=2, padx=(6, 0))
-
-        ttk.Label(form, text="Model").grid(row=1, column=0, sticky="w")
-        self.model_var = tk.StringVar(value=self.app.settings.anthropic_model)
-        self.model_combo = ttk.Combobox(
-            form, textvariable=self.model_var, width=45, values=AVAILABLE_MODELS
+        ttk.Label(form, text="Copilot sync folder").grid(row=0, column=0, sticky="w")
+        self.sync_dir_var = tk.StringVar(
+            value=str(self.app.settings.copilot_sync_dir) if self.app.settings.copilot_sync_dir else ""
         )
-        self.model_combo.grid(row=1, column=1, sticky="we", padx=6, pady=4)
+        ttk.Entry(form, textvariable=self.sync_dir_var, width=48).grid(
+            row=0, column=1, sticky="we", padx=6, pady=4
+        )
+        ttk.Button(form, text="Browse…", command=self._browse_sync_dir).grid(row=0, column=2, padx=(6, 0))
 
-        ttk.Label(form, text="Microphone").grid(row=2, column=0, sticky="w")
+        ttk.Label(form, text="Poll interval (seconds)").grid(row=1, column=0, sticky="w")
+        self.poll_interval_var = tk.StringVar(value=str(self.app.settings.copilot_poll_interval_seconds))
+        ttk.Entry(form, textvariable=self.poll_interval_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=6, pady=4
+        )
+
+        ttk.Label(form, text="Timeout (seconds)").grid(row=2, column=0, sticky="w")
+        self.timeout_var = tk.StringVar(value=str(self.app.settings.copilot_timeout_seconds))
+        ttk.Entry(form, textvariable=self.timeout_var, width=10).grid(
+            row=2, column=1, sticky="w", padx=6, pady=4
+        )
+
+        ttk.Label(form, text="Microphone").grid(row=3, column=0, sticky="w")
         self.mic_var = tk.StringVar(value=self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
         self.mic_combo = ttk.Combobox(form, textvariable=self.mic_var, width=45, state="readonly")
-        self.mic_combo.grid(row=2, column=1, sticky="we", padx=6, pady=4)
+        self.mic_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
 
-        ttk.Label(form, text="System audio (speaker)").grid(row=3, column=0, sticky="w")
+        ttk.Label(form, text="System audio (speaker)").grid(row=4, column=0, sticky="w")
         self.system_var = tk.StringVar(
             value=self.app.settings.system_device_name or SYSTEM_DEFAULT_LABEL
         )
         self.system_combo = ttk.Combobox(form, textvariable=self.system_var, width=45, state="readonly")
-        self.system_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
+        self.system_combo.grid(row=4, column=1, sticky="we", padx=6, pady=4)
 
         ttk.Button(form, text="Refresh devices", command=self._refresh_devices).grid(
-            row=2, column=2, rowspan=2, padx=(6, 0)
+            row=3, column=2, rowspan=2, padx=(6, 0)
         )
         form.columnconfigure(1, weight=1)
 
@@ -715,15 +732,20 @@ class SettingsTab(ttk.Frame):
         ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=12, pady=(8, 0))
 
         note = (
-            "The API key is used to generate meeting notes and answer questions about a project — "
-            "recording, transcription, and screen OCR all work without one. Get a key at "
-            "console.anthropic.com.\n\n"
+            "Meeting notes and Ask no longer call an AI API directly (governance doesn't allow that) — "
+            "instead, the transcript is dropped as a text file into an \"Inbox\" folder under the folder "
+            "you set here, which must be a location OneDrive/SharePoint is already syncing. A Power "
+            "Automate flow (built and owned outside this app, in the Power Platform admin UI) is "
+            "expected to pick it up, run it through Copilot Studio, and write the result back into a "
+            "matching \"Outbox\" folder. This app just waits, polling every \"poll interval\" up to "
+            "\"timeout\" — recording, transcription, and screen OCR all work with no folder configured.\n\n"
             "Microphone / system audio pick which device gets recorded — useful if you have more than "
             "one mic, or the wrong one is the Windows default. \"System default\" always follows "
             "whatever Windows currently has set as default. Watch the level meters on the Record tab "
             "to confirm a device is actually picking up audio.\n\n"
-            "The notes system prompt is sent to Claude alongside every meeting transcript when you finish "
-            "a meeting — edit it to change the tone, sections, or level of detail of the generated notes."
+            "The notes system prompt is bundled into the request file sent to the flow — edit it to "
+            "change the tone, sections, or level of detail of the generated notes (whoever builds the "
+            "flow needs to pass the file's content straight through to the GPT/Copilot Studio action)."
         )
         ttk.Label(self, text=note, wraplength=560, justify="left", foreground="#555").pack(
             anchor="w", padx=12, pady=(12, 0)
@@ -732,18 +754,22 @@ class SettingsTab(ttk.Frame):
         self._refresh_status()
         self._refresh_devices()
 
-    def _toggle_key_visibility(self) -> None:
-        self.api_key_entry.configure(show="" if self.show_key_var.get() else "*")
+    def _browse_sync_dir(self) -> None:
+        chosen = filedialog.askdirectory(title="Choose a OneDrive/SharePoint-synced folder")
+        if chosen:
+            self.sync_dir_var.set(chosen)
 
     def _reset_system_prompt(self) -> None:
         self.prompt_text.delete("1.0", "end")
         self.prompt_text.insert("1.0", DEFAULT_NOTES_SYSTEM_PROMPT)
 
     def _refresh_status(self) -> None:
-        if self.app.settings.anthropic_api_key:
-            self.status_var.set(f"API key is set. Using model: {self.app.settings.anthropic_model}")
+        if self.app.settings.copilot_sync_dir:
+            self.status_var.set(f"Copilot sync folder set: {self.app.settings.copilot_sync_dir}")
         else:
-            self.status_var.set("No API key set — notes generation and Ask are disabled until one is.")
+            self.status_var.set(
+                "No Copilot sync folder set — notes generation and Ask are disabled until one is."
+            )
 
     def _refresh_devices(self) -> None:
         """Repopulates the microphone/system-audio dropdowns with currently available devices."""
@@ -768,14 +794,22 @@ class SettingsTab(ttk.Frame):
             self.system_var.set(SYSTEM_DEFAULT_LABEL)
 
     def _save(self) -> None:
-        model = self.model_var.get().strip() or self.app.settings.anthropic_model
         mic_name = None if self.mic_var.get() == SYSTEM_DEFAULT_LABEL else self.mic_var.get()
         system_name = (
             None if self.system_var.get() == SYSTEM_DEFAULT_LABEL else self.system_var.get()
         )
+        try:
+            poll_interval_seconds = float(self.poll_interval_var.get())
+            timeout_seconds = float(self.timeout_var.get())
+        except ValueError:
+            messagebox.showerror("Meeting Scribe", "Poll interval and timeout must be numbers.")
+            return
 
-        self.app.settings = update_settings(
-            self.app.settings, anthropic_api_key=self.api_key_var.get().strip(), anthropic_model=model
+        self.app.settings = update_copilot_settings(
+            self.app.settings,
+            copilot_sync_dir=self.sync_dir_var.get().strip(),
+            poll_interval_seconds=poll_interval_seconds,
+            timeout_seconds=timeout_seconds,
         )
         self.app.settings = update_audio_devices(
             self.app.settings, mic_device_name=mic_name, system_device_name=system_name
@@ -783,7 +817,6 @@ class SettingsTab(ttk.Frame):
         self.app.settings = update_notes_system_prompt(
             self.app.settings, notes_system_prompt=self.prompt_text.get("1.0", "end")
         )
-        self.model_var.set(self.app.settings.anthropic_model)
         self._refresh_status()
         self.app.sync_device_displays()
         messagebox.showinfo("Meeting Scribe", "Settings saved.")

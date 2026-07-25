@@ -1,13 +1,15 @@
 import sys
+from pathlib import Path
 
 from meeting_scribe.config import (
-    DEFAULT_MODEL,
+    DEFAULT_COPILOT_POLL_INTERVAL_SECONDS,
+    DEFAULT_COPILOT_TIMEOUT_SECONDS,
     DEFAULT_NOTES_SYSTEM_PROMPT,
     load_settings,
     resolve_tesseract_cmd,
     update_audio_devices,
+    update_copilot_settings,
     update_notes_system_prompt,
-    update_settings,
 )
 
 
@@ -33,59 +35,6 @@ def test_returns_none_when_not_frozen_and_no_explicit_path(monkeypatch):
 def test_returns_none_when_frozen_but_bundle_missing_tesseract(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)  # no tesseract/ subdir created
     assert resolve_tesseract_cmd(None) is None
-
-
-def test_load_settings_falls_back_to_default_model_with_no_key_or_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("MEETING_SCRIBE_MODEL", raising=False)
-
-    settings = load_settings()
-
-    assert settings.anthropic_api_key is None
-    assert settings.anthropic_model == DEFAULT_MODEL
-
-
-def test_load_settings_uses_env_vars_when_no_saved_settings(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
-    monkeypatch.setenv("MEETING_SCRIBE_MODEL", "claude-sonnet-5")
-
-    settings = load_settings()
-
-    assert settings.anthropic_api_key == "sk-from-env"
-    assert settings.anthropic_model == "claude-sonnet-5"
-
-
-def test_saved_settings_take_precedence_over_env_vars(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
-    monkeypatch.setenv("MEETING_SCRIBE_MODEL", "claude-sonnet-5")
-
-    update_settings(load_settings(), anthropic_api_key="sk-from-settings-tab", anthropic_model="claude-haiku-4-5")
-
-    reloaded = load_settings()
-    assert reloaded.anthropic_api_key == "sk-from-settings-tab"
-    assert reloaded.anthropic_model == "claude-haiku-4-5"
-
-
-def test_update_settings_persists_and_returns_the_new_settings(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
-
-    updated = update_settings(load_settings(), anthropic_api_key="sk-test", anthropic_model="claude-opus-5")
-
-    assert updated.anthropic_api_key == "sk-test"
-    assert updated.anthropic_model == "claude-opus-5"
-    assert (tmp_path / "settings.json").exists()
-
-
-def test_update_settings_treats_blank_key_as_cleared(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
-
-    update_settings(load_settings(), anthropic_api_key="sk-test", anthropic_model=DEFAULT_MODEL)
-    cleared = update_settings(load_settings(), anthropic_api_key="", anthropic_model=DEFAULT_MODEL)
-
-    assert cleared.anthropic_api_key is None
 
 
 def test_load_settings_defaults_to_no_device_override(tmp_path, monkeypatch):
@@ -119,17 +68,6 @@ def test_update_audio_devices_can_reset_to_system_default(tmp_path, monkeypatch)
     assert cleared.system_device_name is None
 
 
-def test_update_audio_devices_does_not_clobber_api_settings(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
-
-    settings = update_settings(load_settings(), anthropic_api_key="sk-test", anthropic_model=DEFAULT_MODEL)
-    update_audio_devices(settings, mic_device_name="USB Mic", system_device_name=None)
-
-    reloaded = load_settings()
-    assert reloaded.anthropic_api_key == "sk-test"
-    assert reloaded.mic_device_name == "USB Mic"
-
-
 def test_load_settings_defaults_to_the_recommended_notes_system_prompt(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
@@ -154,12 +92,78 @@ def test_update_notes_system_prompt_treats_blank_as_reset_to_default(tmp_path, m
     assert load_settings().notes_system_prompt == DEFAULT_NOTES_SYSTEM_PROMPT
 
 
-def test_update_notes_system_prompt_does_not_clobber_api_settings(tmp_path, monkeypatch):
+def test_load_settings_defaults_to_no_copilot_sync_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("MEETING_SCRIBE_COPILOT_SYNC_DIR", raising=False)
+
+    settings = load_settings()
+
+    assert settings.copilot_sync_dir is None
+    assert settings.copilot_poll_interval_seconds == DEFAULT_COPILOT_POLL_INTERVAL_SECONDS
+    assert settings.copilot_timeout_seconds == DEFAULT_COPILOT_TIMEOUT_SECONDS
+
+
+def test_load_settings_uses_copilot_sync_dir_env_var(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEETING_SCRIBE_COPILOT_SYNC_DIR", str(tmp_path / "OneDrive" / "Bridge"))
+
+    settings = load_settings()
+
+    assert settings.copilot_sync_dir == tmp_path / "OneDrive" / "Bridge"
+
+
+def test_copilot_inbox_and_outbox_are_subfolders_of_the_sync_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    settings = update_settings(load_settings(), anthropic_api_key="sk-test", anthropic_model=DEFAULT_MODEL)
-    update_notes_system_prompt(settings, notes_system_prompt="Custom prompt text.")
+    settings = update_copilot_settings(
+        load_settings(),
+        copilot_sync_dir=str(tmp_path / "Bridge"),
+        poll_interval_seconds=5,
+        timeout_seconds=120,
+    )
+
+    assert settings.copilot_inbox_dir == tmp_path / "Bridge" / "Inbox"
+    assert settings.copilot_outbox_dir == tmp_path / "Bridge" / "Outbox"
+
+
+def test_update_copilot_settings_persists_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_copilot_settings(
+        load_settings(),
+        copilot_sync_dir=str(tmp_path / "Bridge"),
+        poll_interval_seconds=10,
+        timeout_seconds=600,
+    )
 
     reloaded = load_settings()
-    assert reloaded.anthropic_api_key == "sk-test"
-    assert reloaded.notes_system_prompt == "Custom prompt text."
+    assert reloaded.copilot_sync_dir == Path(tmp_path / "Bridge")
+    assert reloaded.copilot_poll_interval_seconds == 10
+    assert reloaded.copilot_timeout_seconds == 600
+
+
+def test_update_copilot_settings_can_clear_the_sync_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_copilot_settings(
+        load_settings(), copilot_sync_dir=str(tmp_path / "Bridge"), poll_interval_seconds=5, timeout_seconds=60
+    )
+    cleared = update_copilot_settings(
+        load_settings(), copilot_sync_dir=None, poll_interval_seconds=5, timeout_seconds=60
+    )
+
+    assert cleared.copilot_sync_dir is None
+    assert load_settings().copilot_sync_dir is None
+
+
+def test_update_copilot_settings_does_not_clobber_audio_devices(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_copilot_settings(
+        settings, copilot_sync_dir=str(tmp_path / "Bridge"), poll_interval_seconds=5, timeout_seconds=60
+    )
+
+    reloaded = load_settings()
+    assert reloaded.mic_device_name == "USB Mic"
+    assert reloaded.copilot_sync_dir == tmp_path / "Bridge"

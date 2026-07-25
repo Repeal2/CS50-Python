@@ -15,14 +15,15 @@ screen, and turns the meeting into a searchable record.
   whole screen, a single selected window (e.g. just the Teams/Zoom window), or a custom rectangle you
   drag out yourself (e.g. just a captions bar) — the app draws a live boundary around whichever custom
   area is active so it's always visible on screen what's being captured.
-- **Transcribes** the recorded audio locally (no audio ever leaves the machine unless you opt into a
-  cloud model) and merges it with the OCR stream into one time-ordered transcript.
-- **Generates notes and action items** by sending the finished transcript to Claude, guided by a system
-  prompt you can edit in the Settings tab (prepopulated with a recommended default that explains what
-  Claude is receiving and how the output gets used).
+- **Transcribes** the recorded audio locally (no audio ever leaves the machine) and merges it with the
+  OCR stream into one time-ordered transcript.
+- **Generates notes and action items** via a Microsoft Copilot Studio / Power Automate flow (see
+  "The Copilot Studio bridge" below) — there's no direct call to an external AI API, since that isn't an
+  option under some organizations' governance policy. A system prompt you can edit in the Settings tab
+  (prepopulated with a recommended default) is bundled into what gets sent to the flow.
 - **Files the meeting under a project.** Every meeting, plus any documents you attach to it (meeting
   invites, agendas, screenshots), is indexed so you can later ask "what did we decide about X" and get an
-  answer synthesized from everything on file for that project.
+  answer synthesized (also via the Copilot Studio bridge) from everything on file for that project.
 - **Accepts context documents** — PDFs, Word docs, images, plain text — uploaded to a project at any time,
   not just during a meeting (e.g. a screenshot of the calendar invite, a spec doc).
 
@@ -30,12 +31,11 @@ screen, and turns the meeting into a searchable record.
 
 | Concern | Choice | Reasoning |
 |---|---|---|
-| Speech-to-text | [faster-whisper](https://github.com/SYSTRAN/faster-whisper), local | Claude has no audio input; running Whisper locally keeps meeting audio on the machine and avoids per-minute STT billing. |
+| Speech-to-text | [faster-whisper](https://github.com/SYSTRAN/faster-whisper), local | Running Whisper locally keeps meeting audio on the machine and avoids per-minute STT billing. |
 | Screen OCR | [pytesseract](https://github.com/madmaze/pytesseract) (wraps Tesseract) | Lightweight, no GPU, no ML runtime to bundle — important for a single-file Windows executable. Requires the Tesseract binary (see Packaging). |
 | System audio capture | [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) | A PyAudio fork with WASAPI loopback support, i.e. it can record "what the speakers are playing" on Windows without a virtual audio cable. |
 | Window selection for OCR | [pywin32](https://github.com/mhammond/pywin32) (`win32gui`) | Enumerates open windows and re-reads a selected window's bounding box every capture cycle (it may move/resize), so OCR can be scoped to one app instead of the whole desktop. |
-| Notes/actions generation | Anthropic Claude | Given a finished transcript, produces a structured summary, decisions, and action items. |
-| Project search | SQLite FTS5 (full-text search), then Claude synthesizes the answer | Keeps the app dependency-light (no torch/embedding model to bundle) while still giving good keyword recall; Claude does the reasoning over the retrieved passages. This is intentionally swappable — see `storage/embeddings.py` stub if semantic search is wanted later. |
+| Notes/actions generation, project search | Microsoft Copilot Studio / Power Automate, via a filesystem bridge (see below) | Governance doesn't allow calling a third-party AI API directly. Routing through a flow the org already owns keeps meeting data inside the Microsoft 365 tenant boundary. |
 | Packaging | PyInstaller, one-file build | Produces the standalone `.exe` the project requires. |
 | GUI | Tkinter | Ships with Python, keeps the PyInstaller build small and dependency-free. |
 
@@ -43,7 +43,7 @@ screen, and turns the meeting into a searchable record.
 
 ```
 src/meeting_scribe/
-  config.py          # data directory, API keys, per-project paths
+  config.py          # data directory, Copilot bridge folder/timing, per-project paths
   session.py          # orchestrates one meeting: start/stop recording, merge, notes, save
   audio/recorder.py   # mic + WASAPI loopback capture (Windows-only at runtime)
   audio/device_picker.py  # enumerates mic/speaker devices so one can be picked instead of the OS default
@@ -51,8 +51,9 @@ src/meeting_scribe/
   screen/window_picker.py  # enumerates open windows so one can be picked as the OCR target
   screen/region_picker.py  # drag-to-select a custom OCR rectangle + its on-screen boundary outline
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
-  ai/notes.py          # Claude call that turns a transcript into notes + action items
-  ai/search.py          # Ask-a-question-about-a-project flow (retrieve + Claude synthesis)
+  ai/copilot_bridge.py  # file-drop request/response round trip to the Power Automate/Copilot Studio flow
+  ai/notes.py          # builds the notes prompt and submits a finished transcript to the bridge
+  ai/search.py          # Ask-a-question-about-a-project flow (FTS5 retrieve + bridge synthesis)
   storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents
   storage/documents.py  # Text extraction for uploaded PDFs/docx/images/text
   gui/app.py             # Tkinter control panel
@@ -73,7 +74,7 @@ tests/                    # Unit tests for the parts that don't need Windows har
   just to the project in general (e.g. a spec doc).
 
 All of the above are indexed in SQLite FTS5 so `ai/search.py` can pull the most relevant passages for a
-question before handing them to Claude.
+question before handing them to the Copilot Studio bridge for synthesis.
 
 ## Setup (development)
 
@@ -84,22 +85,52 @@ pip install -r requirements.txt
 python -m meeting_scribe.main       # launches the GUI by default (equivalent to `... main.py gui`)
 ```
 
-Set your Anthropic API key and pick a model in the app's **Settings** tab — no environment variable
-needed. It's saved to `settings.json` in the app's data directory and takes effect immediately. (Setting
-`ANTHROPIC_API_KEY` / `MEETING_SCRIBE_MODEL` in the environment still works too, e.g. for scripted/CLI
-use, but a value saved via the Settings tab takes precedence.) Recording, transcription, and screen OCR
-all work with no key configured — only note generation and "Ask" need one.
+Point the app at your Copilot Studio bridge folder in the **Settings** tab (see below) — no environment
+variable needed, though `MEETING_SCRIBE_COPILOT_SYNC_DIR` also works for scripted/CLI use. Recording,
+transcription, and screen OCR all work with no folder configured — only note generation and "Ask" need
+one.
 
-The Settings tab also has the **notes system prompt** sent to Claude alongside every transcript when a
-meeting finishes. It ships prepopulated with a recommended default that tells Claude what it's receiving
-(a merged, automated transcript from mic audio, system audio, and screen OCR — timestamped but imperfect)
-and how the output is used (saved as the meeting's permanent record, later retrieved to answer questions
-across a project), plus the section structure the app expects back. Edit it to change tone, sections, or
-detail level; "Reset to recommended default" restores the original text.
+The Settings tab also has the **notes system prompt** bundled into every request sent through the bridge
+when a meeting finishes. It ships prepopulated with a recommended default that explains what's being
+received (a merged, automated transcript from mic audio, system audio, and screen OCR — timestamped but
+imperfect) and how the output is used (saved as the meeting's permanent record, later retrieved to answer
+questions across a project), plus the section structure the app expects back. Edit it to change tone,
+sections, or detail level; "Reset to recommended default" restores the original text.
 
 For development, install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) and make sure
 `tesseract.exe` is on `PATH` (or point `MEETING_SCRIBE_TESSERACT_PATH` at it). The packaged `.exe` (below)
 bundles its own copy, so end users running the built app don't need to install Tesseract at all.
+
+## The Copilot Studio bridge
+
+There's no supported way for this app to call Copilot Studio directly over an outbound HTTP request —
+and even if there were, an unsigned desktop app making its own AI API calls is exactly what governance
+ruled out. Instead, `ai/copilot_bridge.py` hands each job to a Power Automate flow over the filesystem:
+
+1. **Settings tab → "Copilot sync folder"**: pick a folder that's inside a location OneDrive or SharePoint
+   is already syncing to this machine. The app creates `Inbox/` and `Outbox/` subfolders under it.
+2. When a meeting finishes (or you hit "Ask"), the app writes one text file to `Inbox/` named
+   `{job_id}__{kind}.request.txt` (`kind` is `notes` or `search`). Its content is a single block of text:
+   the notes system prompt (or the Ask system prompt) followed by `---TRANSCRIPT---` or
+   `---RETRIEVED PASSAGES--- ... ---QUESTION---` and the actual content. There's no JSON to parse —
+   everything the model needs is one block of plain text.
+3. OneDrive/SharePoint sync uploads that file to the cloud.
+4. **A Power Automate flow (built separately, in the Power Platform admin UI)** needs a "When a file is
+   created" trigger on the Inbox folder, a step that passes the file's content into a Copilot Studio
+   topic or an AI Builder "Create text with GPT" action, and a "Create file" step that writes the result
+   into the Outbox folder as `{job_id}__{kind}.response.txt` — same file name, `.request.txt` swapped for
+   `.response.txt`, which the trigger's dynamic content can build directly without parsing anything.
+5. The app polls the Outbox folder (every "poll interval" seconds, up to "timeout" seconds — both
+   editable in Settings) and reads the response file's content back as the answer/notes.
+
+This app only ever reads and writes local files inside an already-synced folder; it makes no network
+calls for AI processing at all. Building and owning the Power Automate flow (and whatever Copilot Studio
+capacity/licensing it needs) is outside this codebase — that's a Power Platform admin/maker task.
+
+Because this now genuinely round-trips through a cloud flow, expect notes/answers to take anywhere from
+tens of seconds to a few minutes rather than the ~10–20s a direct API call used to take. If nothing shows
+up in the Outbox before the timeout, the meeting's plain transcript is still saved (nothing is lost) and
+the status bar says notes generation timed out — check the flow's run history in Power Automate.
 
 ## Building the .exe
 

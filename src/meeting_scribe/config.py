@@ -13,11 +13,12 @@ from pathlib import Path
 
 USER_CONFIG_FILENAME = "settings.json"
 
-# Offered as presets in the GUI's Settings tab; the field itself accepts any string so an advanced user
-# can type a model ID that isn't listed here.
-AVAILABLE_MODELS = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
-
-DEFAULT_MODEL = "claude-opus-5"
+# Defaults for the Copilot Studio bridge (see ai/copilot_bridge.py) — how often to check the Outbox
+# folder for a response, and how long to wait before giving up. Generation now runs through a Power
+# Automate/Copilot Studio flow outside this app, not a synchronous API call, so this can take anywhere
+# from tens of seconds (Power Automate trigger latency) to a few minutes.
+DEFAULT_COPILOT_POLL_INTERVAL_SECONDS = 5.0
+DEFAULT_COPILOT_TIMEOUT_SECONDS = 300.0
 
 # Prepopulated into the Settings tab's system prompt field. Explains to the model what it's being handed
 # (a merged, automated, imperfect transcript) and what happens to what it produces (saved as the permanent
@@ -89,8 +90,6 @@ def resolve_tesseract_cmd(explicit: str | None) -> str | None:
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
-    anthropic_api_key: str | None
-    anthropic_model: str
     whisper_model_size: str
     tesseract_cmd: str | None
     screen_capture_interval_seconds: float
@@ -99,6 +98,12 @@ class Settings:
     mic_device_name: str | None = None
     system_device_name: str | None = None
     notes_system_prompt: str = DEFAULT_NOTES_SYSTEM_PROMPT
+    # Root of a folder synced by OneDrive/SharePoint — Inbox/Outbox subfolders live under it (see
+    # ai/copilot_bridge.py). None means the Copilot Studio bridge isn't configured yet: notes generation
+    # and Ask are skipped rather than attempted, the same as an unset API key used to mean.
+    copilot_sync_dir: Path | None = None
+    copilot_poll_interval_seconds: float = DEFAULT_COPILOT_POLL_INTERVAL_SECONDS
+    copilot_timeout_seconds: float = DEFAULT_COPILOT_TIMEOUT_SECONDS
 
     @property
     def db_path(self) -> Path:
@@ -107,6 +112,14 @@ class Settings:
     @property
     def projects_dir(self) -> Path:
         return self.data_dir / "projects"
+
+    @property
+    def copilot_inbox_dir(self) -> Path:
+        return self.copilot_sync_dir / "Inbox"
+
+    @property
+    def copilot_outbox_dir(self) -> Path:
+        return self.copilot_sync_dir / "Outbox"
 
     def project_dir(self, project_slug: str) -> Path:
         return self.projects_dir / project_slug
@@ -120,8 +133,8 @@ def _user_config_path(data_dir: Path) -> Path:
 
 
 def _load_user_config(data_dir: Path) -> dict:
-    """Reads the GUI Settings tab's saved API key/model, if any. Missing or corrupt is treated the
-    same as "nothing saved yet" — this is a soft preference, not something to crash startup over."""
+    """Reads the GUI Settings tab's saved preferences, if any. Missing or corrupt is treated the same
+    as "nothing saved yet" — this is a soft preference, not something to crash startup over."""
     path = _user_config_path(data_dir)
     if not path.exists():
         return {}
@@ -132,24 +145,38 @@ def _load_user_config(data_dir: Path) -> dict:
 
 
 def save_user_config(settings: Settings) -> None:
-    """Persists the user-editable settings (API key, model, chosen audio devices) so they survive a
-    restart without the user needing to set environment variables — the GUI's Settings tab calls this
-    after Save."""
+    """Persists the user-editable settings (Copilot sync folder, chosen audio devices, notes prompt) so
+    they survive a restart without the user needing to set environment variables — the GUI's Settings
+    tab calls this after Save."""
     path = _user_config_path(settings.data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "anthropic_api_key": settings.anthropic_api_key,
-        "anthropic_model": settings.anthropic_model,
         "mic_device_name": settings.mic_device_name,
         "system_device_name": settings.system_device_name,
         "notes_system_prompt": settings.notes_system_prompt,
+        "copilot_sync_dir": str(settings.copilot_sync_dir) if settings.copilot_sync_dir else None,
+        "copilot_poll_interval_seconds": settings.copilot_poll_interval_seconds,
+        "copilot_timeout_seconds": settings.copilot_timeout_seconds,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def update_settings(settings: Settings, *, anthropic_api_key: str | None, anthropic_model: str) -> Settings:
-    """Applies and persists an API key / model edit from the Settings tab."""
-    updated = replace(settings, anthropic_api_key=anthropic_api_key or None, anthropic_model=anthropic_model)
+def update_copilot_settings(
+    settings: Settings,
+    *,
+    copilot_sync_dir: str | None,
+    poll_interval_seconds: float,
+    timeout_seconds: float,
+) -> Settings:
+    """Applies and persists the Copilot Studio bridge folder/timing edit from the Settings tab. A blank
+    `copilot_sync_dir` disables the bridge (notes generation and Ask are skipped, same as no API key
+    used to mean)."""
+    updated = replace(
+        settings,
+        copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None,
+        copilot_poll_interval_seconds=poll_interval_seconds,
+        copilot_timeout_seconds=timeout_seconds,
+    )
     save_user_config(updated)
     return updated
 
@@ -166,7 +193,7 @@ def update_audio_devices(
 
 def update_notes_system_prompt(settings: Settings, *, notes_system_prompt: str) -> Settings:
     """Applies and persists an edit to the notes system prompt from the Settings tab. A blank value
-    resets to the recommended default rather than sending Claude an empty system prompt."""
+    resets to the recommended default rather than sending an empty prompt through the bridge."""
     updated = replace(settings, notes_system_prompt=notes_system_prompt.strip() or DEFAULT_NOTES_SYSTEM_PROMPT)
     save_user_config(updated)
     return updated
@@ -177,19 +204,10 @@ def load_settings() -> Settings:
     data_dir.mkdir(parents=True, exist_ok=True)
     user_config = _load_user_config(data_dir)
 
-    # Precedence: a value saved via the Settings tab wins (it's an explicit, recent user action), then
-    # the environment variable (useful for CI/scripting), then the hardcoded default.
-    anthropic_api_key = user_config.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
-    anthropic_model = (
-        user_config.get("anthropic_model")
-        or os.environ.get("MEETING_SCRIBE_MODEL")
-        or DEFAULT_MODEL
-    )
+    copilot_sync_dir = user_config.get("copilot_sync_dir") or os.environ.get("MEETING_SCRIBE_COPILOT_SYNC_DIR")
 
     return Settings(
         data_dir=data_dir,
-        anthropic_api_key=anthropic_api_key,
-        anthropic_model=anthropic_model,
         whisper_model_size=os.environ.get("MEETING_SCRIBE_WHISPER_MODEL", "small"),
         tesseract_cmd=resolve_tesseract_cmd(os.environ.get("MEETING_SCRIBE_TESSERACT_PATH")),
         screen_capture_interval_seconds=float(
@@ -198,4 +216,9 @@ def load_settings() -> Settings:
         mic_device_name=user_config.get("mic_device_name"),
         system_device_name=user_config.get("system_device_name"),
         notes_system_prompt=user_config.get("notes_system_prompt") or DEFAULT_NOTES_SYSTEM_PROMPT,
+        copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None,
+        copilot_poll_interval_seconds=user_config.get(
+            "copilot_poll_interval_seconds", DEFAULT_COPILOT_POLL_INTERVAL_SECONDS
+        ),
+        copilot_timeout_seconds=user_config.get("copilot_timeout_seconds", DEFAULT_COPILOT_TIMEOUT_SECONDS),
     )

@@ -1,38 +1,71 @@
-from unittest.mock import MagicMock, patch
+import uuid
+from unittest.mock import patch
 
 import pytest
 
+from meeting_scribe.ai.copilot_bridge import CopilotResponseTimeout
 from meeting_scribe.ai.notes import generate_notes
-from meeting_scribe.config import DEFAULT_NOTES_SYSTEM_PROMPT
 
 
-def test_generate_notes_rejects_empty_transcript():
+def test_generate_notes_rejects_empty_transcript(tmp_path):
     with pytest.raises(ValueError):
-        generate_notes("   \n  ", api_key="fake-key", model="claude-opus-5")
+        generate_notes(
+            "   \n  ",
+            inbox_dir=tmp_path / "Inbox",
+            outbox_dir=tmp_path / "Outbox",
+            poll_interval_seconds=0.01,
+            timeout_seconds=1,
+        )
 
 
-def _fake_response(text="Notes."):
-    response = MagicMock()
-    response.stop_reason = "end_turn"
-    response.content = [MagicMock(type="text", text=text)]
-    return response
+def test_generate_notes_returns_the_outbox_response(tmp_path):
+    inbox_dir = tmp_path / "Inbox"
+    outbox_dir = tmp_path / "Outbox"
+    outbox_dir.mkdir(parents=True)
+    fixed_id = uuid.UUID(int=0)
+    (outbox_dir / f"{fixed_id.hex}__notes.response.txt").write_text("Generated notes.", encoding="utf-8")
+
+    with patch("meeting_scribe.ai.copilot_bridge.uuid.uuid4", return_value=fixed_id):
+        result = generate_notes(
+            "hello world",
+            inbox_dir=inbox_dir,
+            outbox_dir=outbox_dir,
+            poll_interval_seconds=0.01,
+            timeout_seconds=1,
+        )
+
+    assert result == "Generated notes."
 
 
-def test_generate_notes_defaults_to_the_recommended_system_prompt():
-    with patch("meeting_scribe.ai.notes.anthropic.Anthropic") as MockAnthropic:
-        MockAnthropic.return_value.messages.create.return_value = _fake_response()
+def test_generate_notes_writes_the_system_prompt_and_transcript_to_the_inbox(tmp_path):
+    inbox_dir = tmp_path / "Inbox"
+    outbox_dir = tmp_path / "Outbox"
+    outbox_dir.mkdir(parents=True)
+    fixed_id = uuid.UUID(int=1)
+    (outbox_dir / f"{fixed_id.hex}__notes.response.txt").write_text("Notes.", encoding="utf-8")
 
-        generate_notes("hello", api_key="fake-key", model="claude-opus-5")
+    with patch("meeting_scribe.ai.copilot_bridge.uuid.uuid4", return_value=fixed_id):
+        generate_notes(
+            "the transcript body",
+            inbox_dir=inbox_dir,
+            outbox_dir=outbox_dir,
+            poll_interval_seconds=0.01,
+            timeout_seconds=1,
+            system_prompt="My custom instructions",
+        )
 
-        _args, kwargs = MockAnthropic.return_value.messages.create.call_args
-        assert kwargs["system"] == DEFAULT_NOTES_SYSTEM_PROMPT
+    [request_path] = list(inbox_dir.iterdir())
+    content = request_path.read_text(encoding="utf-8")
+    assert "My custom instructions" in content
+    assert "the transcript body" in content
 
 
-def test_generate_notes_uses_a_custom_system_prompt_when_given():
-    with patch("meeting_scribe.ai.notes.anthropic.Anthropic") as MockAnthropic:
-        MockAnthropic.return_value.messages.create.return_value = _fake_response()
-
-        generate_notes("hello", api_key="fake-key", model="claude-opus-5", system_prompt="Custom prompt.")
-
-        _args, kwargs = MockAnthropic.return_value.messages.create.call_args
-        assert kwargs["system"] == "Custom prompt."
+def test_generate_notes_raises_on_timeout(tmp_path):
+    with pytest.raises(CopilotResponseTimeout):
+        generate_notes(
+            "hello",
+            inbox_dir=tmp_path / "Inbox",
+            outbox_dir=tmp_path / "Outbox",
+            poll_interval_seconds=0.01,
+            timeout_seconds=0.03,
+        )

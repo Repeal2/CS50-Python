@@ -44,8 +44,12 @@ def main(argv: list[str] | None = None) -> int:
         if command == "ask":
             from meeting_scribe.ai.search import ask as ask_project
 
-            if not settings.anthropic_api_key:
-                print("Set ANTHROPIC_API_KEY to ask questions.", file=sys.stderr)
+            if settings.copilot_sync_dir is None:
+                print(
+                    "Set MEETING_SCRIBE_COPILOT_SYNC_DIR (or configure it in the Settings tab) to ask "
+                    "questions.",
+                    file=sys.stderr,
+                )
                 return 1
             project = db.get_project_by_name(args.project)
             if project is None:
@@ -53,7 +57,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             answer = ask_project(
                 db, project.id, args.question,
-                api_key=settings.anthropic_api_key, model=settings.anthropic_model,
+                inbox_dir=settings.copilot_inbox_dir,
+                outbox_dir=settings.copilot_outbox_dir,
+                poll_interval_seconds=settings.copilot_poll_interval_seconds,
+                timeout_seconds=settings.copilot_timeout_seconds,
             )
             print(answer)
             return 0

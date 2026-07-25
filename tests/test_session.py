@@ -12,7 +12,7 @@ def _settings(
     tmp_path: Path,
     mic_device_name=None,
     system_device_name=None,
-    anthropic_api_key=None,
+    copilot_sync_dir=None,
     notes_system_prompt=None,
 ) -> Settings:
     kwargs = {}
@@ -20,13 +20,12 @@ def _settings(
         kwargs["notes_system_prompt"] = notes_system_prompt
     return Settings(
         data_dir=tmp_path,
-        anthropic_api_key=anthropic_api_key,
-        anthropic_model="claude-opus-5",
         whisper_model_size="tiny",
         tesseract_cmd=None,
         screen_capture_interval_seconds=3.0,
         mic_device_name=mic_device_name,
         system_device_name=system_device_name,
+        copilot_sync_dir=copilot_sync_dir,
         **kwargs,
     )
 
@@ -70,10 +69,11 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
             screen_watcher_instance.stop.assert_called_once()
             recorder_instance.stop.assert_called_once()
 
-            # No API key configured -> falls back to the plain transcript text.
+            # No Copilot sync folder configured -> falls back to the plain transcript text.
             assert "Slide: Agenda" in result
             assert "let's get started" in result
             assert "sounds good" in result
+            assert session.notes_timed_out is False
 
             meeting = db.get_meeting(session.meeting_id)
             assert meeting.transcript_text == result
@@ -115,7 +115,7 @@ def test_session_audio_levels_reads_through_to_recorder(tmp_path):
             assert session.audio_levels() == (0.42, 0.13)
 
 
-def test_session_passes_configured_system_prompt_to_notes_generation(tmp_path):
+def test_session_passes_configured_system_prompt_and_bridge_dirs_to_notes_generation(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
@@ -133,11 +133,72 @@ def test_session_passes_configured_system_prompt_to_notes_generation(tmp_path):
 
         with Database(tmp_path / "test.db") as db:
             settings = _settings(
-                tmp_path, anthropic_api_key="sk-test", notes_system_prompt="Custom prompt text."
+                tmp_path,
+                copilot_sync_dir=tmp_path / "Bridge",
+                notes_system_prompt="Custom prompt text.",
             )
             session = MeetingSession(settings, db, "Test Project", "Kickoff")
             session.start()
-            session.stop()
+            result = session.stop()
 
             _args, kwargs = mock_generate_notes.call_args
             assert kwargs["system_prompt"] == "Custom prompt text."
+            assert kwargs["inbox_dir"] == tmp_path / "Bridge" / "Inbox"
+            assert kwargs["outbox_dir"] == tmp_path / "Bridge" / "Outbox"
+            assert result == "Notes."
+            assert session.notes_timed_out is False
+
+
+def test_session_skips_notes_generation_without_a_copilot_sync_dir(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.generate_notes") as mock_generate_notes,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+            session.stop()
+
+            mock_generate_notes.assert_not_called()
+
+
+def test_session_falls_back_to_transcript_and_flags_timeout_when_bridge_times_out(tmp_path):
+    from meeting_scribe.ai.copilot_bridge import CopilotResponseTimeout
+
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.generate_notes") as mock_generate_notes,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        mock_generate_notes.side_effect = CopilotResponseTimeout("timed out")
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path, copilot_sync_dir=tmp_path / "Bridge")
+            session = MeetingSession(settings, db, "Test Project", "Kickoff")
+            session.start()
+            result = session.stop()
+
+            assert session.notes_timed_out is True
+            assert "hello" in result
+
+            meeting = db.get_meeting(session.meeting_id)
+            assert meeting.transcript_text == result
+            assert meeting.notes_markdown is None

@@ -1,8 +1,8 @@
 """SQLite storage for projects, meetings, transcript segments, and uploaded documents.
 
 Everything a project owns is full-text indexed (SQLite FTS5) so `ai.search` can pull the passages
-relevant to a question before handing them to Claude. FTS5 tables are "external content" tables kept in
-sync with triggers, so callers never touch them directly.
+relevant to a question before handing them to the Copilot Studio bridge for synthesis. FTS5 tables are
+"external content" tables kept in sync with triggers, so callers never touch them directly.
 """
 
 from __future__ import annotations

@@ -1,11 +1,13 @@
-"""Answers a question about a project by retrieving relevant passages (FTS5) and asking Claude to
-synthesize an answer strictly from them — the "search my past meetings" feature.
+"""Answers a question about a project by retrieving relevant passages (FTS5) and handing them, plus the
+question, to the Copilot Studio file-drop bridge to synthesize an answer — see ai/copilot_bridge.py for
+why this isn't a direct API call.
 """
 
 from __future__ import annotations
 
-import anthropic
+from pathlib import Path
 
+from meeting_scribe.ai.copilot_bridge import submit_and_wait
 from meeting_scribe.storage.database import Database, SearchHit
 
 ANSWER_SYSTEM_PROMPT = """You answer questions about a project's past meetings and documents. You are \
@@ -15,28 +17,32 @@ guessing. Reference which meeting or document each part of your answer comes fro
 
 
 def ask(
-    db: Database, project_id: int, question: str, *, api_key: str, model: str, max_hits: int = 8
+    db: Database,
+    project_id: int,
+    question: str,
+    *,
+    inbox_dir: Path,
+    outbox_dir: Path,
+    poll_interval_seconds: float,
+    timeout_seconds: float,
+    max_hits: int = 8,
 ) -> str:
     hits = db.search_project(project_id, question, limit=max_hits)
     if not hits:
         return "I couldn't find anything in this project matching that question."
 
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=model,
-        max_tokens=2048,
-        system=ANSWER_SYSTEM_PROMPT,
-        output_config={"effort": "medium"},
-        messages=[
-            {
-                "role": "user",
-                "content": f"Retrieved passages:\n\n{_render_hits(hits)}\n\nQuestion: {question}",
-            }
-        ],
+    prompt_text = (
+        f"{ANSWER_SYSTEM_PROMPT}\n\n---RETRIEVED PASSAGES---\n\n{_render_hits(hits)}"
+        f"\n\n---QUESTION---\n\n{question}"
     )
-    if response.stop_reason == "refusal":
-        raise RuntimeError("Claude declined to answer this question")
-    return next(block.text for block in response.content if block.type == "text")
+    return submit_and_wait(
+        "search",
+        prompt_text,
+        inbox_dir=inbox_dir,
+        outbox_dir=outbox_dir,
+        poll_interval_seconds=poll_interval_seconds,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _render_hits(hits: list[SearchHit]) -> str:

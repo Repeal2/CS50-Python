@@ -1,10 +1,11 @@
 """Orchestrates one meeting end to end: start recording (mic + system audio + screen), and on stop,
-transcribe, merge into one transcript, generate notes via Claude, and file everything under the
-meeting's project so it's searchable later.
+transcribe, merge into one transcript, generate notes via the Copilot Studio bridge, and file everything
+under the meeting's project so it's searchable later.
 """
 
 from __future__ import annotations
 
+from meeting_scribe.ai.copilot_bridge import CopilotResponseTimeout
 from meeting_scribe.ai.notes import generate_notes
 from meeting_scribe.audio.recorder import Recorder
 from meeting_scribe.config import Settings
@@ -53,6 +54,7 @@ class MeetingSession:
             target=screen_target,
         )
         self._transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
+        self.notes_timed_out = False
 
     def start(self) -> None:
         self._recorder.start()
@@ -65,7 +67,7 @@ class MeetingSession:
 
     def stop(self) -> str:
         """Stops recording, transcribes, generates notes, and saves the meeting. Returns the notes
-        (or the plain transcript if no Anthropic API key is configured)."""
+        (or the plain transcript if the Copilot Studio bridge isn't configured, or if it times out)."""
         self._screen_watcher.stop()
         recorded = self._recorder.stop()
 
@@ -85,13 +87,20 @@ class MeetingSession:
             )
 
         notes = None
-        if self._settings.anthropic_api_key:
-            notes = generate_notes(
-                transcript_text,
-                api_key=self._settings.anthropic_api_key,
-                model=self._settings.anthropic_model,
-                system_prompt=self._settings.notes_system_prompt,
-            )
+        if self._settings.copilot_sync_dir is not None:
+            try:
+                notes = generate_notes(
+                    transcript_text,
+                    inbox_dir=self._settings.copilot_inbox_dir,
+                    outbox_dir=self._settings.copilot_outbox_dir,
+                    poll_interval_seconds=self._settings.copilot_poll_interval_seconds,
+                    timeout_seconds=self._settings.copilot_timeout_seconds,
+                    system_prompt=self._settings.notes_system_prompt,
+                )
+            except CopilotResponseTimeout:
+                # Don't lose the meeting over a slow/misconfigured flow — save the plain transcript and
+                # let the caller (the GUI) tell the user notes generation timed out via this flag.
+                self.notes_timed_out = True
 
         self._db.finish_meeting(self.meeting_id, transcript_text=transcript_text, notes_markdown=notes)
         return notes or transcript_text
