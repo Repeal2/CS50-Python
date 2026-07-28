@@ -44,20 +44,6 @@ def _format_meeting_timestamp(iso_string: str) -> str:
         return iso_string
 
 
-def _extract_section(markdown: str, heading: str) -> str | None:
-    """Pulls the body of a `## {heading}` section out of generated notes markdown, up to the next `## `
-    heading or the end of the text. Returns None if the heading isn't present (e.g. the model omitted
-    it because there was nothing to report, per the notes prompt)."""
-    marker = f"## {heading}"
-    start = markdown.find(marker)
-    if start == -1:
-        return None
-    content_start = start + len(marker)
-    end = markdown.find("\n## ", content_start)
-    section = markdown[content_start:end] if end != -1 else markdown[content_start:]
-    return section.strip() or None
-
-
 def _add_scrollable_text_tab(notebook: ttk.Notebook, title: str) -> tk.Text:
     """Adds a read-only-by-convention Text+Scrollbar pair as a new tab and returns the Text widget."""
     frame = ttk.Frame(notebook)
@@ -195,6 +181,9 @@ class RecordTab(ttk.Frame):
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(buttons, text="Stop Meeting", command=self._stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
+        ttk.Button(buttons, text="Upload Document…", command=self._upload_document).pack(
+            side="left", padx=(0, 8)
+        )
 
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=12, pady=(8, 0))
@@ -215,13 +204,34 @@ class RecordTab(ttk.Frame):
         self.system_level_bar.grid(row=1, column=1, sticky="we", padx=(6, 0), pady=(2, 0))
         levels_frame.columnconfigure(1, weight=1)
 
+        manual_notes_frame = ttk.Frame(self)
+        manual_notes_frame.pack(fill="x", padx=12, pady=(8, 0))
+        ttk.Label(manual_notes_frame, text="Manual notes").pack(side="left")
+        self.manual_note_var = tk.StringVar()
+        self.manual_note_entry = ttk.Entry(
+            manual_notes_frame, textvariable=self.manual_note_var, state="disabled"
+        )
+        self.manual_note_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        self.manual_note_entry.bind("<Return>", self._add_manual_note)
+        self.add_note_button = ttk.Button(
+            manual_notes_frame, text="Add Note", command=self._add_manual_note, state="disabled"
+        )
+        self.add_note_button.pack(side="left")
+
+        # A running activity log, not a transcript preview — the raw transcript/OCR text is already
+        # long-form and belongs on the Projects & Search tab once a meeting is saved. This is just enough
+        # to confirm at a glance that something is actually happening during the (now potentially
+        # multi-minute) wait for Copilot Studio.
+        ttk.Label(self, text="Activity log").pack(anchor="w", padx=12, pady=(8, 0))
         output_frame = ttk.Frame(self)
-        output_frame.pack(fill="both", expand=True, padx=12, pady=12)
-        self.output = tk.Text(output_frame, wrap="word")
+        output_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.output = tk.Text(output_frame, wrap="word", state="disabled")
         output_scrollbar = ttk.Scrollbar(output_frame, orient="vertical", command=self.output.yview)
         self.output.configure(yscrollcommand=output_scrollbar.set)
         self.output.pack(side="left", fill="both", expand=True)
         output_scrollbar.pack(side="right", fill="y")
+
+        self._manual_notes_lines: list[str] = []
 
         self.refresh_projects()
         self._refresh_windows()
@@ -337,17 +347,28 @@ class RecordTab(ttk.Frame):
         )
         self.app.sync_device_displays()
 
+    def _log(self, message: str) -> None:
+        """Appends a timestamped line to the activity log and scrolls to it. This is a log of what the
+        app is doing (started, stopped, transcribing, waiting on notes...), not a transcript preview —
+        the widget is otherwise kept disabled so it reads as a log rather than an editable text box."""
+        timestamp = datetime.now().strftime("%b %d, %Y %I:%M:%S %p")
+        self.output["state"] = "normal"
+        self.output.insert("end", f"[{timestamp}] {message}\n")
+        self.output["state"] = "disabled"
+        self.output.see("end")
+
     def _start(self) -> None:
         project_name = self.project_var.get().strip()
         if not project_name:
             messagebox.showerror("Meeting Scribe", "Enter a project name first.")
             return
+        meeting_title = self.title_var.get()
         try:
             session = MeetingSession(
                 self.app.settings,
                 self.app.db,
                 project_name,
-                self.title_var.get(),
+                meeting_title,
                 screen_target=self._selected_screen_target(),
             )
             session.start()
@@ -356,33 +377,52 @@ class RecordTab(ttk.Frame):
             return
 
         self.app._session = session
-        self.status_var.set(f"Recording — {project_name} / {self.title_var.get()}")
+        self._manual_notes_lines = []
+        self.status_var.set(f"Recording — {project_name} / {meeting_title}")
         self.start_button["state"] = "disabled"
         self.stop_button["state"] = "normal"
+        self.manual_note_entry["state"] = "normal"
+        self.add_note_button["state"] = "normal"
+
+        self.output["state"] = "normal"
         self.output.delete("1.0", "end")
+        self.output["state"] = "disabled"
+        self._log(f"Recording started — Project: {project_name} / Meeting: {meeting_title}")
+
+    def _add_manual_note(self, _event=None) -> None:
+        text = self.manual_note_var.get().strip()
+        session = self.app._session
+        if not text or session is None:
+            return
+        timestamp = datetime.now().strftime("%b %d, %Y %I:%M:%S %p")
+        self._manual_notes_lines.append(f"[{timestamp}] {text}")
+        self.app.db.set_manual_notes(session.meeting_id, "\n".join(self._manual_notes_lines))
+        self.manual_note_var.set("")
+        self._log(f"Note added: {text}")
 
     def _stop(self) -> None:
         session = self.app._session
         if session is None:
             return
         self.stop_button["state"] = "disabled"
+        self.manual_note_entry["state"] = "disabled"
+        self.add_note_button["state"] = "disabled"
         self.status_var.set(
             "Transcribing, then waiting on Copilot Studio for notes… this can take a few minutes."
         )
+        self._log("Stop requested by user.")
 
         def worker() -> None:
             try:
-                result = session.stop()
+                session.stop(on_progress=lambda message: self.after(0, self._log, message))
             except Exception as exc:  # surfaced to the user regardless of cause
                 self.after(0, self._on_stop_failed, exc)
                 return
-            self.after(0, self._on_stop_done, result, session.notes_timed_out)
+            self.after(0, self._on_stop_done, session.notes_timed_out)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_stop_done(self, result: str, notes_timed_out: bool) -> None:
-        self.output.delete("1.0", "end")
-        self.output.insert("1.0", result)
+    def _on_stop_done(self, notes_timed_out: bool) -> None:
         if notes_timed_out:
             self.status_var.set("Saved — but notes generation timed out; the plain transcript was saved.")
         else:
@@ -395,7 +435,44 @@ class RecordTab(ttk.Frame):
         self.status_var.set("Failed.")
         self.start_button["state"] = "normal"
         self.app._session = None
+        self._log(f"Failed: {exc}")
         messagebox.showerror("Meeting Scribe", f"Couldn't finish the meeting: {exc}")
+
+    def _upload_document(self) -> None:
+        """Attaches a document to the current project — and, if a meeting is actively recording (or
+        still finishing up), to that specific meeting — without needing to switch to the Projects &
+        Search tab and pick things from a list."""
+        project_name = self.project_var.get().strip()
+        if not project_name:
+            messagebox.showerror("Meeting Scribe", "Enter a project name first.")
+            return
+        path_str = filedialog.askopenfilename(
+            title="Attach a document",
+            filetypes=[
+                ("Supported documents", "*.pdf *.docx *.txt *.md *.png *.jpg *.jpeg *.bmp *.tiff"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            text = extract_text(path, tesseract_cmd=self.app.settings.tesseract_cmd)
+        except UnsupportedDocumentError as exc:
+            messagebox.showerror("Meeting Scribe", str(exc))
+            return
+
+        project = self.app.db.get_or_create_project(project_name)
+        session = self.app._session
+        meeting_id = session.meeting_id if session is not None else None
+        self.app.db.add_document(project.id, path.name, text, meeting_id=meeting_id)
+        self.app.refresh_project_lists()
+
+        if meeting_id is not None:
+            self._log(f"Document attached: {path.name}")
+            messagebox.showinfo("Meeting Scribe", f'Added {path.name} to this meeting.')
+        else:
+            messagebox.showinfo("Meeting Scribe", f'Added {path.name} to project "{project.name}".')
 
 
 class ProjectsTab(ttk.Frame):
@@ -436,23 +513,18 @@ class ProjectsTab(ttk.Frame):
         meeting_list_scrollbar.pack(side="right", fill="y")
         self.meeting_list.bind("<<ListboxSelect>>", self._on_meeting_selected)
 
-        ttk.Button(left, text="Upload Document…", command=self._upload_document).pack(
-            fill="x", pady=(12, 0)
-        )
-
         right = ttk.Frame(self)
         right.pack(side="left", fill="both", expand=True, padx=12, pady=12)
 
         # Selecting a meeting fans its details out across these tabs, rather than dumping everything
-        # into one pane — the raw on-screen OCR log, the spoken-audio transcript, the full AI notes, and
-        # just the action items are different things a user reaches for at different times.
+        # into one pane — the raw on-screen OCR log, the spoken-audio transcript, and the notes the user
+        # typed themselves during the meeting are different things a user reaches for at different times.
         self.detail_notebook = ttk.Notebook(right)
         self.detail_notebook.pack(fill="both", expand=True)
 
         self.ocr_text = _add_scrollable_text_tab(self.detail_notebook, "OCR Transcript")
         self.audio_text = _add_scrollable_text_tab(self.detail_notebook, "Audio Transcript")
-        self.notes_text = _add_scrollable_text_tab(self.detail_notebook, "AI Notes")
-        self.actions_text = _add_scrollable_text_tab(self.detail_notebook, "Action Items")
+        self.manual_notes_text = _add_scrollable_text_tab(self.detail_notebook, "Manual notes")
         self._build_documents_tab()
 
         ask_row = ttk.Frame(right)
@@ -543,7 +615,7 @@ class ProjectsTab(ttk.Frame):
             self.meeting_list.insert("end", f"{meeting.title} — {timestamp}")
 
     def _clear_meeting_details(self) -> None:
-        for widget in (self.ocr_text, self.audio_text, self.notes_text, self.actions_text):
+        for widget in (self.ocr_text, self.audio_text, self.manual_notes_text):
             _set_text(widget, "")
         self._meeting_documents = []
         self.meeting_documents_list.delete(0, "end")
@@ -561,13 +633,7 @@ class ProjectsTab(ttk.Frame):
 
         _set_text(self.ocr_text, render_transcript(ocr_lines) or "(no on-screen text captured)")
         _set_text(self.audio_text, render_transcript(audio_lines) or "(no speech captured)")
-
-        notes = meeting.notes_markdown
-        _set_text(
-            self.notes_text, notes or "(no AI notes yet — set up the Copilot sync folder in the Settings tab)"
-        )
-        action_items = _extract_section(notes, "Action Items") if notes else None
-        _set_text(self.actions_text, action_items or "(no action items)")
+        _set_text(self.manual_notes_text, meeting.manual_notes or "(no manual notes for this meeting)")
 
         self._load_meeting_documents(meeting.id)
 
@@ -587,40 +653,6 @@ class ProjectsTab(ttk.Frame):
             return
         document = self._meeting_documents[selection[0]]
         _set_text(self.meeting_document_viewer, document["content_text"])
-
-    def _upload_document(self) -> None:
-        project = self._selected_project()
-        if project is None:
-            messagebox.showerror("Meeting Scribe", "Select a project first.")
-            return
-        path_str = filedialog.askopenfilename(
-            title="Attach a document to this project",
-            filetypes=[
-                ("Supported documents", "*.pdf *.docx *.txt *.md *.png *.jpg *.jpeg *.bmp *.tiff"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not path_str:
-            return
-        path = Path(path_str)
-        try:
-            text = extract_text(path, tesseract_cmd=self.app.settings.tesseract_cmd)
-        except UnsupportedDocumentError as exc:
-            messagebox.showerror("Meeting Scribe", str(exc))
-            return
-
-        meeting = self._selected_meeting()
-        meeting_id = None
-        if meeting is not None and messagebox.askyesno(
-            "Meeting Scribe",
-            f'Attach to the selected meeting "{meeting.title}" instead of the whole project?',
-        ):
-            meeting_id = meeting.id
-
-        self.app.db.add_document(project.id, path.name, text, meeting_id=meeting_id)
-        if meeting_id is not None and self._selected_meeting() is meeting:
-            self._load_meeting_documents(meeting_id)
-        messagebox.showinfo("Meeting Scribe", f"Added {path.name} to {project.name}.")
 
     def _ask(self) -> None:
         project = self._selected_project()

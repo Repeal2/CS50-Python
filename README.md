@@ -9,7 +9,9 @@ screen, and turns the meeting into a searchable record.
   sides of a call even when remote participants' audio never touches the mic. If a machine has more than
   one mic or speaker, a dropdown right on the Record tab (also in Settings) lets you pick which one gets
   recorded instead of always trusting whatever Windows currently calls "default" — and a live input-level
-  meter for each confirms it's actually picking up audio rather than guessing.
+  meter for each confirms it's actually picking up audio rather than guessing. The meters use a
+  logarithmic (dBFS) scale rather than a plain linear ratio, since normal microphone volume is often only
+  a few percent of full scale and would otherwise barely move a linear meter.
 - **Watches the screen** at a low frame rate and OCRs it, so on-screen captions, shared slides, and chat
   messages become part of the transcript even if they're never spoken aloud. You can point this at the
   whole screen, a single selected window (e.g. just the Teams/Zoom window), or a custom rectangle you
@@ -17,15 +19,24 @@ screen, and turns the meeting into a searchable record.
   area is active so it's always visible on screen what's being captured.
 - **Transcribes** the recorded audio locally (no audio ever leaves the machine) and merges it with the
   OCR stream into one time-ordered transcript.
-- **Generates notes and action items** via a Microsoft Copilot Studio / Power Automate flow (see
-  "The Copilot Studio bridge" below) — there's no direct call to an external AI API, since that isn't an
-  option under some organizations' governance policy. A system prompt you can edit in the Settings tab
-  (prepopulated with a recommended default) is bundled into what gets sent to the flow.
+- **Generates notes** via a Microsoft Copilot Studio / Power Automate flow (see "The Copilot Studio
+  bridge" below) — there's no direct call to an external AI API, since that isn't an option under some
+  organizations' governance policy. A system prompt you can edit in the Settings tab (prepopulated with
+  a recommended default) is bundled into what gets sent to the flow. Action items are intentionally not
+  parsed back out and shown in the app — whatever consumes the flow's output downstream handles that.
+- **Keeps a running activity log** on the Record tab while a meeting is in progress (and while it's
+  finishing up) — timestamped lines for the meeting starting, stopping, transcription finishing, and each
+  stage of waiting on Copilot Studio — so it's obvious something is happening during what can now be a
+  multi-minute wait, without dumping the live transcript/OCR text into view.
+- **Takes manual notes** typed directly on the Record tab during a meeting, timestamped and saved
+  incrementally per meeting (so nothing is lost if the app closes mid-meeting) — shown afterward on the
+  Projects & Search tab's "Manual notes" tab, alongside the OCR and audio transcripts.
 - **Files the meeting under a project.** Every meeting, plus any documents you attach to it (meeting
   invites, agendas, screenshots), is indexed so you can later ask "what did we decide about X" and get an
   answer synthesized (also via the Copilot Studio bridge) from everything on file for that project.
-- **Accepts context documents** — PDFs, Word docs, images, plain text — uploaded to a project at any time,
-  not just during a meeting (e.g. a screenshot of the calendar invite, a spec doc).
+- **Accepts context documents** — PDFs, Word docs, images, plain text — attached from the Record tab
+  (to the project, or to whichever meeting is currently in progress) at any time, not just during a
+  meeting (e.g. a screenshot of the calendar invite, a spec doc).
 
 ## Why it's built this way
 
@@ -67,14 +78,17 @@ tests/                    # Unit tests for the parts that don't need Windows har
 ## Data model
 
 - **Project** — a named bucket ("Acme Q3 Renewal", "Team Standups"). Everything below belongs to one.
-- **Meeting** — one recorded session: raw audio files, the merged transcript, generated notes.
+- **Meeting** — one recorded session: raw audio files, the merged transcript, generated notes, and the
+  manual notes typed on the Record tab while it was in progress.
 - **Transcript segment** — a timestamped line from either `mic`, `system`, or `screen_ocr`, tied to a
   meeting.
 - **Document** — any uploaded file, optionally tied to a specific meeting (e.g. that meeting's invite) or
   just to the project in general (e.g. a spec doc).
 
-All of the above are indexed in SQLite FTS5 so `ai/search.py` can pull the most relevant passages for a
-question before handing them to the Copilot Studio bridge for synthesis.
+Transcript segments, documents, and generated notes are indexed in SQLite FTS5 so `ai/search.py` can pull
+the most relevant passages for a question before handing them to the Copilot Studio bridge for synthesis.
+Manual notes aren't currently part of that index — they're stored and displayed, but not searchable via
+Ask yet.
 
 ## Setup (development)
 

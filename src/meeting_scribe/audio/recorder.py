@@ -23,17 +23,29 @@ CHUNK_FRAMES = 1024
 SAMPLE_WIDTH_BYTES = 2  # 16-bit PCM
 
 
+# A plain linear ratio (rms / full-scale) makes a normal-volume microphone barely move the meter: typical
+# speech sits maybe 1-5% of full scale, which renders as a sliver nobody can see, while system audio
+# (already mixed/normalized by the OS) tends to run much hotter and dominates the same linear scale. A
+# dBFS floor maps that same signal across most of the visible range instead, the way a real VU meter
+# does — anything at or below this floor reads as silence (0.0), anything at full scale reads as 1.0.
+_SILENCE_FLOOR_DB = -60.0
+
+
 def _pcm16_level(data: bytes) -> float:
-    """RMS level of a 16-bit PCM chunk, normalized to roughly 0..1 for a VU-meter display. Not
-    calibrated to any standard (e.g. dBFS) — it only needs to visibly move with real audio and sit near
-    zero with silence, so a user can tell at a glance whether a device is actually picking anything up."""
+    """RMS level of a 16-bit PCM chunk on a logarithmic (dBFS) scale, normalized to 0..1 for a VU-meter
+    display. Not calibrated to any broadcast standard — it only needs to make normal speaking volume
+    visibly move the meter and sit near zero with silence, so a user can tell at a glance whether a
+    device is actually picking anything up."""
     if not data:
         return 0.0
     samples = np.frombuffer(data, dtype=np.int16)
     if samples.size == 0:
         return 0.0
     rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float32)))))
-    return min(1.0, rms / 32768.0)
+    if rms <= 0:
+        return 0.0
+    db = 20.0 * np.log10(rms / 32768.0)
+    return float(np.clip((db - _SILENCE_FLOOR_DB) / -_SILENCE_FLOOR_DB, 0.0, 1.0))
 
 
 @dataclass(frozen=True)

@@ -202,3 +202,122 @@ def test_session_falls_back_to_transcript_and_flags_timeout_when_bridge_times_ou
             meeting = db.get_meeting(session.meeting_id)
             assert meeting.transcript_text == result
             assert meeting.notes_markdown is None
+
+
+def test_session_stop_reports_progress_through_each_stage(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.generate_notes") as mock_generate_notes,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        mock_generate_notes.return_value = "Notes."
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path, copilot_sync_dir=tmp_path / "Bridge")
+            session = MeetingSession(settings, db, "Test Project", "Kickoff")
+            session.start()
+
+            messages = []
+            session.stop(on_progress=messages.append)
+
+            assert messages == [
+                "Recording stopped.",
+                "Transcription complete.",
+                "Waiting for Copilot Studio notes...",
+                "Notes received from Copilot Studio.",
+                "Meeting saved.",
+            ]
+
+
+def test_session_stop_reports_skip_message_without_a_copilot_sync_dir(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+
+            messages = []
+            session.stop(on_progress=messages.append)
+
+            assert messages == [
+                "Recording stopped.",
+                "Transcription complete.",
+                "Copilot sync folder not configured — skipping notes generation.",
+                "Meeting saved.",
+            ]
+
+
+def test_session_stop_reports_timeout_message(tmp_path):
+    from meeting_scribe.ai.copilot_bridge import CopilotResponseTimeout
+
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.generate_notes") as mock_generate_notes,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        mock_generate_notes.side_effect = CopilotResponseTimeout("timed out")
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path, copilot_sync_dir=tmp_path / "Bridge")
+            session = MeetingSession(settings, db, "Test Project", "Kickoff")
+            session.start()
+
+            messages = []
+            session.stop(on_progress=messages.append)
+
+            assert messages == [
+                "Recording stopped.",
+                "Transcription complete.",
+                "Waiting for Copilot Studio notes...",
+                "Notes generation timed out.",
+                "Meeting saved.",
+            ]
+
+
+def test_session_stop_works_without_an_on_progress_callback(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+            result = session.stop()  # no on_progress passed at all
+
+            assert "hello" in result

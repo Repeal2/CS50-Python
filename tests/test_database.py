@@ -1,3 +1,4 @@
+import sqlite3
 import threading
 
 from meeting_scribe.storage.database import Database
@@ -93,6 +94,51 @@ def test_project_isolation(tmp_path):
 
         assert len(db.search_project(p1.id, "zzyzx")) == 1
         assert len(db.search_project(p2.id, "zzyzx")) == 0
+
+
+def test_set_manual_notes_persists_and_can_be_overwritten(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        project = db.create_project("Manual Notes")
+        meeting_id = db.create_meeting(project.id, "Kickoff")
+
+        db.set_manual_notes(meeting_id, "First note.")
+        assert db.get_meeting(meeting_id).manual_notes == "First note."
+
+        db.set_manual_notes(meeting_id, "First note.\nSecond note.")
+        assert db.get_meeting(meeting_id).manual_notes == "First note.\nSecond note."
+
+
+def test_meetings_created_before_manual_notes_existed_get_the_column_via_migration(tmp_path):
+    # Simulates a database from before manual_notes was added to SCHEMA: create the meetings table
+    # without that column, then open it with Database and confirm the ALTER TABLE migration catches it
+    # up rather than crashing on "no such column" the first time a Meeting row is read.
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE meetings (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            transcript_text TEXT,
+            notes_markdown TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Database(db_path) as db:
+        project = db.create_project("Legacy")
+        meeting_id = db.create_meeting(project.id, "Pre-existing schema")
+
+        meeting = db.get_meeting(meeting_id)
+        assert meeting.manual_notes is None
+
+        db.set_manual_notes(meeting_id, "Works after migration.")
+        assert db.get_meeting(meeting_id).manual_notes == "Works after migration."
 
 
 def test_list_documents_for_meeting_scopes_to_that_meeting(tmp_path):

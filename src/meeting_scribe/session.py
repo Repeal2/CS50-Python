@@ -5,6 +5,8 @@ under the meeting's project so it's searchable later.
 
 from __future__ import annotations
 
+from typing import Callable
+
 from meeting_scribe.ai.copilot_bridge import CopilotResponseTimeout
 from meeting_scribe.ai.notes import generate_notes
 from meeting_scribe.audio.recorder import Recorder
@@ -65,11 +67,22 @@ class MeetingSession:
         picking up audio" meter while recording. Both are 0.0 before start() or after stop()."""
         return self._recorder.mic_level, self._recorder.system_level
 
-    def stop(self) -> str:
+    def stop(self, on_progress: Callable[[str], None] | None = None) -> str:
         """Stops recording, transcribes, generates notes, and saves the meeting. Returns the notes
-        (or the plain transcript if the Copilot Studio bridge isn't configured, or if it times out)."""
+        (or the plain transcript if the Copilot Studio bridge isn't configured, or if it times out).
+
+        `on_progress`, if given, is called with a short human-readable status at each stage — this whole
+        method can take anywhere from seconds to several minutes (the Copilot Studio round trip
+        dominates), so the caller (the GUI) uses this to keep an activity log current instead of the UI
+        looking frozen with no feedback."""
+
+        def report(message: str) -> None:
+            if on_progress is not None:
+                on_progress(message)
+
         self._screen_watcher.stop()
         recorded = self._recorder.stop()
+        report("Recording stopped.")
 
         mic_lines = self._transcriber.transcribe(recorded.mic_path, source="mic")
         system_lines = self._transcriber.transcribe(recorded.system_path, source="system")
@@ -77,6 +90,7 @@ class MeetingSession:
             TranscriptLine(event.timestamp_seconds, "screen_ocr", event.text)
             for event in self._screen_events
         ]
+        report("Transcription complete.")
 
         merged = merge_transcript_lines(mic_lines, system_lines, screen_lines)
         transcript_text = render_transcript(merged)
@@ -88,6 +102,7 @@ class MeetingSession:
 
         notes = None
         if self._settings.copilot_sync_dir is not None:
+            report("Waiting for Copilot Studio notes...")
             try:
                 notes = generate_notes(
                     transcript_text,
@@ -97,10 +112,15 @@ class MeetingSession:
                     timeout_seconds=self._settings.copilot_timeout_seconds,
                     system_prompt=self._settings.notes_system_prompt,
                 )
+                report("Notes received from Copilot Studio.")
             except CopilotResponseTimeout:
                 # Don't lose the meeting over a slow/misconfigured flow — save the plain transcript and
                 # let the caller (the GUI) tell the user notes generation timed out via this flag.
                 self.notes_timed_out = True
+                report("Notes generation timed out.")
+        else:
+            report("Copilot sync folder not configured — skipping notes generation.")
 
         self._db.finish_meeting(self.meeting_id, transcript_text=transcript_text, notes_markdown=notes)
+        report("Meeting saved.")
         return notes or transcript_text
