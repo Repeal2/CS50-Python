@@ -14,3 +14,26 @@ def test_format_meeting_timestamp_is_readable_and_localized():
 def test_format_meeting_timestamp_falls_back_to_raw_string_on_bad_input():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     assert gui_app._format_meeting_timestamp("not-a-date") == "not-a-date"
+
+
+def test_notes_bullet_prefix_matches_a_dash_bullet_and_its_indentation():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    match = gui_app._NOTES_BULLET_PREFIX.match("    - Follow up with legal")
+    assert match.group(0) == "    - "
+
+
+def test_notes_bullet_prefix_matches_plain_lines_as_just_leading_whitespace():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    match = gui_app._NOTES_BULLET_PREFIX.match("  Just a plain note, no bullet")
+    assert match.group(0) == "  "
+
+
+def test_notes_bullet_prefix_matches_asterisk_and_dot_bullets():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._NOTES_BULLET_PREFIX.match("* Something").group(0) == "* "
+    assert gui_app._NOTES_BULLET_PREFIX.match("• Something").group(0) == "• "
+
+
+def test_notes_bullet_prefix_matches_an_empty_line():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._NOTES_BULLET_PREFIX.match("").group(0) == ""

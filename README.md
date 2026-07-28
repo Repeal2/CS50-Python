@@ -34,10 +34,13 @@ saves everything locally, and pushes.
   finishing up) — timestamped lines for the meeting starting, stopping, transcription finishing, and the
   push to Copilot Studio — so it's obvious something is happening, without dumping the live
   transcript/OCR text into view.
-- **Takes manual notes** typed directly on the Record tab during a meeting, timestamped and saved
-  incrementally per meeting (so nothing is lost if the app closes mid-meeting) — shown afterward on the
-  Projects & Search tab's "Manual notes" tab, alongside the OCR and audio transcripts, and included in
-  what gets pushed to Copilot Studio.
+- **Takes manual notes** in a full-size, freely-editable box on the Record tab (roughly half its vertical
+  space, matching the activity log) — type continuously rather than adding one note at a time; Enter
+  continues whatever bullet/indent the current line has, and Tab / Shift+Tab indent or dedent it, so a
+  nested bulleted list is just typing. Saved to that meeting incrementally as you type (debounced, so
+  nothing is lost if the app closes mid-meeting) — shown afterward on the Projects & Search tab's
+  "Manual notes" tab, alongside the OCR and audio transcripts, and included in what gets pushed to
+  Copilot Studio.
 - **Files the meeting under a project**, kept as a permanent local record — every meeting (transcript,
   manual notes) and any documents attached to it (invites, agendas, screenshots) stays browsable in this
   app under its project regardless of what happens to the copy pushed to Copilot Studio.

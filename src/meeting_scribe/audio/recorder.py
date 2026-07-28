@@ -22,6 +22,16 @@ import numpy as np
 CHUNK_FRAMES = 1024
 SAMPLE_WIDTH_BYTES = 2  # 16-bit PCM
 
+# Guards PyAudio() construction and .terminate() specifically — not stream open/read/close, which is
+# already safely concurrent (that's the whole point of separate mic/system capture threads within one
+# Recorder). Those two calls touch PortAudio's global init state and, on Windows, WASAPI's COM setup/
+# teardown, which isn't necessarily safe to interleave across *different* Recorder instances. Back-to-back
+# meetings (see session.py) can now have one meeting's Recorder.stop() tearing down on a background
+# thread while a new meeting's Recorder.start() is initializing on the GUI thread; without this lock that
+# race could crash the whole process natively — silently, since a native crash bypasses Python's
+# exception handling (and a windowed build has no console to show a traceback on even if it didn't).
+_pyaudio_lifecycle_lock = threading.Lock()
+
 
 # A plain linear ratio (rms / full-scale) makes a normal-volume microphone barely move the meter: typical
 # speech sits maybe 1-5% of full scale, which renders as a sliver nobody can see, while system audio
@@ -100,7 +110,8 @@ class Recorder:
             )
         import pyaudiowpatch as pyaudio
 
-        self._pyaudio = pyaudio.PyAudio()
+        with _pyaudio_lifecycle_lock:
+            self._pyaudio = pyaudio.PyAudio()
         self._stop_event.clear()
         self._started_at = time.monotonic()
 
@@ -120,7 +131,8 @@ class Recorder:
             if thread is not None:
                 thread.join(timeout=5)
         if self._pyaudio is not None:
-            self._pyaudio.terminate()
+            with _pyaudio_lifecycle_lock:
+                self._pyaudio.terminate()
         return RecordedAudio(
             mic_path=self._mic_path,
             system_path=self._system_path,

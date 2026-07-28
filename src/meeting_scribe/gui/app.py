@@ -8,8 +8,10 @@ and so starting the next meeting doesn't have to wait for the previous one to fi
 
 from __future__ import annotations
 
+import re
 import threading
 import tkinter as tk
+import traceback
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -29,6 +31,12 @@ from meeting_scribe.transcription.engine import TranscriptLine, render_transcrip
 # Shown in a device dropdown in place of a device name, meaning "follow whatever Windows currently
 # considers the default" rather than a specific device — used on both the Record tab and Settings tab.
 SYSTEM_DEFAULT_LABEL = "System default"
+
+# Manual-notes editor: matches leading whitespace plus an optional bullet marker ("-", "*", or "•")
+# followed by a space, so Enter can continue the same bullet/indent on the next line. A plain line (no
+# bullet) just matches its leading whitespace, so it stays plain rather than getting a bullet forced on.
+_NOTES_BULLET_PREFIX = re.compile(r"^[ \t]*(?:[-*•]\s+)?")
+_NOTES_INDENT = "    "
 
 
 def _format_meeting_timestamp(iso_string: str) -> str:
@@ -66,6 +74,11 @@ class MeetingScribeApp(tk.Tk):
         self.settings = settings or load_settings()
         self.db = Database(self.settings.db_path)
         self._session: MeetingSession | None = None
+        # A windowed PyInstaller build has no console, so an exception raised inside any Tkinter
+        # callback (a button command, an after() callback) would otherwise just vanish with nothing to
+        # show for it. Tkinter calls this instead of its default stderr-print behavior — log it to a
+        # file next to the database so there's at least something to look at if the app misbehaves.
+        self.report_callback_exception = self._report_callback_exception
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
@@ -105,6 +118,15 @@ class MeetingScribeApp(tk.Tk):
         self._record_tab.close_region_outline()
         self.db.close()
         self.destroy()
+
+    def _report_callback_exception(self, exc_type, exc_value, exc_traceback) -> None:
+        try:
+            log_path = self.settings.data_dir / "error.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n--- {datetime.now().isoformat()} ---\n")
+                traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+        except OSError:
+            pass  # logging the error shouldn't itself be able to crash the app
 
 
 class RecordTab(ttk.Frame):
@@ -200,34 +222,45 @@ class RecordTab(ttk.Frame):
         self.system_level_bar.grid(row=1, column=1, sticky="we", padx=(6, 0), pady=(2, 0))
         levels_frame.columnconfigure(1, weight=1)
 
-        manual_notes_frame = ttk.Frame(self)
-        manual_notes_frame.pack(fill="x", padx=12, pady=(8, 0))
-        ttk.Label(manual_notes_frame, text="Manual notes").pack(side="left")
-        self.manual_note_var = tk.StringVar()
-        self.manual_note_entry = ttk.Entry(
-            manual_notes_frame, textvariable=self.manual_note_var, state="disabled"
+        # Manual notes and the activity log split the remaining vertical space evenly: both frames below
+        # use fill="both", expand=True inside the same parent, and Tkinter's pack geometry manager
+        # divides leftover space equally between multiple expanding children packed the same way.
+        notes_and_log = ttk.Frame(self)
+        notes_and_log.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+
+        notes_header = ttk.Frame(notes_and_log)
+        notes_header.pack(fill="x")
+        ttk.Label(notes_header, text="Manual notes").pack(side="left")
+        ttk.Label(
+            notes_header, text="Enter: continue bullet   ·   Tab / Shift+Tab: indent", foreground="#777"
+        ).pack(side="right")
+
+        notes_frame = ttk.Frame(notes_and_log)
+        notes_frame.pack(fill="both", expand=True, pady=(2, 8))
+        self.manual_notes_editor = tk.Text(notes_frame, wrap="word", state="disabled")
+        notes_scrollbar = ttk.Scrollbar(
+            notes_frame, orient="vertical", command=self.manual_notes_editor.yview
         )
-        self.manual_note_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
-        self.manual_note_entry.bind("<Return>", self._add_manual_note)
-        self.add_note_button = ttk.Button(
-            manual_notes_frame, text="Add Note", command=self._add_manual_note, state="disabled"
-        )
-        self.add_note_button.pack(side="left")
+        self.manual_notes_editor.configure(yscrollcommand=notes_scrollbar.set)
+        self.manual_notes_editor.pack(side="left", fill="both", expand=True)
+        notes_scrollbar.pack(side="right", fill="y")
+        self.manual_notes_editor.bind("<KeyRelease>", self._schedule_manual_notes_save)
+        self.manual_notes_editor.bind("<Return>", self._on_manual_notes_return)
+        self.manual_notes_editor.bind("<Tab>", self._on_manual_notes_indent)
+        self.manual_notes_editor.bind("<Shift-Tab>", self._on_manual_notes_dedent)
+        self._manual_notes_save_after_id: str | None = None
 
         # A running activity log, not a transcript preview — the raw transcript/OCR text is already
         # long-form and belongs on the Projects & Search tab once a meeting is saved. This is just enough
-        # to confirm at a glance that something is actually happening during the (now potentially
-        # multi-minute) wait for Copilot Studio.
-        ttk.Label(self, text="Activity log").pack(anchor="w", padx=12, pady=(8, 0))
-        output_frame = ttk.Frame(self)
-        output_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        # to confirm at a glance that something is actually happening during the finish-up work.
+        ttk.Label(notes_and_log, text="Activity log").pack(anchor="w")
+        output_frame = ttk.Frame(notes_and_log)
+        output_frame.pack(fill="both", expand=True, pady=(2, 0))
         self.output = tk.Text(output_frame, wrap="word", state="disabled")
         output_scrollbar = ttk.Scrollbar(output_frame, orient="vertical", command=self.output.yview)
         self.output.configure(yscrollcommand=output_scrollbar.set)
         self.output.pack(side="left", fill="both", expand=True)
         output_scrollbar.pack(side="right", fill="y")
-
-        self._manual_notes_lines: list[str] = []
 
         self.refresh_projects()
         self._refresh_windows()
@@ -376,12 +409,12 @@ class RecordTab(ttk.Frame):
             return
 
         self.app._session = session
-        self._manual_notes_lines = []
         self.status_var.set(f"Recording — {project_name} / {meeting_title}")
         self.start_button["state"] = "disabled"
         self.stop_button["state"] = "normal"
-        self.manual_note_entry["state"] = "normal"
-        self.add_note_button["state"] = "normal"
+
+        self.manual_notes_editor["state"] = "normal"
+        self.manual_notes_editor.delete("1.0", "end")
 
         # Deliberately not cleared here: a previous meeting's background finish-up job (see _stop())
         # may still be logging its own progress, and wiping the log out from under it would lose that
@@ -389,21 +422,63 @@ class RecordTab(ttk.Frame):
         self._log(f'[{meeting_title}] Recording started — Project: {project_name}.')
         self._sync_region_outline()
 
-    def _add_manual_note(self, _event=None) -> None:
-        text = self.manual_note_var.get().strip()
+    def _schedule_manual_notes_save(self, _event=None) -> None:
+        """Debounces saving to the DB so a fast typist doesn't trigger a write on every keystroke —
+        restarts a short timer on each edit, so the save actually happens ~400ms after typing pauses."""
+        if self._manual_notes_save_after_id is not None:
+            self.after_cancel(self._manual_notes_save_after_id)
+        self._manual_notes_save_after_id = self.after(400, self._save_manual_notes)
+
+    def _save_manual_notes(self) -> None:
+        self._manual_notes_save_after_id = None
         session = self.app._session
-        if not text or session is None:
+        if session is None:
             return
-        timestamp = datetime.now().strftime("%b %d, %Y %I:%M:%S %p")
-        self._manual_notes_lines.append(f"[{timestamp}] {text}")
-        self.app.db.set_manual_notes(session.meeting_id, "\n".join(self._manual_notes_lines))
-        self.manual_note_var.set("")
-        self._log(f"[{session.title}] Note added: {text}")
+        content = self.manual_notes_editor.get("1.0", "end-1c")
+        self.app.db.set_manual_notes(session.meeting_id, content)
+
+    def _on_manual_notes_return(self, event) -> str:
+        """Continues the current line's indentation and bullet marker (if any) onto the new line, so a
+        bulleted/nested list keeps going with just Enter instead of retyping "- " (or however many
+        levels of indent) every time. A plain line has no bullet to match, so it just stays plain.
+        (The <KeyRelease> binding covers scheduling the save for this and the two handlers below —
+        Tkinter fires it after any key, including Return/Tab, so there's no need to also call it here.)
+        """
+        widget = event.widget
+        line_text = widget.get("insert linestart", "insert lineend")
+        match = _NOTES_BULLET_PREFIX.match(line_text)
+        prefix = match.group(0) if match else ""
+        widget.insert("insert", "\n" + prefix)
+        return "break"
+
+    def _on_manual_notes_indent(self, event) -> str:
+        """Tab indents the whole current line one level, wherever the cursor is in it — matches how
+        bullet lists behave in most note-taking apps, rather than inserting a literal tab character."""
+        event.widget.insert("insert linestart", _NOTES_INDENT)
+        return "break"
+
+    def _on_manual_notes_dedent(self, event) -> str:
+        widget = event.widget
+        line_start = widget.index("insert linestart")
+        line_text = widget.get(line_start, "insert lineend")
+        leading_spaces = len(line_text) - len(line_text.lstrip(" "))
+        remove = min(leading_spaces, len(_NOTES_INDENT))
+        if remove:
+            widget.delete(line_start, f"{line_start}+{remove}c")
+        return "break"
 
     def _stop(self) -> None:
         session = self.app._session
         if session is None:
             return
+        # Flush any pending debounced save before detaching (see _schedule_manual_notes_save) so the
+        # last few keystrokes before Stop aren't lost — _save_manual_notes reads self.app._session, so
+        # this has to happen before that gets cleared below.
+        if self._manual_notes_save_after_id is not None:
+            self.after_cancel(self._manual_notes_save_after_id)
+            self._manual_notes_save_after_id = None
+        self._save_manual_notes()
+
         # Detach right away rather than waiting for the background job below to finish — transcribing
         # and pushing to Copilot Studio takes a moment, and there's no reason that should block starting
         # the next meeting. Everything the background job needs (the session, its title) is already
@@ -411,8 +486,7 @@ class RecordTab(ttk.Frame):
         self.app._session = None
 
         self.stop_button["state"] = "disabled"
-        self.manual_note_entry["state"] = "disabled"
-        self.add_note_button["state"] = "disabled"
+        self.manual_notes_editor["state"] = "disabled"
         self.start_button["state"] = "normal"
         self.status_var.set(f'Idle — finishing "{session.title}" in the background.')
         self._log(f'[{session.title}] Stop requested — finishing in the background.')
