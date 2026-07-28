@@ -24,12 +24,13 @@ saves everything locally, and pushes.
   the background after you hit Stop, so it doesn't block starting the next meeting right away; the
   activity log tags each background job's lines with that meeting's title so back-to-back meetings
   finishing up at the same time stay distinguishable.
-- **Pushes the finished meeting to Copilot Studio** — the transcript plus any manual notes, dropped as a
-  plain-text file into a folder OneDrive/SharePoint is already syncing (see "The Copilot push" below).
-  This is one-way and fire-and-forget: the app doesn't call an AI API directly (governance doesn't allow
-  that for this org) and doesn't wait for or ingest anything back. Whatever picks that file up from
-  there — a Power Automate flow, Copilot Studio, or however it's wired up — owns managing, summarizing,
-  and parsing the information; this app's job stops at the handoff.
+- **Pushes the finished meeting to Copilot Studio** as a named file package — separate audio and screen
+  transcripts, a copy of each reference document attached to that meeting, and a completion manifest,
+  all dropped into a folder OneDrive/SharePoint is already syncing (see "The Copilot push" below). This is
+  one-way and fire-and-forget: the app doesn't call an AI API directly (governance doesn't allow that for
+  this org) and doesn't wait for or ingest anything back. Whatever picks that package up from there — a
+  Power Automate flow, Copilot Studio, or however it's wired up — owns managing, summarizing, and parsing
+  the information; this app's job stops at the handoff.
 - **Keeps a running activity log** on the Record tab while a meeting is in progress (and while it's
   finishing up) — timestamped lines for the meeting starting, stopping, transcription finishing, and the
   push to Copilot Studio — so it's obvious something is happening, without dumping the live
@@ -39,14 +40,27 @@ saves everything locally, and pushes.
   continues whatever bullet/indent the current line has, and Tab / Shift+Tab indent or dedent it, so a
   nested bulleted list is just typing. Saved to that meeting incrementally as you type (debounced, so
   nothing is lost if the app closes mid-meeting) — shown afterward on the Projects & Search tab's
-  "Manual notes" tab, alongside the OCR and audio transcripts, and included in what gets pushed to
-  Copilot Studio.
+  "Manual notes" tab, alongside the OCR and audio transcripts, and handed off in the Copilot push package
+  as a reference-doc-style entry (see below).
 - **Files the meeting under a project**, kept as a permanent local record — every meeting (transcript,
   manual notes) and any documents attached to it (invites, agendas, screenshots) stays browsable in this
   app under its project regardless of what happens to the copy pushed to Copilot Studio.
-- **Accepts context documents** — PDFs, Word docs, images, plain text — attached from the Record tab
-  (to the project, or to whichever meeting is currently in progress) at any time, not just during a
-  meeting (e.g. a screenshot of the calendar invite, a spec doc).
+- **Accepts context documents** — PDFs, Word docs, images, plain text — attached from the Record tab (to
+  the project, or to whichever meeting is currently in progress) at any time, not just during a meeting
+  (e.g. a screenshot of the calendar invite, a spec doc). Documents can also be attached *after* a meeting
+  has ended, from the Projects & Search tab's own "Upload Document…" button — to whichever past meeting is
+  selected there, or to the project generally if none is.
+- **Lets the meeting title be renamed any time before it ends** — it's a normal editable field on the
+  Record tab, not fixed once at Start, and every keystroke is saved immediately so the title shown
+  elsewhere in the app never lags behind. It's also a dropdown: typing a project name into the Project
+  field populates it with that project's previous meeting titles (most recently used first), so a
+  recurring meeting ("Weekly Client Meeting") is one click instead of retyping.
+- **Captures the attendee list via OCR** — a "Capture Attendees…" button on the Record tab (enabled while
+  a meeting is recording) opens the same drag-to-select overlay used for screen OCR, reads whatever
+  participants panel you draw a box around immediately (not on a delay, and not part of the continuous
+  screen watcher), and appends the result to that meeting's attendee list. Shown afterward in its own
+  "Attendees" tab on the Projects & Search tab, alongside the OCR/audio transcripts and manual notes, and
+  handed off in the Copilot push package as a reference-doc-style entry (see below).
 
 ## Why it's built this way
 
@@ -72,7 +86,7 @@ src/meeting_scribe/
   screen/window_picker.py  # enumerates open windows so one can be picked as the OCR target
   screen/region_picker.py  # drag-to-select a custom OCR rectangle + its on-screen boundary outline
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
-  ai/copilot_push.py    # one-way file drop of a finished meeting to Copilot Studio — no response handling
+  ai/copilot_push.py    # one-way, named-file-package drop of a finished meeting to Copilot Studio
   storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents
   storage/documents.py  # Text extraction for uploaded PDFs/docx/images/text
   gui/app.py             # Tkinter control panel
@@ -86,13 +100,17 @@ tests/                    # Unit tests for the parts that don't need Windows har
 ## Data model
 
 - **Project** — a named bucket ("Acme Q3 Renewal", "Team Standups"). Everything below belongs to one.
-- **Meeting** — one recorded session: raw audio files, the merged transcript, and the manual notes typed
-  on the Record tab while it was in progress. This is the permanent local record, independent of the
-  copy pushed to Copilot Studio.
+- **Meeting** — one recorded session: raw audio files, the merged transcript, the manual notes typed on
+  the Record tab while it was in progress, and any attendee list captured via OCR. Assigned a `meetingID`
+  (`meeting_code` in the database, e.g. `20260728-1030`) once at creation — this is what the Copilot push
+  package's file names are keyed on, not the database row id. This is the permanent local record,
+  independent of the copy pushed to Copilot Studio.
 - **Transcript segment** — a timestamped line from either `mic`, `system`, or `screen_ocr`, tied to a
   meeting.
 - **Document** — any uploaded file, optionally tied to a specific meeting (e.g. that meeting's invite) or
-  just to the project in general (e.g. a spec doc).
+  just to the project in general (e.g. a spec doc). Both its extracted text and a copy of its original
+  bytes are kept (the latter under a synthetic name — see `storage/documents.py::save_original_copy`), so
+  a meeting-attached document can still be handed off under its real filename in the Copilot push package.
 
 Everything above is browsable in the app (Projects & Search tab: pick a project, pick a meeting, its
 transcripts/notes/documents are right there) — there's no in-app search/Ask feature, since querying and
@@ -125,15 +143,75 @@ synthesized result. `ai/copilot_push.py` does the whole thing in two steps:
 
 1. **Settings tab → "Copilot sync folder"**: pick a folder that's inside a location OneDrive or SharePoint
    is already syncing to this machine. The app creates an `Inbox/` subfolder under it.
-2. When a meeting finishes, the app writes one plain-text file to `Inbox/` (project, title, the merged
-   transcript, and any manual notes) and returns immediately. OneDrive/SharePoint sync uploads it to the
-   cloud from there.
+2. When a meeting finishes, the app writes that meeting's whole file package to `Inbox/` and returns
+   immediately. OneDrive/SharePoint sync uploads it to the cloud from there.
 
-Whatever picks that file up on the other end — a Power Automate flow, Copilot Studio, or however an org
+### File naming contract
+
+Every meeting gets a **meetingID** — `YYYYMMDD-HHMM` (e.g. `20260728-1030`), or `YYYYMMDD-HHMM-XXX` with a
+random 3-character suffix if another meeting already started in that same minute — assigned once when the
+meeting is created and used to prefix every file in its package:
+
+| File | Naming pattern | Example |
+|---|---|---|
+| Audio transcript | `{meetingID}_transcript-audio.txt` | `20260728-1030_transcript-audio.txt` |
+| Screen transcript | `{meetingID}_transcript-screen.txt` | `20260728-1030_transcript-screen.txt` |
+| Reference document(s) | `{meetingID}_{original-filename}.{ext}` | `20260728-1030_Q3 Budget Proposal.pdf` |
+| Completion manifest | `{meetingID}_done.json` | `20260728-1030_done.json` |
+
+Reference documents are copied under their real original filename (just prefixed), not renamed or
+converted — this app keeps a copy of the original bytes it was uploaded with (see
+`storage/documents.py::save_original_copy`) specifically so it has something to hand off here later, since
+only its *extracted text* is otherwise kept in the local database. Two reference documents attached to the
+same meeting with identical original filenames get `-2`, `-3`, etc. appended before the extension to avoid
+overwriting each other; the manifest's `reference_docs` entries carry both the original and saved filename,
+so a rename is always visible there.
+
+Manual notes and the OCR'd attendee list aren't uploaded files, but they're handed off the same
+reference-doc-style way — same naming pattern, same manifest entry shape — as `{meetingID}_meeting-notes.txt`
+and `{meetingID}_attendees.txt` respectively, written from whatever's saved in the local database rather
+than copied from a file on disk. Either (or both) is simply omitted from `reference_docs` if nothing was
+recorded for that meeting — a manual notes box that was never typed in, or an attendee list that was never
+captured, doesn't produce an empty file.
+
+The **completion manifest is written last**, only once the transcripts and every reference document have
+been fully copied — it's the single file the downstream workflow should watch for and trigger on; nothing
+else appearing in the folder should cause a trigger. Its shape:
+
+```json
+{
+  "meetingID": "20260728-1030",
+  "files": {
+    "transcript_audio": "20260728-1030_transcript-audio.txt",
+    "transcript_screen": "20260728-1030_transcript-screen.txt",
+    "reference_docs": [
+      {
+        "original_filename": "meeting-notes.txt",
+        "saved_filename": "20260728-1030_meeting-notes.txt"
+      },
+      {
+        "original_filename": "attendees.txt",
+        "saved_filename": "20260728-1030_attendees.txt"
+      },
+      {
+        "original_filename": "Q3 Budget Proposal.pdf",
+        "saved_filename": "20260728-1030_Q3 Budget Proposal.pdf"
+      }
+    ]
+  },
+  "reference_count": 3,
+  "timestamp_completed": "2026-07-28T10:47:32Z"
+}
+```
+
+`reference_docs` is `[]` (and `reference_count` is `0`) when no reference documents were attached to that
+meeting. `timestamp_completed` is always UTC, `Z`-suffixed ISO 8601.
+
+Whatever picks that package up on the other end — a Power Automate flow, Copilot Studio, or however an org
 wires it up — owns managing, summarizing, and parsing the information from that point on. Building and
 owning that side (and whatever Copilot Studio capacity/licensing it needs) is outside this codebase —
 that's a Power Platform admin/maker task, not something this app depends on to function. If nothing is
-configured to pick the file up at all, the meeting is still fully recorded and saved locally; nothing
+configured to pick the package up at all, the meeting is still fully recorded and saved locally; nothing
 is lost, it just never gets pushed anywhere.
 
 ## Building the .exe

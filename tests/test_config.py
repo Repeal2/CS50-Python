@@ -80,6 +80,12 @@ def test_load_settings_uses_copilot_sync_dir_env_var(tmp_path, monkeypatch):
     assert settings.copilot_sync_dir == tmp_path / "OneDrive" / "Bridge"
 
 
+def test_documents_dir_is_a_subfolder_of_the_data_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    assert load_settings().documents_dir == tmp_path / "documents"
+
+
 def test_copilot_inbox_dir_is_a_subfolder_of_the_sync_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 

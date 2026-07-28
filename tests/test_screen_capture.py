@@ -1,4 +1,9 @@
-from meeting_scribe.screen.capture import ScreenWatcher, _looks_like_ui_noise, _new_lines
+from meeting_scribe.screen.capture import (
+    ScreenWatcher,
+    _looks_like_ui_noise,
+    _new_lines,
+    _ocr_region_once,
+)
 from meeting_scribe.screen.region_picker import RegionTarget
 
 
@@ -154,3 +159,23 @@ def test_capture_once_only_emits_newly_scrolled_in_lines():
     watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
 
     assert [e.text for e in events] == ["Brookes, Martin\nTesting.", "On T3.", "OK, now we are testing."]
+
+
+def test_ocr_region_once_returns_the_cleaned_text():
+    sct = FakeSct([b"frame-a"])
+    tess = FakePytesseract(["MB\nJohn Smith\nJane Doe\n@ B x"])
+
+    result = _ocr_region_once(sct, region={"left": 0, "top": 0, "width": 100, "height": 100},
+                               Image=FakeImage, pytesseract=tess)
+
+    assert result == "John Smith\nJane Doe"
+
+
+def test_ocr_region_once_returns_empty_string_for_no_readable_text():
+    sct = FakeSct([b"frame-a"])
+    tess = FakePytesseract(["MB\n@ B x"])
+
+    result = _ocr_region_once(sct, region={"left": 0, "top": 0, "width": 100, "height": 100},
+                               Image=FakeImage, pytesseract=tess)
+
+    assert result == ""

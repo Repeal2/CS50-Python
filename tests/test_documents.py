@@ -1,6 +1,6 @@
 import pytest
 
-from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text
+from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
 
 
 def test_extract_text_from_txt(tmp_path):
@@ -41,3 +41,29 @@ def test_unsupported_suffix_raises(tmp_path):
     path.write_bytes(b"not really a video")
     with pytest.raises(UnsupportedDocumentError):
         extract_text(path)
+
+
+def test_save_original_copy_preserves_bytes_and_extension(tmp_path):
+    source = tmp_path / "invite.pdf"
+    source.write_bytes(b"%PDF-1.4 fake contents")
+    dest_dir = tmp_path / "vault"
+
+    saved = save_original_copy(source, dest_dir)
+
+    assert saved.parent == dest_dir
+    assert saved.suffix == ".pdf"
+    assert saved.read_bytes() == b"%PDF-1.4 fake contents"
+
+
+def test_save_original_copy_creates_the_dest_dir_and_avoids_name_collisions(tmp_path):
+    source = tmp_path / "notes.txt"
+    source.write_text("first", encoding="utf-8")
+    dest_dir = tmp_path / "vault" / "nested"
+
+    first = save_original_copy(source, dest_dir)
+    second = save_original_copy(source, dest_dir)
+
+    assert dest_dir.is_dir()
+    assert first != second
+    assert first.read_text(encoding="utf-8") == "first"
+    assert second.read_text(encoding="utf-8") == "first"

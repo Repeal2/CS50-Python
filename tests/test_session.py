@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -108,7 +109,7 @@ def test_session_audio_levels_reads_through_to_recorder(tmp_path):
             assert session.audio_levels() == (0.42, 0.13)
 
 
-def test_session_pushes_transcript_and_manual_notes_when_sync_dir_configured(tmp_path):
+def test_session_pushes_a_named_file_package_when_sync_dir_configured(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
@@ -126,17 +127,125 @@ def test_session_pushes_transcript_and_manual_notes_when_sync_dir_configured(tmp
             settings = _settings(tmp_path, copilot_sync_dir=tmp_path / "Bridge")
             session = MeetingSession(settings, db, "Test Project", "Kickoff")
             session.start()
-            db.set_manual_notes(session.meeting_id, "Don't forget the budget.")
 
             result = session.stop()
 
             assert result == db.get_meeting(session.meeting_id).transcript_text
-            [pushed_file] = list((tmp_path / "Bridge" / "Inbox").iterdir())
-            content = pushed_file.read_text(encoding="utf-8")
-            assert "Test Project" in content
-            assert "Kickoff" in content
-            assert "hello" in content
-            assert "Don't forget the budget." in content
+            inbox_dir = tmp_path / "Bridge" / "Inbox"
+            code = session.meeting_code
+            audio_transcript = (inbox_dir / f"{code}_transcript-audio.txt").read_text(encoding="utf-8")
+            screen_transcript = (inbox_dir / f"{code}_transcript-screen.txt").read_text(encoding="utf-8")
+            assert "hello" in audio_transcript
+            assert "no on-screen text" in screen_transcript
+            manifest = json.loads((inbox_dir / f"{code}_done.json").read_text(encoding="utf-8"))
+            assert manifest["meetingID"] == code
+            assert manifest["files"]["reference_docs"] == []
+
+
+def test_session_pushes_a_meetings_reference_documents_under_their_original_filename(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path, copilot_sync_dir=tmp_path / "Bridge")
+            session = MeetingSession(settings, db, "Test Project", "Kickoff")
+            session.start()
+
+            original = tmp_path / "invite.pdf"
+            original.write_bytes(b"invite bytes")
+            db.add_document(
+                session.project.id,
+                "invite.pdf",
+                "invite text",
+                meeting_id=session.meeting_id,
+                source_path=str(original),
+            )
+
+            session.stop()
+
+            inbox_dir = tmp_path / "Bridge" / "Inbox"
+            saved = inbox_dir / f"{session.meeting_code}_invite.pdf"
+            assert saved.read_bytes() == b"invite bytes"
+            manifest = json.loads((inbox_dir / f"{session.meeting_code}_done.json").read_text())
+            assert manifest["reference_count"] == 1
+            assert manifest["files"]["reference_docs"] == [
+                {"original_filename": "invite.pdf", "saved_filename": f"{session.meeting_code}_invite.pdf"}
+            ]
+
+
+def test_session_pushes_manual_notes_and_attendees_as_reference_docs(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path, copilot_sync_dir=tmp_path / "Bridge")
+            session = MeetingSession(settings, db, "Test Project", "Kickoff")
+            session.start()
+            db.set_manual_notes(session.meeting_id, "Follow up with legal.")
+            db.set_attendees(session.meeting_id, "John Smith\nJane Doe")
+
+            session.stop()
+
+            inbox_dir = tmp_path / "Bridge" / "Inbox"
+            code = session.meeting_code
+            notes = (inbox_dir / f"{code}_meeting-notes.txt").read_text(encoding="utf-8")
+            attendees = (inbox_dir / f"{code}_attendees.txt").read_text(encoding="utf-8")
+            assert notes == "Follow up with legal."
+            assert attendees == "John Smith\nJane Doe"
+
+            manifest = json.loads((inbox_dir / f"{code}_done.json").read_text(encoding="utf-8"))
+            assert manifest["reference_count"] == 2
+            assert manifest["files"]["reference_docs"] == [
+                {"original_filename": "meeting-notes.txt", "saved_filename": f"{code}_meeting-notes.txt"},
+                {"original_filename": "attendees.txt", "saved_filename": f"{code}_attendees.txt"},
+            ]
+
+
+def test_session_omits_manual_notes_and_attendees_from_the_push_when_neither_was_recorded(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path, copilot_sync_dir=tmp_path / "Bridge")
+            session = MeetingSession(settings, db, "Test Project", "Kickoff")
+            session.start()
+
+            session.stop()
+
+            inbox_dir = tmp_path / "Bridge" / "Inbox"
+            manifest = json.loads((inbox_dir / f"{session.meeting_code}_done.json").read_text())
+            assert manifest["files"]["reference_docs"] == []
+            assert manifest["reference_count"] == 0
 
 
 def test_session_pushes_nothing_without_a_copilot_sync_dir(tmp_path):

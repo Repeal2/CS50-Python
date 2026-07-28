@@ -5,8 +5,10 @@ to Copilot Studio (see ai/copilot_push.py).
 
 from __future__ import annotations
 
+import random
 import re
 import sqlite3
+import string
 import threading
 from contextlib import closing
 from dataclasses import dataclass
@@ -29,7 +31,9 @@ CREATE TABLE IF NOT EXISTS meetings (
     ended_at TEXT,
     transcript_text TEXT,
     notes_markdown TEXT,
-    manual_notes TEXT
+    manual_notes TEXT,
+    attendees TEXT,
+    meeting_code TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transcript_segments (
@@ -46,6 +50,7 @@ CREATE TABLE IF NOT EXISTS documents (
     meeting_id INTEGER REFERENCES meetings(id) ON DELETE SET NULL,
     filename TEXT NOT NULL,
     content_text TEXT NOT NULL,
+    source_path TEXT,
     added_at TEXT NOT NULL
 );
 
@@ -57,12 +62,20 @@ CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:
     """`CREATE TABLE IF NOT EXISTS` in SCHEMA only creates a fresh table for brand-new databases — it's
-    a no-op against a `meetings` table that already exists from before a column was added, so an
-    existing user's database needs an explicit ALTER TABLE to catch up. There's no formal migration
-    framework here; this is a deliberately minimal "add the column if it isn't already there" check."""
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(meetings)")}
-    if "manual_notes" not in existing:
+    a no-op against tables that already exist from before a column was added, so an existing user's
+    database needs an explicit ALTER TABLE to catch up. There's no formal migration framework here; this
+    is a deliberately minimal "add the column if it isn't already there" check."""
+    meetings_columns = {row["name"] for row in conn.execute("PRAGMA table_info(meetings)")}
+    if "manual_notes" not in meetings_columns:
         conn.execute("ALTER TABLE meetings ADD COLUMN manual_notes TEXT")
+    if "attendees" not in meetings_columns:
+        conn.execute("ALTER TABLE meetings ADD COLUMN attendees TEXT")
+    if "meeting_code" not in meetings_columns:
+        conn.execute("ALTER TABLE meetings ADD COLUMN meeting_code TEXT")
+
+    documents_columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+    if "source_path" not in documents_columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN source_path TEXT")
 
 
 def _slugify(name: str) -> str:
@@ -72,6 +85,29 @@ def _slugify(name: str) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_MEETING_CODE_SUFFIX_ALPHABET = string.ascii_uppercase + string.digits
+
+
+def _generate_meeting_code(conn: sqlite3.Connection) -> str:
+    """A meetingID in the "YYYYMMDD-HHMM" format the Copilot push package's file names are keyed on
+    (see ai/copilot_push.py) — local wall-clock time, since it's meant to be human-recognizable
+    ("this is this morning's 10:30 meeting"), not a machine timestamp. Two meetings starting in the same
+    minute would otherwise collide, so a random 3-character suffix is appended whenever that base code is
+    already taken."""
+    base = datetime.now().strftime("%Y%m%d-%H%M")
+    existing = {
+        row["meeting_code"]
+        for row in conn.execute("SELECT meeting_code FROM meetings WHERE meeting_code IS NOT NULL")
+    }
+    if base not in existing:
+        return base
+    while True:
+        suffix = "".join(random.choices(_MEETING_CODE_SUFFIX_ALPHABET, k=3))
+        candidate = f"{base}-{suffix}"
+        if candidate not in existing:
+            return candidate
 
 
 @dataclass(frozen=True)
@@ -92,6 +128,8 @@ class Meeting:
     transcript_text: str | None
     notes_markdown: str | None
     manual_notes: str | None
+    attendees: str | None
+    meeting_code: str | None
 
 
 class Database:
@@ -158,9 +196,10 @@ class Database:
 
     def create_meeting(self, project_id: int, title: str, started_at: str | None = None) -> int:
         with self._lock, closing(self._conn.cursor()) as cur:
+            meeting_code = _generate_meeting_code(self._conn)
             cur.execute(
-                "INSERT INTO meetings (project_id, title, started_at) VALUES (?, ?, ?)",
-                (project_id, title, started_at or _now()),
+                "INSERT INTO meetings (project_id, title, started_at, meeting_code) VALUES (?, ?, ?, ?)",
+                (project_id, title, started_at or _now(), meeting_code),
             )
             self._conn.commit()
             return cur.lastrowid
@@ -202,6 +241,33 @@ class Database:
             )
             self._conn.commit()
 
+    def set_attendees(self, meeting_id: int, attendees: str | None) -> None:
+        """Overwrites the meeting's attendee list, built from one or more OCR captures of an attendee
+        panel taken during the meeting (see screen/capture.py's ocr_region)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE meetings SET attendees = ? WHERE id = ?", (attendees, meeting_id)
+            )
+            self._conn.commit()
+
+    def update_meeting_title(self, meeting_id: int, title: str) -> None:
+        """Renames a meeting in place — the title can be edited any time up until the meeting ends,
+        not just fixed at Start."""
+        with self._lock:
+            self._conn.execute("UPDATE meetings SET title = ? WHERE id = ?", (title, meeting_id))
+            self._conn.commit()
+
+    def list_recent_meeting_titles(self, project_id: int) -> list[str]:
+        """Distinct meeting titles used in this project, most recently used first — powers the Record
+        tab's meeting-title suggestions for quick repeat meetings (e.g. "Weekly Client Meeting")."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT title, MAX(started_at) AS last_used FROM meetings WHERE project_id = ? "
+                "GROUP BY title ORDER BY last_used DESC",
+                (project_id,),
+            ).fetchall()
+        return [row["title"] for row in rows]
+
     def get_meeting(self, meeting_id: int) -> Meeting | None:
         with self._lock:
             row = self._conn.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
@@ -224,13 +290,22 @@ class Database:
     # -- Documents ------------------------------------------------------------
 
     def add_document(
-        self, project_id: int, filename: str, content_text: str, meeting_id: int | None = None
+        self,
+        project_id: int,
+        filename: str,
+        content_text: str,
+        meeting_id: int | None = None,
+        source_path: str | None = None,
     ) -> int:
+        """`source_path` is where this document's original bytes are stashed on disk (see
+        storage.documents.save_original_copy) — None for documents added without a real file behind
+        them (e.g. in older tests/data). It's what the Copilot push package copies from when handing a
+        meeting's reference documents off under their real filenames."""
         with self._lock, closing(self._conn.cursor()) as cur:
             cur.execute(
-                "INSERT INTO documents (project_id, meeting_id, filename, content_text, added_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (project_id, meeting_id, filename, content_text, _now()),
+                "INSERT INTO documents (project_id, meeting_id, filename, content_text, source_path, "
+                "added_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (project_id, meeting_id, filename, content_text, source_path, _now()),
             )
             self._conn.commit()
             return cur.lastrowid

@@ -133,3 +133,31 @@ class ScreenWatcher:
         self._seen_lines.update(new_lines)
         elapsed = time.monotonic() - self._started_at
         self._on_text(ScreenTextEvent(timestamp_seconds=elapsed, text="\n".join(new_lines)))
+
+
+def ocr_region(region: dict, tesseract_cmd: str | None = None) -> str:
+    """One-shot OCR of a fixed screen rectangle (an mss-style region dict — see RegionTarget.mss_region).
+    Unlike ScreenWatcher this isn't a continuous background watcher; it grabs exactly one frame right now
+    and returns whatever Tesseract reads from it, for on-demand captures like reading a meeting's
+    attendee list off a participants panel."""
+    import mss
+    import pytesseract
+    from PIL import Image
+
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+    with mss.mss() as sct:
+        return _ocr_region_once(sct, region, Image, pytesseract)
+
+
+def _ocr_region_once(sct, region, Image, pytesseract) -> str:
+    """The actual grab-and-read, split out from ocr_region() so it's testable with fakes the same way
+    ScreenWatcher._capture_once is. Runs the same noise filter as the live OCR stream (an empty
+    `already_seen` set degrades _new_lines to "just drop blank/junk/duplicate lines"), since
+    avatar-initial and icon-row garbage shows up in a one-shot capture exactly like it does in a
+    continuous one."""
+    shot = sct.grab(region)
+    image = Image.frombytes("RGB", shot.size, shot.rgb)
+    text = pytesseract.image_to_string(image)
+    return "\n".join(_new_lines(text, already_seen=set()))

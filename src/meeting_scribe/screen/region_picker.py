@@ -47,13 +47,32 @@ def _region_from_drag(x1: int, y1: int, x2: int, y2: int) -> RegionTarget | None
 
 
 def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
-    """Opens a fullscreen, mostly-transparent overlay the user drags a rectangle onto, showing the
-    selection live as they drag. Blocks (via wait_window) until they release the mouse or press Escape
-    to cancel. Returns None on cancel or too-small a selection."""
+    """Opens a mostly-transparent overlay spanning every connected monitor (not just the primary one)
+    the user drags a rectangle onto, showing the selection live as they drag. Blocks (via wait_window)
+    until they release the mouse or press Escape to cancel. Returns None on cancel or too-small a
+    selection.
+
+    Tkinter's own `-fullscreen` attribute and `winfo_screenwidth()`/`winfo_screenheight()` only cover the
+    *primary* monitor on Windows, not the full virtual desktop — on a multi-monitor setup that made the
+    greyed-out selection area smaller than the actual screen, and unusable on secondary monitors
+    entirely. mss's monitor 0 is the real union of every display, negative coordinates and all (a monitor
+    positioned above/left of the primary has a negative left/top), so the overlay is explicitly
+    positioned and sized from that instead of relying on Tk's single-monitor notion of "the screen".
+    """
+    import mss
     import tkinter as tk
 
+    with mss.mss() as sct:
+        virtual_screen = sct.monitors[0]
+
     overlay = tk.Toplevel(parent)
-    overlay.attributes("-fullscreen", True)
+    # overrideredirect (no title bar/borders) rather than "-fullscreen", which on Windows only ever
+    # covers the primary monitor regardless of the geometry given below.
+    overlay.overrideredirect(True)
+    overlay.geometry(
+        f"{virtual_screen['width']}x{virtual_screen['height']}"
+        f"+{virtual_screen['left']}+{virtual_screen['top']}"
+    )
     overlay.attributes("-alpha", 0.25)
     overlay.attributes("-topmost", True)
     overlay.configure(bg="black", cursor="crosshair")
@@ -63,7 +82,7 @@ def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
     canvas = tk.Canvas(overlay, bg="black", highlightthickness=0)
     canvas.pack(fill="both", expand=True)
     canvas.create_text(
-        overlay.winfo_screenwidth() // 2,
+        virtual_screen["width"] // 2,
         24,
         text="Drag to select the area to capture — Esc to cancel",
         fill="white",
@@ -87,9 +106,15 @@ def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
     def on_release(event: tk.Event) -> None:
         if state["start"] is not None:
             start_x, start_y = state["start"]
-            # Canvas coords are overlay-relative; the overlay is fullscreen at (0, 0), so they're also
-            # screen-absolute, which is what mss (and RegionOutline) expect.
-            state["result"] = _region_from_drag(start_x, start_y, event.x, event.y)
+            # Canvas coords are overlay-relative, and the overlay's own top-left is the virtual
+            # desktop's top-left (which can be negative) rather than (0, 0), so that offset has to be
+            # added back in to get real screen-absolute coordinates for mss (and RegionOutline).
+            state["result"] = _region_from_drag(
+                start_x + virtual_screen["left"],
+                start_y + virtual_screen["top"],
+                event.x + virtual_screen["left"],
+                event.y + virtual_screen["top"],
+            )
         overlay.destroy()
 
     def on_cancel(_event: tk.Event | None = None) -> None:

@@ -11,9 +11,10 @@ doesn't wait for the previous one to finish transcribing/saving.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
-from meeting_scribe.ai.copilot_push import format_meeting_for_push, push_meeting
+from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
 from meeting_scribe.audio.recorder import Recorder
 from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
@@ -45,6 +46,9 @@ class MeetingSession:
         self.project = db.get_or_create_project(project_name)
         self.meeting_id = db.create_meeting(self.project.id, title)
         self.title = title
+        # The Copilot push package's file names are keyed on this (see ai/copilot_push.py), not the
+        # database row id — assigned once at creation and never changes, unlike the title.
+        self.meeting_code = db.get_meeting(self.meeting_id).meeting_code
 
         meeting_dir = settings.meeting_dir(self.project.slug, self.meeting_id)
         meeting_dir.mkdir(parents=True, exist_ok=True)
@@ -97,7 +101,13 @@ class MeetingSession:
         ]
         report("Transcription complete.")
 
-        merged = merge_transcript_lines(mic_lines, system_lines, screen_lines)
+        # The Copilot push package (see ai/copilot_push.py) hands off the spoken and on-screen text as
+        # two separate files, not one merged one — audio_lines covers both directions of the call (mic
+        # and system), screen_lines is the OCR stream. The combined `merged` rendering is still what's
+        # kept in this app's own local record (finish_meeting below), where mixing sources by timestamp
+        # is exactly the point.
+        audio_lines = merge_transcript_lines(mic_lines, system_lines)
+        merged = merge_transcript_lines(audio_lines, screen_lines)
         transcript_text = render_transcript(merged)
 
         for line in merged:
@@ -106,14 +116,32 @@ class MeetingSession:
             )
 
         if self._settings.copilot_sync_dir is not None:
-            manual_notes = self._db.get_meeting(self.meeting_id).manual_notes
-            content = format_meeting_for_push(
-                project_name=self.project.name,
-                title=self.title,
-                transcript_text=transcript_text,
-                manual_notes=manual_notes,
+            meeting = self._db.get_meeting(self.meeting_id)
+            # Manual notes and the OCR'd attendee list aren't uploaded files, but they're handed off the
+            # same reference-doc-style way as one — same naming, same manifest shape — rather than being
+            # folded into either transcript, since neither is really "audio" or "on-screen text".
+            text_reference_documents = []
+            if meeting.manual_notes and meeting.manual_notes.strip():
+                text_reference_documents.append(
+                    TextReferenceDocument(original_filename="meeting-notes.txt", content=meeting.manual_notes)
+                )
+            if meeting.attendees and meeting.attendees.strip():
+                text_reference_documents.append(
+                    TextReferenceDocument(original_filename="attendees.txt", content=meeting.attendees)
+                )
+            reference_documents = [
+                ReferenceDocument(original_filename=row["filename"], source_path=Path(row["source_path"]))
+                for row in self._db.list_documents_for_meeting(self.meeting_id)
+                if row["source_path"]
+            ]
+            push_meeting_package(
+                meeting_code=self.meeting_code,
+                audio_transcript_text=render_transcript(audio_lines),
+                screen_transcript_text=render_transcript(screen_lines),
+                reference_documents=reference_documents,
+                text_reference_documents=text_reference_documents,
+                inbox_dir=self._settings.copilot_inbox_dir,
             )
-            push_meeting(content, inbox_dir=self._settings.copilot_inbox_dir)
             report("Pushed to Copilot Studio.")
         else:
             report("Copilot sync folder not configured — nothing pushed.")

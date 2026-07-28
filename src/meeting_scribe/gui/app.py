@@ -22,10 +22,11 @@ from meeting_scribe.config import (
     update_audio_devices,
     update_copilot_settings,
 )
+from meeting_scribe.screen.capture import ocr_region
 from meeting_scribe.screen.region_picker import RegionOutline, RegionTarget, pick_region_interactively
 from meeting_scribe.session import MeetingSession
 from meeting_scribe.storage.database import Database
-from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text
+from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
 from meeting_scribe.transcription.engine import TranscriptLine, render_transcript
 
 # Shown in a device dropdown in place of a device name, meaning "follow whatever Windows currently
@@ -148,15 +149,20 @@ class RecordTab(ttk.Frame):
         self.project_var = tk.StringVar()
         self.project_combo = ttk.Combobox(form, textvariable=self.project_var, width=40)
         self.project_combo.grid(row=0, column=1, sticky="we", padx=6, pady=4)
+        self.project_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_title_suggestions())
+        self.project_combo.bind("<FocusOut>", lambda _e: self._refresh_title_suggestions())
         ttk.Button(form, text="Add Project", command=self.app.prompt_new_project).grid(
             row=0, column=2, padx=(6, 0)
         )
 
         ttk.Label(form, text="Meeting title").grid(row=1, column=0, sticky="w")
         self.title_var = tk.StringVar(value="Untitled meeting")
-        ttk.Entry(form, textvariable=self.title_var, width=42).grid(
-            row=1, column=1, sticky="we", padx=6, pady=4
-        )
+        # Editable (not state="readonly"), so it still doubles as a free-typed title field — the
+        # dropdown values are just suggestions of titles already used in this project, for quick repeat
+        # meetings ("Weekly Client Meeting") rather than retyping the same title every time.
+        self.title_combo = ttk.Combobox(form, textvariable=self.title_var, width=40)
+        self.title_combo.grid(row=1, column=1, sticky="we", padx=6, pady=4)
+        self.title_var.trace_add("write", self._on_title_changed)
 
         ttk.Label(form, text="Screen source").grid(row=2, column=0, sticky="w")
         self.source_var = tk.StringVar(value=self.ENTIRE_SCREEN_LABEL)
@@ -202,6 +208,10 @@ class RecordTab(ttk.Frame):
         ttk.Button(buttons, text="Upload Document…", command=self._upload_document).pack(
             side="left", padx=(0, 8)
         )
+        self.capture_attendees_button = ttk.Button(
+            buttons, text="Capture Attendees…", command=self._capture_attendees, state="disabled"
+        )
+        self.capture_attendees_button.pack(side="left")
 
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=12, pady=(8, 0))
@@ -270,6 +280,28 @@ class RecordTab(ttk.Frame):
     def refresh_projects(self) -> None:
         names = [p.name for p in self.app.db.list_projects()]
         self.project_combo["values"] = names
+
+    def _refresh_title_suggestions(self) -> None:
+        """Repopulates the meeting-title dropdown with titles already used in the currently-entered
+        project, most-recently-used first, so a recurring meeting ("Weekly Client Meeting") can be
+        picked instead of retyped. Doesn't touch the current title itself, editable field, that value
+        stays whatever the user typed or last selected."""
+        project = self.app.db.get_project_by_name(self.project_var.get().strip())
+        self.title_combo["values"] = (
+            self.app.db.list_recent_meeting_titles(project.id) if project is not None else []
+        )
+
+    def _on_title_changed(self, *_args) -> None:
+        """Keeps the meeting title editable for the whole life of a meeting, not just fixed at Start —
+        persists to the DB (and the in-memory session used for the eventual Copilot push) on every
+        change. Titles are short and edited infrequently compared to the manual notes box, so this
+        skips the debouncing used there and just saves directly."""
+        session = self.app._session
+        if session is None:
+            return
+        new_title = self.title_var.get()
+        session.title = new_title
+        self.app.db.update_meeting_title(session.meeting_id, new_title)
 
     def _poll_audio_levels(self) -> None:
         """Runs continuously (not just while recording) so the meters are always current — cheap enough
@@ -412,6 +444,7 @@ class RecordTab(ttk.Frame):
         self.status_var.set(f"Recording — {project_name} / {meeting_title}")
         self.start_button["state"] = "disabled"
         self.stop_button["state"] = "normal"
+        self.capture_attendees_button["state"] = "normal"
 
         self.manual_notes_editor["state"] = "normal"
         self.manual_notes_editor.delete("1.0", "end")
@@ -486,6 +519,7 @@ class RecordTab(ttk.Frame):
         self.app._session = None
 
         self.stop_button["state"] = "disabled"
+        self.capture_attendees_button["state"] = "disabled"
         self.manual_notes_editor["state"] = "disabled"
         self.start_button["state"] = "normal"
         self.status_var.set(f'Idle — finishing "{session.title}" in the background.')
@@ -548,11 +582,17 @@ class RecordTab(ttk.Frame):
         except UnsupportedDocumentError as exc:
             messagebox.showerror("Meeting Scribe", str(exc))
             return
+        # Keeps a copy of the original bytes (under a synthetic name — see save_original_copy) so the
+        # real file, not just its extracted text, is still around later for the Copilot push package,
+        # which hands reference documents off under their real filename.
+        source_path = save_original_copy(path, self.app.settings.documents_dir)
 
         project = self.app.db.get_or_create_project(project_name)
         session = self.app._session
         meeting_id = session.meeting_id if session is not None else None
-        self.app.db.add_document(project.id, path.name, text, meeting_id=meeting_id)
+        self.app.db.add_document(
+            project.id, path.name, text, meeting_id=meeting_id, source_path=str(source_path)
+        )
         self.app.refresh_project_lists()
 
         if meeting_id is not None:
@@ -560,6 +600,32 @@ class RecordTab(ttk.Frame):
             messagebox.showinfo("Meeting Scribe", f'Added {path.name} to this meeting.')
         else:
             messagebox.showinfo("Meeting Scribe", f'Added {path.name} to project "{project.name}".')
+
+    def _capture_attendees(self) -> None:
+        """Lets the user drag out a rectangle over an attendee/participants panel and OCRs it
+        immediately (not on a delay, and not part of the continuous screen watcher), appending the
+        result to this meeting's attendee list. Only available while a meeting is actively recording,
+        same as the Stop button, since there's no meeting to attach attendees to otherwise."""
+        session = self.app._session
+        if session is None:
+            messagebox.showerror("Meeting Scribe", "Start a meeting first.")
+            return
+        region = pick_region_interactively(self)
+        if region is None:
+            return
+        try:
+            text = ocr_region(region.mss_region, tesseract_cmd=self.app.settings.tesseract_cmd)
+        except Exception as exc:  # surfaced to the user regardless of cause
+            messagebox.showerror("Meeting Scribe", f"Couldn't read that area: {exc}")
+            return
+        if not text.strip():
+            messagebox.showinfo("Meeting Scribe", "No text found in that area.")
+            return
+
+        existing = self.app.db.get_meeting(session.meeting_id).attendees or ""
+        combined = (existing + "\n" + text).strip() if existing else text.strip()
+        self.app.db.set_attendees(session.meeting_id, combined)
+        self._log(f'[{session.title}] Attendees captured ({len(text.strip().splitlines())} line(s)).')
 
 
 class ProjectsTab(ttk.Frame):
@@ -575,6 +641,13 @@ class ProjectsTab(ttk.Frame):
         ttk.Label(projects_header, text="Projects").pack(side="left")
         ttk.Button(projects_header, text="Add Project", command=self.app.prompt_new_project).pack(
             side="right"
+        )
+
+        # Uploading here (rather than only from the Record tab) is for documents that turn up after a
+        # meeting is already over — a follow-up email, a shared recording transcript from elsewhere — so
+        # it attaches to whichever meeting is currently selected, or to the project as a whole if none is.
+        ttk.Button(left, text="Upload Document…", command=self._upload_document).pack(
+            fill="x", pady=(8, 0)
         )
 
         project_list_frame = ttk.Frame(left)
@@ -612,6 +685,7 @@ class ProjectsTab(ttk.Frame):
         self.ocr_text = _add_scrollable_text_tab(self.detail_notebook, "OCR Transcript")
         self.audio_text = _add_scrollable_text_tab(self.detail_notebook, "Audio Transcript")
         self.manual_notes_text = _add_scrollable_text_tab(self.detail_notebook, "Manual notes")
+        self.attendees_text = _add_scrollable_text_tab(self.detail_notebook, "Attendees")
         self._build_documents_tab()
 
         self._projects: list = []
@@ -673,6 +747,42 @@ class ProjectsTab(ttk.Frame):
                 self._on_project_selected(None)
                 return
 
+    def _upload_document(self) -> None:
+        """Attaches a document after the fact: to whichever meeting is currently selected in the list,
+        or to the project itself if none is selected. This is the post-meeting counterpart to the
+        Record tab's own upload button, which only ever attaches to the meeting in progress right now."""
+        project = self._selected_project()
+        if project is None:
+            messagebox.showerror("Meeting Scribe", "Select a project first.")
+            return
+        path_str = filedialog.askopenfilename(
+            title="Attach a document",
+            filetypes=[
+                ("Supported documents", "*.pdf *.docx *.txt *.md *.png *.jpg *.jpeg *.bmp *.tiff"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            text = extract_text(path, tesseract_cmd=self.app.settings.tesseract_cmd)
+        except UnsupportedDocumentError as exc:
+            messagebox.showerror("Meeting Scribe", str(exc))
+            return
+        source_path = save_original_copy(path, self.app.settings.documents_dir)
+
+        meeting = self._selected_meeting()
+        meeting_id = meeting.id if meeting is not None else None
+        self.app.db.add_document(
+            project.id, path.name, text, meeting_id=meeting_id, source_path=str(source_path)
+        )
+        if meeting_id is not None:
+            self._load_meeting_documents(meeting_id)
+
+        target = f'meeting "{meeting.title}"' if meeting is not None else f'project "{project.name}"'
+        messagebox.showinfo("Meeting Scribe", f"Added {path.name} to {target}.")
+
     def _on_project_selected(self, _event) -> None:
         project = self._selected_project()
         self.meeting_list.delete(0, "end")
@@ -686,7 +796,7 @@ class ProjectsTab(ttk.Frame):
             self.meeting_list.insert("end", f"{meeting.title} — {timestamp}")
 
     def _clear_meeting_details(self) -> None:
-        for widget in (self.ocr_text, self.audio_text, self.manual_notes_text):
+        for widget in (self.ocr_text, self.audio_text, self.manual_notes_text, self.attendees_text):
             _set_text(widget, "")
         self._meeting_documents = []
         self.meeting_documents_list.delete(0, "end")
@@ -705,6 +815,7 @@ class ProjectsTab(ttk.Frame):
         _set_text(self.ocr_text, render_transcript(ocr_lines) or "(no on-screen text captured)")
         _set_text(self.audio_text, render_transcript(audio_lines) or "(no speech captured)")
         _set_text(self.manual_notes_text, meeting.manual_notes or "(no manual notes for this meeting)")
+        _set_text(self.attendees_text, meeting.attendees or "(no attendees captured)")
 
         self._load_meeting_documents(meeting.id)
 

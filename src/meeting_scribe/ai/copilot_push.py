@@ -1,42 +1,123 @@
-"""One-way handoff of a finished meeting to Copilot Studio: write the merged transcript (and any manual
-notes) to a file in an "Inbox" folder that OneDrive/SharePoint is already syncing, and stop there.
+"""One-way handoff of a finished meeting to Copilot Studio: drop its file package into an "Inbox"
+folder that OneDrive/SharePoint is already syncing, and stop there.
 
 There's nothing to wait for and nothing to parse back out — Copilot Studio (or whatever processes that
 folder on the other end) owns managing and parsing the information from that point on. This app's job is
 to record and push, not to consume a synthesized result; the searchable local record of what was recorded
 (projects, meetings, transcripts, manual notes) lives on regardless of what happens to the pushed copy.
+
+The package follows a fixed file-naming contract the downstream automation depends on: every file for one
+meeting is prefixed with that meeting's `meetingID` (see storage.database's meeting_code, format
+"YYYYMMDD-HHMM", e.g. "20260728-1030"), and a `{meetingID}_done.json` manifest is written last, once
+every other file has been fully saved — that manifest's arrival, and only its arrival, is what the
+downstream workflow triggers on, so nothing else in the folder should look like a completed package to it.
 """
 
 from __future__ import annotations
 
-import uuid
+import json
+import shutil
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
-
-def format_meeting_for_push(
-    *, project_name: str, title: str, transcript_text: str, manual_notes: str | None
-) -> str:
-    """Plain-text payload for one meeting: enough context (project, title) to be useful on its own once
-    it lands wherever Copilot Studio's flow puts it, without requiring the reader to parse anything
-    structured."""
-    sections = [
-        f"Project: {project_name}",
-        f"Meeting: {title}",
-        "",
-        "--- TRANSCRIPT ---",
-        "",
-        transcript_text or "(no transcript captured)",
-    ]
-    if manual_notes:
-        sections += ["", "--- MANUAL NOTES ---", "", manual_notes]
-    return "\n".join(sections)
+AUDIO_TRANSCRIPT_SUFFIX = "_transcript-audio.txt"
+SCREEN_TRANSCRIPT_SUFFIX = "_transcript-screen.txt"
+DONE_MANIFEST_SUFFIX = "_done.json"
 
 
-def push_meeting(content: str, *, inbox_dir: Path) -> Path:
-    """Writes `content` to a uniquely-named file in `inbox_dir` (created if it doesn't exist yet) and
-    returns its path. Fire-and-forget: there's no response to wait for, so this returns as soon as the
-    file is written."""
+@dataclass(frozen=True)
+class ReferenceDocument:
+    original_filename: str
+    source_path: Path
+
+
+@dataclass(frozen=True)
+class TextReferenceDocument:
+    """A reference-doc-style entry backed by text already in the database rather than an uploaded file
+    on disk — the manual notes typed during the meeting, or the attendee list captured via OCR. Handed
+    off the same way a real reference document is (same naming, same manifest shape), just written
+    directly from `content` instead of copied from a `source_path`."""
+
+    original_filename: str
+    content: str
+
+
+def _dedupe_filename(candidate: str, used_names: set[str]) -> str:
+    """If `candidate` is already taken (two reference documents in this meeting shared an original
+    filename), appends "-2", "-3", etc. before the extension until it finds one that isn't. The
+    manifest's reference_docs entries already carry both `original_filename` and `saved_filename`, so a
+    rename is visible there without needing a separate flag."""
+    if candidate not in used_names:
+        return candidate
+    stem, suffix = Path(candidate).stem, Path(candidate).suffix
+    n = 2
+    while f"{stem}-{n}{suffix}" in used_names:
+        n += 1
+    return f"{stem}-{n}{suffix}"
+
+
+def push_meeting_package(
+    *,
+    meeting_code: str,
+    audio_transcript_text: str,
+    screen_transcript_text: str,
+    reference_documents: list[ReferenceDocument],
+    text_reference_documents: list[TextReferenceDocument] = (),
+    inbox_dir: Path,
+) -> Path:
+    """Writes one meeting's full file package to `inbox_dir` (created if it doesn't exist yet) and
+    returns the manifest's path. Reference documents whose original file is no longer reachable on disk
+    are skipped rather than failing the whole push — the transcripts and manifest still matter even if
+    one attachment went missing. The manifest is written last, and only after everything else succeeded,
+    so its appearance reliably means the whole package is ready to fetch.
+
+    `text_reference_documents` (manual notes, the OCR'd attendee list) share one filename namespace with
+    `reference_documents` — a real uploaded file happening to be named the same as one of these gets
+    deduped against it the same way two uploaded files would be."""
     inbox_dir.mkdir(parents=True, exist_ok=True)
-    path = inbox_dir / f"{uuid.uuid4().hex}__meeting.txt"
-    path.write_text(content, encoding="utf-8")
-    return path
+
+    audio_filename = f"{meeting_code}{AUDIO_TRANSCRIPT_SUFFIX}"
+    screen_filename = f"{meeting_code}{SCREEN_TRANSCRIPT_SUFFIX}"
+    (inbox_dir / audio_filename).write_text(
+        audio_transcript_text or "(no audio transcript captured)", encoding="utf-8"
+    )
+    (inbox_dir / screen_filename).write_text(
+        screen_transcript_text or "(no on-screen text captured)", encoding="utf-8"
+    )
+
+    used_names: set[str] = set()
+    manifest_docs = []
+    for text_document in text_reference_documents:
+        candidate = f"{meeting_code}_{text_document.original_filename}"
+        saved_filename = _dedupe_filename(candidate, used_names)
+        used_names.add(saved_filename)
+        (inbox_dir / saved_filename).write_text(text_document.content, encoding="utf-8")
+        manifest_docs.append(
+            {"original_filename": text_document.original_filename, "saved_filename": saved_filename}
+        )
+
+    for document in reference_documents:
+        if not document.source_path.exists():
+            continue  # original file no longer available locally; skip rather than fail the push
+        candidate = f"{meeting_code}_{document.original_filename}"
+        saved_filename = _dedupe_filename(candidate, used_names)
+        used_names.add(saved_filename)
+        shutil.copyfile(document.source_path, inbox_dir / saved_filename)
+        manifest_docs.append(
+            {"original_filename": document.original_filename, "saved_filename": saved_filename}
+        )
+
+    manifest = {
+        "meetingID": meeting_code,
+        "files": {
+            "transcript_audio": audio_filename,
+            "transcript_screen": screen_filename,
+            "reference_docs": manifest_docs,
+        },
+        "reference_count": len(manifest_docs),
+        "timestamp_completed": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    manifest_path = inbox_dir / f"{meeting_code}{DONE_MANIFEST_SUFFIX}"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest_path

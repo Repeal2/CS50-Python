@@ -72,6 +72,14 @@ class Settings:
         return self.data_dir / "projects"
 
     @property
+    def documents_dir(self) -> Path:
+        """Where uploaded documents' original bytes are kept (under a synthetic, collision-free name —
+        see storage.documents.save_original_copy), separate from the DB's extracted-text copy, so the
+        original file is still available later for the Copilot push package (which hands off the
+        original file under its own real filename, not the extracted text)."""
+        return self.data_dir / "documents"
+
+    @property
     def copilot_inbox_dir(self) -> Path:
         return self.copilot_sync_dir / "Inbox"
 
