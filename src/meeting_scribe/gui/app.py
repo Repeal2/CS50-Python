@@ -300,7 +300,10 @@ class RecordTab(ttk.Frame):
             self._region_outline = RegionOutline(self, self._region_target)
 
     def close_region_outline(self) -> None:
-        """Called on app shutdown so the boundary windows don't outlive the main window."""
+        """Called when a meeting stops (nothing is being captured anymore, so the boundary shouldn't
+        linger on screen) and on app shutdown (so the boundary windows don't outlive the main window).
+        _start() calls _sync_region_outline() again, which re-shows it if the same area is still
+        selected for the next meeting."""
         if self._region_outline is not None:
             self._region_outline.close()
             self._region_outline = None
@@ -388,6 +391,7 @@ class RecordTab(ttk.Frame):
         self.output.delete("1.0", "end")
         self.output["state"] = "disabled"
         self._log(f"Recording started — Project: {project_name} / Meeting: {meeting_title}")
+        self._sync_region_outline()
 
     def _add_manual_note(self, _event=None) -> None:
         text = self.manual_note_var.get().strip()
@@ -411,6 +415,10 @@ class RecordTab(ttk.Frame):
             "Transcribing, then waiting on Copilot Studio for notes… this can take a few minutes."
         )
         self._log("Stop requested by user.")
+        # The custom-area boundary is a "this is what's being captured" indicator — leaving it on screen
+        # after recording stops is just a stray colored box with nothing behind it. _start() re-shows it
+        # if the same area is still selected next time.
+        self.close_region_outline()
 
         def worker() -> None:
             try:
