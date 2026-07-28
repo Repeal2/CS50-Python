@@ -1,4 +1,4 @@
-from meeting_scribe.screen.capture import ScreenWatcher
+from meeting_scribe.screen.capture import ScreenWatcher, _looks_like_ui_noise, _new_lines
 from meeting_scribe.screen.region_picker import RegionTarget
 
 
@@ -99,3 +99,58 @@ def test_resolve_region_returns_the_whole_virtual_screen_with_no_target():
     watcher = ScreenWatcher(on_text=lambda e: None, target=None)
 
     assert watcher._resolve_region(FakeSctWithMonitors()) == "whole-virtual-screen"
+
+
+def test_ui_noise_rejects_short_avatar_initials_and_icon_rows():
+    assert _looks_like_ui_noise("MB")
+    assert _looks_like_ui_noise("lO")
+    assert _looks_like_ui_noise("@ B x")
+
+
+def test_ui_noise_accepts_short_but_real_chat_lines():
+    assert not _looks_like_ui_noise("On T3.")
+    assert not _looks_like_ui_noise("Testing.")
+    assert not _looks_like_ui_noise("Brookes, Martin")
+
+
+def test_new_lines_returns_only_lines_not_already_seen():
+    already_seen = {"Brookes, Martin", "Testing."}
+    text = "Brookes, Martin\nTesting.\nOn T3."
+
+    assert _new_lines(text, already_seen) == ["On T3."]
+
+
+def test_new_lines_filters_blank_and_noise_lines():
+    text = "MB\n\nBrookes, Martin\n@ B x\nTesting."
+
+    assert _new_lines(text, set()) == ["Brookes, Martin", "Testing."]
+
+
+def test_new_lines_dedups_a_line_repeated_within_the_same_capture():
+    text = "Brookes, Martin\nTesting.\nBrookes, Martin"
+
+    assert _new_lines(text, set()) == ["Brookes, Martin", "Testing."]
+
+
+def test_capture_once_only_emits_newly_scrolled_in_lines():
+    """Reproduces the real-world bug: a scrolling chat pane re-shows most of its previous content on
+    every capture, so each screenshot's OCR text mostly overlaps the last one plus one new line."""
+    events = []
+    watcher = ScreenWatcher(on_text=events.append, interval_seconds=0.01)
+    watcher._started_at = 0.0
+
+    sct = FakeSct([b"frame-a", b"frame-b", b"frame-c"])
+    tess = FakePytesseract(
+        [
+            "MB\nBrookes, Martin\nTesting.",
+            "MB\nMB\nBrookes, Martin\nTesting.\nBrookes, Martin\nOn T3.",
+            "MB\nMB\nMB\nBrookes, Martin\nTesting.\nBrookes, Martin\nOn T3.\n@ B x\nBrookes, Martin\n"
+            "OK, now we are testing.",
+        ]
+    )
+
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
+
+    assert [e.text for e in events] == ["Brookes, Martin\nTesting.", "On T3.", "OK, now we are testing."]
