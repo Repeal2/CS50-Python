@@ -321,3 +321,53 @@ def test_session_stop_works_without_an_on_progress_callback(tmp_path):
             result = session.stop()  # no on_progress passed at all
 
             assert "hello" in result
+
+
+def test_session_exposes_its_title(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder"),
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Daily Standup")
+            assert session.title == "Daily Standup"
+
+
+def test_two_sessions_can_be_active_at_once_without_interfering(tmp_path):
+    # Regression test for back-to-back meetings: starting a new MeetingSession while a previous one's
+    # stop() is still running (transcribing, waiting on Copilot Studio) must not share any mutable state
+    # between them — each has its own recorder/screen watcher/transcriber and meeting row.
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            first = MeetingSession(_settings(tmp_path), db, "Test Project", "Meeting One")
+            first.start()
+
+            # "Stop" the first meeting (still finishing up, per the GUI's model) and immediately start a
+            # second one before the first's stop() has been awaited.
+            second = MeetingSession(_settings(tmp_path), db, "Test Project", "Meeting Two")
+            second.start()
+
+            assert first.meeting_id != second.meeting_id
+            assert first.title != second.title
+
+            first_result = first.stop()
+            second_result = second.stop()
+
+            assert "hello" in first_result
+            assert "hello" in second_result
+            assert db.get_meeting(first.meeting_id).transcript_text == first_result
+            assert db.get_meeting(second.meeting_id).transcript_text == second_result

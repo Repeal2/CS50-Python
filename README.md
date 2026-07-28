@@ -18,7 +18,10 @@ screen, and turns the meeting into a searchable record.
   drag out yourself (e.g. just a captions bar) — the app draws a live boundary around whichever custom
   area is active so it's always visible on screen what's being captured.
 - **Transcribes** the recorded audio locally (no audio ever leaves the machine) and merges it with the
-  OCR stream into one time-ordered transcript.
+  OCR stream into one time-ordered transcript. This — plus the Copilot Studio round trip below — happens
+  in the background after you hit Stop, so it doesn't block starting the next meeting right away; the
+  activity log tags each background job's lines with that meeting's title so back-to-back meetings
+  finishing up at the same time stay distinguishable.
 - **Generates notes** via a Microsoft Copilot Studio / Power Automate flow (see "The Copilot Studio
   bridge" below) — there's no direct call to an external AI API, since that isn't an option under some
   organizations' governance policy. A system prompt you can edit in the Settings tab (prepopulated with

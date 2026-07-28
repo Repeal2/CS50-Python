@@ -1,6 +1,12 @@
 """Orchestrates one meeting end to end: start recording (mic + system audio + screen), and on stop,
 transcribe, merge into one transcript, generate notes via the Copilot Studio bridge, and file everything
 under the meeting's project so it's searchable later.
+
+Each MeetingSession is self-contained (its own Recorder, ScreenWatcher, WhisperTranscriber, and meeting
+directory) with no shared mutable state between instances, so one session's stop() — the slow part,
+given transcription and the Copilot Studio round trip — can safely keep running on a background thread
+while a new MeetingSession starts and records the next meeting. The GUI relies on this for back-to-back
+meetings: starting the next one doesn't wait for the previous one to finish transcribing/saving.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ class MeetingSession:
         self._db = db
         self.project = db.get_or_create_project(project_name)
         self.meeting_id = db.create_meeting(self.project.id, title)
+        self.title = title
 
         meeting_dir = settings.meeting_dir(self.project.slug, self.meeting_id)
         meeting_dir.mkdir(parents=True, exist_ok=True)

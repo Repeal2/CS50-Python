@@ -387,10 +387,10 @@ class RecordTab(ttk.Frame):
         self.manual_note_entry["state"] = "normal"
         self.add_note_button["state"] = "normal"
 
-        self.output["state"] = "normal"
-        self.output.delete("1.0", "end")
-        self.output["state"] = "disabled"
-        self._log(f"Recording started — Project: {project_name} / Meeting: {meeting_title}")
+        # Deliberately not cleared here: a previous meeting's background finish-up job (see _stop())
+        # may still be logging its own progress, and wiping the log out from under it would lose that
+        # context. The [title] prefix on every line is what keeps overlapping meetings' entries readable.
+        self._log(f'[{meeting_title}] Recording started — Project: {project_name}.')
         self._sync_region_outline()
 
     def _add_manual_note(self, _event=None) -> None:
@@ -402,54 +402,67 @@ class RecordTab(ttk.Frame):
         self._manual_notes_lines.append(f"[{timestamp}] {text}")
         self.app.db.set_manual_notes(session.meeting_id, "\n".join(self._manual_notes_lines))
         self.manual_note_var.set("")
-        self._log(f"Note added: {text}")
+        self._log(f"[{session.title}] Note added: {text}")
 
     def _stop(self) -> None:
         session = self.app._session
         if session is None:
             return
+        # Detach right away rather than waiting for the background job below to finish — transcription
+        # plus the Copilot Studio round trip can take minutes, and there's no reason that should block
+        # starting the next meeting. Everything the background job needs (the session, its title) is
+        # already captured in this closure, so the app has no more use for the "current" session slot.
+        self.app._session = None
+
         self.stop_button["state"] = "disabled"
         self.manual_note_entry["state"] = "disabled"
         self.add_note_button["state"] = "disabled"
-        self.status_var.set(
-            "Transcribing, then waiting on Copilot Studio for notes… this can take a few minutes."
-        )
-        self._log("Stop requested by user.")
+        self.start_button["state"] = "normal"
+        self.status_var.set(f'Idle — finishing "{session.title}" in the background.')
+        self._log(f'[{session.title}] Stop requested — finishing in the background.')
         # The custom-area boundary is a "this is what's being captured" indicator — leaving it on screen
         # after recording stops is just a stray colored box with nothing behind it. _start() re-shows it
         # if the same area is still selected next time.
         self.close_region_outline()
 
         def worker() -> None:
+            def report(message: str) -> None:
+                self.after(0, self._log, f"[{session.title}] {message}")
+
             try:
-                session.stop(on_progress=lambda message: self.after(0, self._log, message))
+                session.stop(on_progress=report)
             except Exception as exc:  # surfaced to the user regardless of cause
-                self.after(0, self._on_stop_failed, exc)
+                self.after(0, self._on_stop_failed, session.title, exc)
                 return
-            self.after(0, self._on_stop_done, session.notes_timed_out)
+            self.after(0, self._on_stop_done, session.title, session.notes_timed_out)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_stop_done(self, notes_timed_out: bool) -> None:
+    def _on_stop_done(self, meeting_title: str, notes_timed_out: bool) -> None:
         if notes_timed_out:
-            self.status_var.set("Saved — but notes generation timed out; the plain transcript was saved.")
+            summary = "Saved — but notes generation timed out; the plain transcript was saved."
         else:
-            self.status_var.set("Saved.")
-        self.start_button["state"] = "normal"
-        self.app._session = None
+            summary = "Saved."
+        self._log(f"[{meeting_title}] {summary}")
+        # Don't stomp on a newer status — a different meeting may already be recording by the time this
+        # background job finishes, and its "Recording — ..." status shouldn't be overwritten by a
+        # trailing "Saved." from an unrelated, earlier meeting.
+        if self.app._session is None:
+            self.status_var.set(summary)
         self.app.refresh_project_lists()
 
-    def _on_stop_failed(self, exc: Exception) -> None:
-        self.status_var.set("Failed.")
-        self.start_button["state"] = "normal"
-        self.app._session = None
-        self._log(f"Failed: {exc}")
-        messagebox.showerror("Meeting Scribe", f"Couldn't finish the meeting: {exc}")
+    def _on_stop_failed(self, meeting_title: str, exc: Exception) -> None:
+        self._log(f"[{meeting_title}] Failed: {exc}")
+        if self.app._session is None:
+            self.status_var.set("Failed.")
+        messagebox.showerror("Meeting Scribe", f'Couldn\'t finish "{meeting_title}": {exc}')
 
     def _upload_document(self) -> None:
-        """Attaches a document to the current project — and, if a meeting is actively recording (or
-        still finishing up), to that specific meeting — without needing to switch to the Projects &
-        Search tab and pick things from a list."""
+        """Attaches a document to the current project — and, if a meeting is actively recording right
+        now, to that specific meeting — without needing to switch to the Projects & Search tab and pick
+        things from a list. Once a meeting is stopped it's no longer "current" even while it's still
+        finishing up in the background (see _stop()), so a document uploaded in that window attaches at
+        the project level rather than to the just-ended meeting."""
         project_name = self.project_var.get().strip()
         if not project_name:
             messagebox.showerror("Meeting Scribe", "Enter a project name first.")
@@ -477,7 +490,7 @@ class RecordTab(ttk.Frame):
         self.app.refresh_project_lists()
 
         if meeting_id is not None:
-            self._log(f"Document attached: {path.name}")
+            self._log(f"[{session.title}] Document attached: {path.name}")
             messagebox.showinfo("Meeting Scribe", f'Added {path.name} to this meeting.')
         else:
             messagebox.showinfo("Meeting Scribe", f'Added {path.name} to project "{project.name}".')
