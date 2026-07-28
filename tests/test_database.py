@@ -61,29 +61,6 @@ def test_create_project_and_meeting(tmp_path):
         assert meeting.ended_at is not None
 
 
-def test_search_finds_segments_documents_and_notes(tmp_path):
-    with Database(tmp_path / "test.db") as db:
-        project = db.create_project("Search Test")
-        meeting_id = db.create_meeting(project.id, "Budget review")
-        db.add_transcript_segment(meeting_id, "mic", 0.0, "We need to finalize the budget by Friday.")
-        db.finish_meeting(
-            meeting_id,
-            transcript_text="We need to finalize the budget by Friday.",
-            notes_markdown="Action item: finalize budget by Friday.",
-        )
-        db.add_document(project.id, "invite.png", "Budget Review Meeting - Friday 3pm")
-
-        hits = db.search_project(project.id, "budget Friday")
-        kinds = {hit.kind for hit in hits}
-        assert kinds == {"segment", "document", "meeting"}
-
-
-def test_search_empty_query_returns_nothing(tmp_path):
-    with Database(tmp_path / "test.db") as db:
-        project = db.create_project("Empty")
-        assert db.search_project(project.id, "!!!") == []
-
-
 def test_project_isolation(tmp_path):
     with Database(tmp_path / "test.db") as db:
         p1 = db.create_project("Project One")
@@ -92,8 +69,12 @@ def test_project_isolation(tmp_path):
         db.add_transcript_segment(m1, "mic", 0.0, "unique keyword zzyzx here")
         db.finish_meeting(m1, transcript_text="unique keyword zzyzx here")
 
-        assert len(db.search_project(p1.id, "zzyzx")) == 1
-        assert len(db.search_project(p2.id, "zzyzx")) == 0
+        db.add_document(p1.id, "p1-doc.txt", "belongs to project one")
+
+        assert [m.id for m in db.list_meetings(p1.id)] == [m1]
+        assert db.list_meetings(p2.id) == []
+        assert len(db.list_documents(p1.id)) == 1
+        assert db.list_documents(p2.id) == []
 
 
 def test_set_manual_notes_persists_and_can_be_overwritten(tmp_path):

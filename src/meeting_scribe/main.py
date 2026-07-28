@@ -5,7 +5,6 @@ desktop session.
 from __future__ import annotations
 
 import argparse
-import sys
 
 from meeting_scribe.config import load_settings
 from meeting_scribe.storage.database import Database
@@ -16,12 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("gui", help="Launch the desktop control panel (default)")
-
-    list_projects_parser = subparsers.add_parser("list-projects", help="List saved projects")
-
-    ask_parser = subparsers.add_parser("ask", help="Ask a question about a project")
-    ask_parser.add_argument("project", help="Project name")
-    ask_parser.add_argument("question", help="Question to ask")
+    subparsers.add_parser("list-projects", help="List saved projects")
 
     args = parser.parse_args(argv)
     command = args.command or "gui"
@@ -39,30 +33,6 @@ def main(argv: list[str] | None = None) -> int:
         if command == "list-projects":
             for project in db.list_projects():
                 print(project.name)
-            return 0
-
-        if command == "ask":
-            from meeting_scribe.ai.search import ask as ask_project
-
-            if settings.copilot_sync_dir is None:
-                print(
-                    "Set MEETING_SCRIBE_COPILOT_SYNC_DIR (or configure it in the Settings tab) to ask "
-                    "questions.",
-                    file=sys.stderr,
-                )
-                return 1
-            project = db.get_project_by_name(args.project)
-            if project is None:
-                print(f"No such project: {args.project}", file=sys.stderr)
-                return 1
-            answer = ask_project(
-                db, project.id, args.question,
-                inbox_dir=settings.copilot_inbox_dir,
-                outbox_dir=settings.copilot_outbox_dir,
-                poll_interval_seconds=settings.copilot_poll_interval_seconds,
-                timeout_seconds=settings.copilot_timeout_seconds,
-            )
-            print(answer)
             return 0
 
     parser.print_help()

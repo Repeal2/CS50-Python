@@ -1,7 +1,9 @@
 # Meeting Scribe
 
 A standalone Windows application that sits in the background during a meeting, listens, watches the
-screen, and turns the meeting into a searchable record.
+screen, and turns the meeting into a local record — then hands a copy off to Copilot Studio to manage
+and parse from there. This app doesn't call an AI API and doesn't wait for one to answer; it records,
+saves everything locally, and pushes.
 
 ## What it does
 
@@ -18,25 +20,27 @@ screen, and turns the meeting into a searchable record.
   drag out yourself (e.g. just a captions bar) — the app draws a live boundary around whichever custom
   area is active so it's always visible on screen what's being captured.
 - **Transcribes** the recorded audio locally (no audio ever leaves the machine) and merges it with the
-  OCR stream into one time-ordered transcript. This — plus the Copilot Studio round trip below — happens
-  in the background after you hit Stop, so it doesn't block starting the next meeting right away; the
+  OCR stream into one time-ordered transcript. This — plus the push to Copilot Studio below — happens in
+  the background after you hit Stop, so it doesn't block starting the next meeting right away; the
   activity log tags each background job's lines with that meeting's title so back-to-back meetings
   finishing up at the same time stay distinguishable.
-- **Generates notes** via a Microsoft Copilot Studio / Power Automate flow (see "The Copilot Studio
-  bridge" below) — there's no direct call to an external AI API, since that isn't an option under some
-  organizations' governance policy. A system prompt you can edit in the Settings tab (prepopulated with
-  a recommended default) is bundled into what gets sent to the flow. Action items are intentionally not
-  parsed back out and shown in the app — whatever consumes the flow's output downstream handles that.
+- **Pushes the finished meeting to Copilot Studio** — the transcript plus any manual notes, dropped as a
+  plain-text file into a folder OneDrive/SharePoint is already syncing (see "The Copilot push" below).
+  This is one-way and fire-and-forget: the app doesn't call an AI API directly (governance doesn't allow
+  that for this org) and doesn't wait for or ingest anything back. Whatever picks that file up from
+  there — a Power Automate flow, Copilot Studio, or however it's wired up — owns managing, summarizing,
+  and parsing the information; this app's job stops at the handoff.
 - **Keeps a running activity log** on the Record tab while a meeting is in progress (and while it's
-  finishing up) — timestamped lines for the meeting starting, stopping, transcription finishing, and each
-  stage of waiting on Copilot Studio — so it's obvious something is happening during what can now be a
-  multi-minute wait, without dumping the live transcript/OCR text into view.
+  finishing up) — timestamped lines for the meeting starting, stopping, transcription finishing, and the
+  push to Copilot Studio — so it's obvious something is happening, without dumping the live
+  transcript/OCR text into view.
 - **Takes manual notes** typed directly on the Record tab during a meeting, timestamped and saved
   incrementally per meeting (so nothing is lost if the app closes mid-meeting) — shown afterward on the
-  Projects & Search tab's "Manual notes" tab, alongside the OCR and audio transcripts.
-- **Files the meeting under a project.** Every meeting, plus any documents you attach to it (meeting
-  invites, agendas, screenshots), is indexed so you can later ask "what did we decide about X" and get an
-  answer synthesized (also via the Copilot Studio bridge) from everything on file for that project.
+  Projects & Search tab's "Manual notes" tab, alongside the OCR and audio transcripts, and included in
+  what gets pushed to Copilot Studio.
+- **Files the meeting under a project**, kept as a permanent local record — every meeting (transcript,
+  manual notes) and any documents attached to it (invites, agendas, screenshots) stays browsable in this
+  app under its project regardless of what happens to the copy pushed to Copilot Studio.
 - **Accepts context documents** — PDFs, Word docs, images, plain text — attached from the Record tab
   (to the project, or to whichever meeting is currently in progress) at any time, not just during a
   meeting (e.g. a screenshot of the calendar invite, a spec doc).
@@ -49,7 +53,7 @@ screen, and turns the meeting into a searchable record.
 | Screen OCR | [pytesseract](https://github.com/madmaze/pytesseract) (wraps Tesseract) | Lightweight, no GPU, no ML runtime to bundle — important for a single-file Windows executable. Requires the Tesseract binary (see Packaging). |
 | System audio capture | [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) | A PyAudio fork with WASAPI loopback support, i.e. it can record "what the speakers are playing" on Windows without a virtual audio cable. |
 | Window selection for OCR | [pywin32](https://github.com/mhammond/pywin32) (`win32gui`) | Enumerates open windows and re-reads a selected window's bounding box every capture cycle (it may move/resize), so OCR can be scoped to one app instead of the whole desktop. |
-| Notes/actions generation, project search | Microsoft Copilot Studio / Power Automate, via a filesystem bridge (see below) | Governance doesn't allow calling a third-party AI API directly. Routing through a flow the org already owns keeps meeting data inside the Microsoft 365 tenant boundary. |
+| Handoff to Copilot Studio | One-way file drop (see below), no API call, no response | Governance doesn't allow calling a third-party AI API directly. This app's scope ends at recording and handing off; managing/parsing the information is Copilot Studio's job, not this app's. |
 | Packaging | PyInstaller, one-file build | Produces the standalone `.exe` the project requires. |
 | GUI | Tkinter | Ships with Python, keeps the PyInstaller build small and dependency-free. |
 
@@ -57,17 +61,15 @@ screen, and turns the meeting into a searchable record.
 
 ```
 src/meeting_scribe/
-  config.py          # data directory, Copilot bridge folder/timing, per-project paths
-  session.py          # orchestrates one meeting: start/stop recording, merge, notes, save
+  config.py          # data directory, Copilot push folder, per-project paths
+  session.py          # orchestrates one meeting: start/stop recording, merge, push, save
   audio/recorder.py   # mic + WASAPI loopback capture (Windows-only at runtime)
   audio/device_picker.py  # enumerates mic/speaker devices so one can be picked instead of the OS default
   screen/capture.py   # periodic screenshot + OCR, deduplicated, optionally scoped to one window or area
   screen/window_picker.py  # enumerates open windows so one can be picked as the OCR target
   screen/region_picker.py  # drag-to-select a custom OCR rectangle + its on-screen boundary outline
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
-  ai/copilot_bridge.py  # file-drop request/response round trip to the Power Automate/Copilot Studio flow
-  ai/notes.py          # builds the notes prompt and submits a finished transcript to the bridge
-  ai/search.py          # Ask-a-question-about-a-project flow (FTS5 retrieve + bridge synthesis)
+  ai/copilot_push.py    # one-way file drop of a finished meeting to Copilot Studio — no response handling
   storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents
   storage/documents.py  # Text extraction for uploaded PDFs/docx/images/text
   gui/app.py             # Tkinter control panel
@@ -81,17 +83,17 @@ tests/                    # Unit tests for the parts that don't need Windows har
 ## Data model
 
 - **Project** — a named bucket ("Acme Q3 Renewal", "Team Standups"). Everything below belongs to one.
-- **Meeting** — one recorded session: raw audio files, the merged transcript, generated notes, and the
-  manual notes typed on the Record tab while it was in progress.
+- **Meeting** — one recorded session: raw audio files, the merged transcript, and the manual notes typed
+  on the Record tab while it was in progress. This is the permanent local record, independent of the
+  copy pushed to Copilot Studio.
 - **Transcript segment** — a timestamped line from either `mic`, `system`, or `screen_ocr`, tied to a
   meeting.
 - **Document** — any uploaded file, optionally tied to a specific meeting (e.g. that meeting's invite) or
   just to the project in general (e.g. a spec doc).
 
-Transcript segments, documents, and generated notes are indexed in SQLite FTS5 so `ai/search.py` can pull
-the most relevant passages for a question before handing them to the Copilot Studio bridge for synthesis.
-Manual notes aren't currently part of that index — they're stored and displayed, but not searchable via
-Ask yet.
+Everything above is browsable in the app (Projects & Search tab: pick a project, pick a meeting, its
+transcripts/notes/documents are right there) — there's no in-app search/Ask feature, since querying and
+synthesizing across meetings is Copilot Studio's job once the data has been pushed to it, not this app's.
 
 ## Setup (development)
 
@@ -102,52 +104,34 @@ pip install -r requirements.txt
 python -m meeting_scribe.main       # launches the GUI by default (equivalent to `... main.py gui`)
 ```
 
-Point the app at your Copilot Studio bridge folder in the **Settings** tab (see below) — no environment
-variable needed, though `MEETING_SCRIBE_COPILOT_SYNC_DIR` also works for scripted/CLI use. Recording,
-transcription, and screen OCR all work with no folder configured — only note generation and "Ask" need
-one.
-
-The Settings tab also has the **notes system prompt** bundled into every request sent through the bridge
-when a meeting finishes. It ships prepopulated with a recommended default that explains what's being
-received (a merged, automated transcript from mic audio, system audio, and screen OCR — timestamped but
-imperfect) and how the output is used (saved as the meeting's permanent record, later retrieved to answer
-questions across a project), plus the section structure the app expects back. Edit it to change tone,
-sections, or detail level; "Reset to recommended default" restores the original text.
+Point the app at your Copilot push folder in the **Settings** tab (see below) — no environment variable
+needed, though `MEETING_SCRIBE_COPILOT_SYNC_DIR` also works for scripted/CLI use. Recording, transcription,
+and screen OCR all work with no folder configured; the meeting is just recorded and saved locally, not
+pushed anywhere.
 
 For development, install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) and make sure
 `tesseract.exe` is on `PATH` (or point `MEETING_SCRIBE_TESSERACT_PATH` at it). The packaged `.exe` (below)
 bundles its own copy, so end users running the built app don't need to install Tesseract at all.
 
-## The Copilot Studio bridge
+## The Copilot push
 
 There's no supported way for this app to call Copilot Studio directly over an outbound HTTP request —
 and even if there were, an unsigned desktop app making its own AI API calls is exactly what governance
-ruled out. Instead, `ai/copilot_bridge.py` hands each job to a Power Automate flow over the filesystem:
+ruled out. There's also nothing to wait for: this app's job is to record and hand off, not to consume a
+synthesized result. `ai/copilot_push.py` does the whole thing in two steps:
 
 1. **Settings tab → "Copilot sync folder"**: pick a folder that's inside a location OneDrive or SharePoint
-   is already syncing to this machine. The app creates `Inbox/` and `Outbox/` subfolders under it.
-2. When a meeting finishes (or you hit "Ask"), the app writes one text file to `Inbox/` named
-   `{job_id}__{kind}.request.txt` (`kind` is `notes` or `search`). Its content is a single block of text:
-   the notes system prompt (or the Ask system prompt) followed by `---TRANSCRIPT---` or
-   `---RETRIEVED PASSAGES--- ... ---QUESTION---` and the actual content. There's no JSON to parse —
-   everything the model needs is one block of plain text.
-3. OneDrive/SharePoint sync uploads that file to the cloud.
-4. **A Power Automate flow (built separately, in the Power Platform admin UI)** needs a "When a file is
-   created" trigger on the Inbox folder, a step that passes the file's content into a Copilot Studio
-   topic or an AI Builder "Create text with GPT" action, and a "Create file" step that writes the result
-   into the Outbox folder as `{job_id}__{kind}.response.txt` — same file name, `.request.txt` swapped for
-   `.response.txt`, which the trigger's dynamic content can build directly without parsing anything.
-5. The app polls the Outbox folder (every "poll interval" seconds, up to "timeout" seconds — both
-   editable in Settings) and reads the response file's content back as the answer/notes.
+   is already syncing to this machine. The app creates an `Inbox/` subfolder under it.
+2. When a meeting finishes, the app writes one plain-text file to `Inbox/` (project, title, the merged
+   transcript, and any manual notes) and returns immediately. OneDrive/SharePoint sync uploads it to the
+   cloud from there.
 
-This app only ever reads and writes local files inside an already-synced folder; it makes no network
-calls for AI processing at all. Building and owning the Power Automate flow (and whatever Copilot Studio
-capacity/licensing it needs) is outside this codebase — that's a Power Platform admin/maker task.
-
-Because this now genuinely round-trips through a cloud flow, expect notes/answers to take anywhere from
-tens of seconds to a few minutes rather than the ~10–20s a direct API call used to take. If nothing shows
-up in the Outbox before the timeout, the meeting's plain transcript is still saved (nothing is lost) and
-the status bar says notes generation timed out — check the flow's run history in Power Automate.
+Whatever picks that file up on the other end — a Power Automate flow, Copilot Studio, or however an org
+wires it up — owns managing, summarizing, and parsing the information from that point on. Building and
+owning that side (and whatever Copilot Studio capacity/licensing it needs) is outside this codebase —
+that's a Power Platform admin/maker task, not something this app depends on to function. If nothing is
+configured to pick the file up at all, the meeting is still fully recorded and saved locally; nothing
+is lost, it just never gets pushed anywhere.
 
 ## Building the .exe
 
@@ -186,15 +170,14 @@ its own release regardless, tagged off whatever the base version currently is.
 
 ## Status
 
-This is the initial scaffold: the storage layer, document ingestion, transcript merging, notes generation,
-and project search are implemented and unit-tested. The audio and screen-capture modules are implemented
+This is the initial scaffold: the storage layer, document ingestion, transcript merging, and the one-way
+Copilot Studio push are implemented and unit-tested. The audio and screen-capture modules are implemented
 against the Windows-only APIs they depend on (WASAPI loopback, live screenshots) and are not testable in a
 headless Linux CI/dev container — they need to be exercised on an actual Windows machine. The GUI wires
 everything together but likewise needs a Windows desktop session to click through.
 
 ## Roadmap / open decisions
 
-- Swap FTS5 keyword search for embeddings if recall becomes a problem on large projects.
 - Speaker diarization (who said what) — faster-whisper alone doesn't separate speakers; mic vs. system
   audio gives a coarse "you" vs. "everyone else" split today.
 - Auto-detect meeting start (e.g. when Teams/Zoom is foregrounded) instead of a manual start button.

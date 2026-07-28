@@ -1,8 +1,6 @@
-"""SQLite storage for projects, meetings, transcript segments, and uploaded documents.
-
-Everything a project owns is full-text indexed (SQLite FTS5) so `ai.search` can pull the passages
-relevant to a question before handing them to the Copilot Studio bridge for synthesis. FTS5 tables are
-"external content" tables kept in sync with triggers, so callers never touch them directly.
+"""SQLite storage for projects, meetings, transcript segments, and uploaded documents — the local,
+searchable-by-browsing record of everything recorded, independent of whatever happens to the copy pushed
+to Copilot Studio (see ai/copilot_push.py).
 """
 
 from __future__ import annotations
@@ -54,46 +52,6 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS idx_meetings_project ON meetings(project_id);
 CREATE INDEX IF NOT EXISTS idx_segments_meeting ON transcript_segments(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
-    text, content='transcript_segments', content_rowid='id'
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-    filename, content_text, content='documents', content_rowid='id'
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS meetings_fts USING fts5(
-    title, notes_markdown, content='meetings', content_rowid='id'
-);
-
-CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON transcript_segments BEGIN
-    INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
-END;
-CREATE TRIGGER IF NOT EXISTS segments_ad AFTER DELETE ON transcript_segments BEGIN
-    INSERT INTO segments_fts(segments_fts, rowid, text) VALUES ('delete', old.id, old.text);
-END;
-
-CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-    INSERT INTO documents_fts(rowid, filename, content_text) VALUES (new.id, new.filename, new.content_text);
-END;
-CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-    INSERT INTO documents_fts(documents_fts, rowid, filename, content_text)
-        VALUES ('delete', old.id, old.filename, old.content_text);
-END;
-
-CREATE TRIGGER IF NOT EXISTS meetings_ai AFTER INSERT ON meetings BEGIN
-    INSERT INTO meetings_fts(rowid, title, notes_markdown)
-        VALUES (new.id, new.title, coalesce(new.notes_markdown, ''));
-END;
-CREATE TRIGGER IF NOT EXISTS meetings_au AFTER UPDATE ON meetings BEGIN
-    INSERT INTO meetings_fts(meetings_fts, rowid, title, notes_markdown)
-        VALUES ('delete', old.id, old.title, coalesce(old.notes_markdown, ''));
-    INSERT INTO meetings_fts(rowid, title, notes_markdown)
-        VALUES (new.id, new.title, coalesce(new.notes_markdown, ''));
-END;
-CREATE TRIGGER IF NOT EXISTS meetings_ad AFTER DELETE ON meetings BEGIN
-    INSERT INTO meetings_fts(meetings_fts, rowid, title, notes_markdown)
-        VALUES ('delete', old.id, old.title, coalesce(old.notes_markdown, ''));
-END;
 """
 
 
@@ -136,18 +94,9 @@ class Meeting:
     manual_notes: str | None
 
 
-@dataclass(frozen=True)
-class SearchHit:
-    kind: str  # "segment" | "document" | "meeting"
-    meeting_id: int | None
-    label: str
-    snippet: str
-    rank: float
-
-
 class Database:
     """One Database instance is shared across the GUI's main thread and the background worker threads
-    that run meeting-finalization and search (so the UI doesn't freeze during transcription/API calls).
+    that finish a meeting (transcribe, push, save) so the UI doesn't freeze while that runs.
     sqlite3 connections are tied to the thread that created them by default (`check_same_thread=True`
     raises "SQLite objects created in a thread can only be used in that same thread" otherwise) and
     aren't safe for concurrent use from multiple threads even with that check disabled — so this opens
@@ -298,90 +247,3 @@ class Database:
                 "SELECT * FROM documents WHERE meeting_id = ? ORDER BY added_at DESC", (meeting_id,)
             ).fetchall()
 
-    # -- Search ----------------------------------------------------------------
-
-    def search_project(self, project_id: int, query: str, limit: int = 8) -> list[SearchHit]:
-        """Full-text search across a project's transcripts, documents, and meeting notes."""
-        fts_query = _to_fts_query(query)
-        if not fts_query:
-            return []
-        hits: list[SearchHit] = []
-
-        with self._lock:
-            segment_rows = self._conn.execute(
-                """
-                SELECT ts.meeting_id, ts.source, ts.text, bm25(segments_fts) AS rank
-                FROM segments_fts
-                JOIN transcript_segments ts ON ts.id = segments_fts.rowid
-                JOIN meetings m ON m.id = ts.meeting_id
-                WHERE segments_fts MATCH ? AND m.project_id = ?
-                ORDER BY rank LIMIT ?
-                """,
-                (fts_query, project_id, limit),
-            ).fetchall()
-
-            document_rows = self._conn.execute(
-                """
-                SELECT d.meeting_id, d.filename, d.content_text, bm25(documents_fts) AS rank
-                FROM documents_fts
-                JOIN documents d ON d.id = documents_fts.rowid
-                WHERE documents_fts MATCH ? AND d.project_id = ?
-                ORDER BY rank LIMIT ?
-                """,
-                (fts_query, project_id, limit),
-            ).fetchall()
-
-            meeting_rows = self._conn.execute(
-                """
-                SELECT mf.rowid AS meeting_id, m.title, m.notes_markdown, bm25(meetings_fts) AS rank
-                FROM meetings_fts mf
-                JOIN meetings m ON m.id = mf.rowid
-                WHERE meetings_fts MATCH ? AND m.project_id = ?
-                ORDER BY rank LIMIT ?
-                """,
-                (fts_query, project_id, limit),
-            ).fetchall()
-
-        for row in segment_rows:
-            hits.append(
-                SearchHit(
-                    kind="segment",
-                    meeting_id=row["meeting_id"],
-                    label=f"transcript ({row['source']})",
-                    snippet=row["text"],
-                    rank=row["rank"],
-                )
-            )
-
-        for row in document_rows:
-            hits.append(
-                SearchHit(
-                    kind="document",
-                    meeting_id=row["meeting_id"],
-                    label=f"document: {row['filename']}",
-                    snippet=row["content_text"][:1000],
-                    rank=row["rank"],
-                )
-            )
-
-        for row in meeting_rows:
-            hits.append(
-                SearchHit(
-                    kind="meeting",
-                    meeting_id=row["meeting_id"],
-                    label=f"meeting notes: {row['title']}",
-                    snippet=(row["notes_markdown"] or "")[:1000],
-                    rank=row["rank"],
-                )
-            )
-
-        hits.sort(key=lambda h: h.rank)
-        return hits[:limit]
-
-
-def _to_fts_query(raw: str) -> str:
-    """Turn free text into a safe FTS5 MATCH query (OR of the individual terms)."""
-    terms = re.findall(r"[A-Za-z0-9_]+", raw)
-    if not terms:
-        return ""
-    return " OR ".join(f'"{t}"' for t in terms)

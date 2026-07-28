@@ -1,9 +1,9 @@
-"""Tkinter control panel: start/stop meetings, browse past meetings per project, upload context
-documents, and ask questions about a project.
+"""Tkinter control panel: start/stop meetings, browse past meetings per project, and upload context
+documents.
 
-Windows desktop only (ships with Python's standard install there). Recording and note generation run on
-a background thread so the UI doesn't freeze during transcription or the (now much slower, since it
-round-trips through a Power Automate/Copilot Studio flow) notes-generation wait.
+Windows desktop only (ships with Python's standard install there). Recording and the finish-up work
+(transcription, pushing to Copilot Studio, saving) run on a background thread so the UI doesn't freeze,
+and so starting the next meeting doesn't have to wait for the previous one to finish (see session.py).
 """
 
 from __future__ import annotations
@@ -14,15 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from meeting_scribe.ai.copilot_bridge import CopilotResponseTimeout
-from meeting_scribe.ai.search import ask as ask_project
 from meeting_scribe.config import (
-    DEFAULT_NOTES_SYSTEM_PROMPT,
     Settings,
     load_settings,
     update_audio_devices,
     update_copilot_settings,
-    update_notes_system_prompt,
 )
 from meeting_scribe.screen.region_picker import RegionOutline, RegionTarget, pick_region_interactively
 from meeting_scribe.session import MeetingSession
@@ -408,10 +404,10 @@ class RecordTab(ttk.Frame):
         session = self.app._session
         if session is None:
             return
-        # Detach right away rather than waiting for the background job below to finish — transcription
-        # plus the Copilot Studio round trip can take minutes, and there's no reason that should block
-        # starting the next meeting. Everything the background job needs (the session, its title) is
-        # already captured in this closure, so the app has no more use for the "current" session slot.
+        # Detach right away rather than waiting for the background job below to finish — transcribing
+        # and pushing to Copilot Studio takes a moment, and there's no reason that should block starting
+        # the next meeting. Everything the background job needs (the session, its title) is already
+        # captured in this closure, so the app has no more use for the "current" session slot.
         self.app._session = None
 
         self.stop_button["state"] = "disabled"
@@ -434,21 +430,17 @@ class RecordTab(ttk.Frame):
             except Exception as exc:  # surfaced to the user regardless of cause
                 self.after(0, self._on_stop_failed, session.title, exc)
                 return
-            self.after(0, self._on_stop_done, session.title, session.notes_timed_out)
+            self.after(0, self._on_stop_done, session.title)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_stop_done(self, meeting_title: str, notes_timed_out: bool) -> None:
-        if notes_timed_out:
-            summary = "Saved — but notes generation timed out; the plain transcript was saved."
-        else:
-            summary = "Saved."
-        self._log(f"[{meeting_title}] {summary}")
+    def _on_stop_done(self, meeting_title: str) -> None:
+        self._log(f"[{meeting_title}] Saved.")
         # Don't stomp on a newer status — a different meeting may already be recording by the time this
         # background job finishes, and its "Recording — ..." status shouldn't be overwritten by a
         # trailing "Saved." from an unrelated, earlier meeting.
         if self.app._session is None:
-            self.status_var.set(summary)
+            self.status_var.set("Saved.")
         self.app.refresh_project_lists()
 
     def _on_stop_failed(self, meeting_title: str, exc: Exception) -> None:
@@ -547,22 +539,6 @@ class ProjectsTab(ttk.Frame):
         self.audio_text = _add_scrollable_text_tab(self.detail_notebook, "Audio Transcript")
         self.manual_notes_text = _add_scrollable_text_tab(self.detail_notebook, "Manual notes")
         self._build_documents_tab()
-
-        ask_row = ttk.Frame(right)
-        ask_row.pack(fill="x", pady=(8, 0))
-        self.question_var = tk.StringVar()
-        ttk.Entry(ask_row, textvariable=self.question_var).pack(side="left", fill="x", expand=True)
-        ttk.Button(ask_row, text="Ask", command=self._ask).pack(side="left", padx=(6, 0))
-
-        answer_frame = ttk.Frame(right)
-        answer_frame.pack(fill="both", pady=(6, 0))
-        self.answer_text = tk.Text(answer_frame, wrap="word", height=6)
-        answer_scrollbar = ttk.Scrollbar(
-            answer_frame, orient="vertical", command=self.answer_text.yview
-        )
-        self.answer_text.configure(yscrollcommand=answer_scrollbar.set)
-        self.answer_text.pack(side="left", fill="both", expand=True)
-        answer_scrollbar.pack(side="right", fill="y")
 
         self._projects: list = []
         self._meetings: list = []
@@ -675,46 +651,11 @@ class ProjectsTab(ttk.Frame):
         document = self._meeting_documents[selection[0]]
         _set_text(self.meeting_document_viewer, document["content_text"])
 
-    def _ask(self) -> None:
-        project = self._selected_project()
-        question = self.question_var.get().strip()
-        if project is None or not question:
-            return
-        settings = self.app.settings
-        if settings.copilot_sync_dir is None:
-            messagebox.showerror(
-                "Meeting Scribe", "Set up the Copilot sync folder in the Settings tab to ask questions."
-            )
-            return
-        _set_text(self.answer_text, "Waiting on Copilot Studio… this can take a while.")
-
-        def worker() -> None:
-            try:
-                answer = ask_project(
-                    self.app.db,
-                    project.id,
-                    question,
-                    inbox_dir=settings.copilot_inbox_dir,
-                    outbox_dir=settings.copilot_outbox_dir,
-                    poll_interval_seconds=settings.copilot_poll_interval_seconds,
-                    timeout_seconds=settings.copilot_timeout_seconds,
-                )
-            except CopilotResponseTimeout as exc:
-                answer = str(exc)
-            except Exception as exc:  # surfaced to the user regardless of cause
-                answer = f"Couldn't answer that: {exc}"
-            self.after(0, self._show_answer, answer)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _show_answer(self, answer: str) -> None:
-        _set_text(self.answer_text, answer)
-
 
 class SettingsTab(ttk.Frame):
-    """Copilot Studio bridge folder, notes prompt, and audio device selection — all editable without
-    touching environment variables. Saved settings are written to disk (see config.save_user_config)
-    and take effect immediately for this running session."""
+    """Copilot push folder and audio device selection — all editable without touching environment
+    variables. Saved settings are written to disk (see config.save_user_config) and take effect
+    immediately for this running session."""
 
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
@@ -734,50 +675,22 @@ class SettingsTab(ttk.Frame):
         )
         ttk.Button(form, text="Browse…", command=self._browse_sync_dir).grid(row=0, column=2, padx=(6, 0))
 
-        ttk.Label(form, text="Poll interval (seconds)").grid(row=1, column=0, sticky="w")
-        self.poll_interval_var = tk.StringVar(value=str(self.app.settings.copilot_poll_interval_seconds))
-        ttk.Entry(form, textvariable=self.poll_interval_var, width=10).grid(
-            row=1, column=1, sticky="w", padx=6, pady=4
-        )
-
-        ttk.Label(form, text="Timeout (seconds)").grid(row=2, column=0, sticky="w")
-        self.timeout_var = tk.StringVar(value=str(self.app.settings.copilot_timeout_seconds))
-        ttk.Entry(form, textvariable=self.timeout_var, width=10).grid(
-            row=2, column=1, sticky="w", padx=6, pady=4
-        )
-
-        ttk.Label(form, text="Microphone").grid(row=3, column=0, sticky="w")
+        ttk.Label(form, text="Microphone").grid(row=1, column=0, sticky="w")
         self.mic_var = tk.StringVar(value=self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
         self.mic_combo = ttk.Combobox(form, textvariable=self.mic_var, width=45, state="readonly")
-        self.mic_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
+        self.mic_combo.grid(row=1, column=1, sticky="we", padx=6, pady=4)
 
-        ttk.Label(form, text="System audio (speaker)").grid(row=4, column=0, sticky="w")
+        ttk.Label(form, text="System audio (speaker)").grid(row=2, column=0, sticky="w")
         self.system_var = tk.StringVar(
             value=self.app.settings.system_device_name or SYSTEM_DEFAULT_LABEL
         )
         self.system_combo = ttk.Combobox(form, textvariable=self.system_var, width=45, state="readonly")
-        self.system_combo.grid(row=4, column=1, sticky="we", padx=6, pady=4)
+        self.system_combo.grid(row=2, column=1, sticky="we", padx=6, pady=4)
 
         ttk.Button(form, text="Refresh devices", command=self._refresh_devices).grid(
-            row=3, column=2, rowspan=2, padx=(6, 0)
+            row=1, column=2, rowspan=2, padx=(6, 0)
         )
         form.columnconfigure(1, weight=1)
-
-        prompt_header = ttk.Frame(self)
-        prompt_header.pack(fill="x", padx=12, pady=(4, 0))
-        ttk.Label(prompt_header, text="Notes system prompt").pack(side="left")
-        ttk.Button(
-            prompt_header, text="Reset to recommended default", command=self._reset_system_prompt
-        ).pack(side="right")
-
-        prompt_frame = ttk.Frame(self)
-        prompt_frame.pack(fill="both", expand=True, padx=12, pady=(4, 4))
-        self.prompt_text = tk.Text(prompt_frame, wrap="word", height=12)
-        prompt_scrollbar = ttk.Scrollbar(prompt_frame, orient="vertical", command=self.prompt_text.yview)
-        self.prompt_text.configure(yscrollcommand=prompt_scrollbar.set)
-        self.prompt_text.insert("1.0", self.app.settings.notes_system_prompt)
-        self.prompt_text.pack(side="left", fill="both", expand=True)
-        prompt_scrollbar.pack(side="right", fill="y")
 
         ttk.Button(self, text="Save", command=self._save).pack(anchor="w", padx=12)
 
@@ -785,20 +698,19 @@ class SettingsTab(ttk.Frame):
         ttk.Label(self, textvariable=self.status_var).pack(anchor="w", padx=12, pady=(8, 0))
 
         note = (
-            "Meeting notes and Ask no longer call an AI API directly (governance doesn't allow that) — "
-            "instead, the transcript is dropped as a text file into an \"Inbox\" folder under the folder "
-            "you set here, which must be a location OneDrive/SharePoint is already syncing. A Power "
-            "Automate flow (built and owned outside this app, in the Power Platform admin UI) is "
-            "expected to pick it up, run it through Copilot Studio, and write the result back into a "
-            "matching \"Outbox\" folder. This app just waits, polling every \"poll interval\" up to "
-            "\"timeout\" — recording, transcription, and screen OCR all work with no folder configured.\n\n"
+            "This app doesn't call an AI API directly (governance doesn't allow that) and doesn't wait "
+            "for anything back — when a meeting ends, its transcript (and any manual notes) is dropped "
+            "as a text file into an \"Inbox\" folder under the folder you set here, which must be a "
+            "location OneDrive/SharePoint is already syncing. Whatever picks that folder up from there "
+            "(a Power Automate flow, Copilot Studio, or however it's wired up) owns managing and parsing "
+            "it — this app's job stops at the handoff. Recording, transcription, and screen OCR all work "
+            "with no folder configured; the meeting is just recorded and saved locally, not pushed "
+            "anywhere. Projects, meetings, transcripts, and manual notes all stay in this app either "
+            "way — that local record doesn't depend on the push.\n\n"
             "Microphone / system audio pick which device gets recorded — useful if you have more than "
             "one mic, or the wrong one is the Windows default. \"System default\" always follows "
             "whatever Windows currently has set as default. Watch the level meters on the Record tab "
-            "to confirm a device is actually picking up audio.\n\n"
-            "The notes system prompt is bundled into the request file sent to the flow — edit it to "
-            "change the tone, sections, or level of detail of the generated notes (whoever builds the "
-            "flow needs to pass the file's content straight through to the GPT/Copilot Studio action)."
+            "to confirm a device is actually picking up audio."
         )
         ttk.Label(self, text=note, wraplength=560, justify="left", foreground="#555").pack(
             anchor="w", padx=12, pady=(12, 0)
@@ -812,17 +724,11 @@ class SettingsTab(ttk.Frame):
         if chosen:
             self.sync_dir_var.set(chosen)
 
-    def _reset_system_prompt(self) -> None:
-        self.prompt_text.delete("1.0", "end")
-        self.prompt_text.insert("1.0", DEFAULT_NOTES_SYSTEM_PROMPT)
-
     def _refresh_status(self) -> None:
         if self.app.settings.copilot_sync_dir:
             self.status_var.set(f"Copilot sync folder set: {self.app.settings.copilot_sync_dir}")
         else:
-            self.status_var.set(
-                "No Copilot sync folder set — notes generation and Ask are disabled until one is."
-            )
+            self.status_var.set("No Copilot sync folder set — meetings are recorded but not pushed.")
 
     def _refresh_devices(self) -> None:
         """Repopulates the microphone/system-audio dropdowns with currently available devices."""
@@ -851,24 +757,12 @@ class SettingsTab(ttk.Frame):
         system_name = (
             None if self.system_var.get() == SYSTEM_DEFAULT_LABEL else self.system_var.get()
         )
-        try:
-            poll_interval_seconds = float(self.poll_interval_var.get())
-            timeout_seconds = float(self.timeout_var.get())
-        except ValueError:
-            messagebox.showerror("Meeting Scribe", "Poll interval and timeout must be numbers.")
-            return
 
         self.app.settings = update_copilot_settings(
-            self.app.settings,
-            copilot_sync_dir=self.sync_dir_var.get().strip(),
-            poll_interval_seconds=poll_interval_seconds,
-            timeout_seconds=timeout_seconds,
+            self.app.settings, copilot_sync_dir=self.sync_dir_var.get().strip()
         )
         self.app.settings = update_audio_devices(
             self.app.settings, mic_device_name=mic_name, system_device_name=system_name
-        )
-        self.app.settings = update_notes_system_prompt(
-            self.app.settings, notes_system_prompt=self.prompt_text.get("1.0", "end")
         )
         self._refresh_status()
         self.app.sync_device_displays()

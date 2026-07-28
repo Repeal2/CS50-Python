@@ -13,45 +13,6 @@ from pathlib import Path
 
 USER_CONFIG_FILENAME = "settings.json"
 
-# Defaults for the Copilot Studio bridge (see ai/copilot_bridge.py) — how often to check the Outbox
-# folder for a response, and how long to wait before giving up. Generation now runs through a Power
-# Automate/Copilot Studio flow outside this app, not a synchronous API call, so this can take anywhere
-# from tens of seconds (Power Automate trigger latency) to a few minutes.
-DEFAULT_COPILOT_POLL_INTERVAL_SECONDS = 5.0
-DEFAULT_COPILOT_TIMEOUT_SECONDS = 300.0
-
-# Prepopulated into the Settings tab's system prompt field. Explains to the model what it's being handed
-# (a merged, automated, imperfect transcript) and what happens to what it produces (saved as the permanent
-# record of the meeting, later retrieved to answer questions across a project) so a user who edits this
-# has a template for what information matters to include.
-DEFAULT_NOTES_SYSTEM_PROMPT = """You are a meeting assistant. You will receive a single merged transcript \
-of a meeting, combining three sources: audio from the user's own microphone, audio from the meeting's \
-system/speaker output (everyone else on the call), and text OCR'd from the screen during the meeting \
-(slides, captions, shared chat). Lines are in chronological order, but the transcription and OCR are \
-automated and may contain errors, misattributions, or gaps.
-
-Turn this into concise, well-structured notes formatted as Markdown with these sections, in this order:
-
-## Summary
-2-4 sentences on what the meeting was about and its outcome.
-
-## Key Discussion Points
-Bullet list of the topics covered.
-
-## Decisions
-Bullet list of decisions made. Omit this section if none were made.
-
-## Action Items
-A markdown table with columns: Owner | Action | Due date (use "unspecified" when the transcript doesn't \
-say). Omit this section if there are none.
-
-Base everything strictly on the transcript. Do not invent names, dates, or commitments that aren't in it.
-
-These notes become the permanent record of this meeting: they're shown to the user directly, and later \
-indexed so they (or a future search) can ask "what did we decide about X" across every meeting in the \
-project. Write for that audience — someone who wasn't necessarily in the meeting and is relying on these \
-notes to reconstruct what happened."""
-
 
 def _default_data_dir() -> Path:
     override = os.environ.get("MEETING_SCRIBE_DATA_DIR")
@@ -97,13 +58,10 @@ class Settings:
     # historical/simple behavior, and still the default until the user picks something explicit.
     mic_device_name: str | None = None
     system_device_name: str | None = None
-    notes_system_prompt: str = DEFAULT_NOTES_SYSTEM_PROMPT
-    # Root of a folder synced by OneDrive/SharePoint — Inbox/Outbox subfolders live under it (see
-    # ai/copilot_bridge.py). None means the Copilot Studio bridge isn't configured yet: notes generation
-    # and Ask are skipped rather than attempted, the same as an unset API key used to mean.
+    # Root of a folder synced by OneDrive/SharePoint — an Inbox subfolder lives under it (see
+    # ai/copilot_push.py). None means nothing gets pushed anywhere: the meeting is still recorded and
+    # saved locally, just not handed off.
     copilot_sync_dir: Path | None = None
-    copilot_poll_interval_seconds: float = DEFAULT_COPILOT_POLL_INTERVAL_SECONDS
-    copilot_timeout_seconds: float = DEFAULT_COPILOT_TIMEOUT_SECONDS
 
     @property
     def db_path(self) -> Path:
@@ -116,10 +74,6 @@ class Settings:
     @property
     def copilot_inbox_dir(self) -> Path:
         return self.copilot_sync_dir / "Inbox"
-
-    @property
-    def copilot_outbox_dir(self) -> Path:
-        return self.copilot_sync_dir / "Outbox"
 
     def project_dir(self, project_slug: str) -> Path:
         return self.projects_dir / project_slug
@@ -145,38 +99,23 @@ def _load_user_config(data_dir: Path) -> dict:
 
 
 def save_user_config(settings: Settings) -> None:
-    """Persists the user-editable settings (Copilot sync folder, chosen audio devices, notes prompt) so
-    they survive a restart without the user needing to set environment variables — the GUI's Settings
-    tab calls this after Save."""
+    """Persists the user-editable settings (Copilot sync folder, chosen audio devices) so they survive
+    a restart without the user needing to set environment variables — the GUI's Settings tab calls this
+    after Save."""
     path = _user_config_path(settings.data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "mic_device_name": settings.mic_device_name,
         "system_device_name": settings.system_device_name,
-        "notes_system_prompt": settings.notes_system_prompt,
         "copilot_sync_dir": str(settings.copilot_sync_dir) if settings.copilot_sync_dir else None,
-        "copilot_poll_interval_seconds": settings.copilot_poll_interval_seconds,
-        "copilot_timeout_seconds": settings.copilot_timeout_seconds,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def update_copilot_settings(
-    settings: Settings,
-    *,
-    copilot_sync_dir: str | None,
-    poll_interval_seconds: float,
-    timeout_seconds: float,
-) -> Settings:
-    """Applies and persists the Copilot Studio bridge folder/timing edit from the Settings tab. A blank
-    `copilot_sync_dir` disables the bridge (notes generation and Ask are skipped, same as no API key
-    used to mean)."""
-    updated = replace(
-        settings,
-        copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None,
-        copilot_poll_interval_seconds=poll_interval_seconds,
-        copilot_timeout_seconds=timeout_seconds,
-    )
+def update_copilot_settings(settings: Settings, *, copilot_sync_dir: str | None) -> Settings:
+    """Applies and persists the Copilot Studio push-folder edit from the Settings tab. A blank
+    `copilot_sync_dir` disables pushing entirely — meetings are still recorded and saved locally."""
+    updated = replace(settings, copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None)
     save_user_config(updated)
     return updated
 
@@ -187,14 +126,6 @@ def update_audio_devices(
     """Applies and persists a microphone / system-audio device choice from the Settings tab. None means
     "use whatever Windows currently considers the default" for that device."""
     updated = replace(settings, mic_device_name=mic_device_name, system_device_name=system_device_name)
-    save_user_config(updated)
-    return updated
-
-
-def update_notes_system_prompt(settings: Settings, *, notes_system_prompt: str) -> Settings:
-    """Applies and persists an edit to the notes system prompt from the Settings tab. A blank value
-    resets to the recommended default rather than sending an empty prompt through the bridge."""
-    updated = replace(settings, notes_system_prompt=notes_system_prompt.strip() or DEFAULT_NOTES_SYSTEM_PROMPT)
     save_user_config(updated)
     return updated
 
@@ -215,10 +146,5 @@ def load_settings() -> Settings:
         ),
         mic_device_name=user_config.get("mic_device_name"),
         system_device_name=user_config.get("system_device_name"),
-        notes_system_prompt=user_config.get("notes_system_prompt") or DEFAULT_NOTES_SYSTEM_PROMPT,
         copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None,
-        copilot_poll_interval_seconds=user_config.get(
-            "copilot_poll_interval_seconds", DEFAULT_COPILOT_POLL_INTERVAL_SECONDS
-        ),
-        copilot_timeout_seconds=user_config.get("copilot_timeout_seconds", DEFAULT_COPILOT_TIMEOUT_SECONDS),
     )

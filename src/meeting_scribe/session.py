@@ -1,20 +1,19 @@
 """Orchestrates one meeting end to end: start recording (mic + system audio + screen), and on stop,
-transcribe, merge into one transcript, generate notes via the Copilot Studio bridge, and file everything
-under the meeting's project so it's searchable later.
+transcribe, merge into one transcript, push it to Copilot Studio, and file everything locally under the
+meeting's project so there's a record of it in this app regardless of what happens to the pushed copy.
 
 Each MeetingSession is self-contained (its own Recorder, ScreenWatcher, WhisperTranscriber, and meeting
-directory) with no shared mutable state between instances, so one session's stop() — the slow part,
-given transcription and the Copilot Studio round trip — can safely keep running on a background thread
-while a new MeetingSession starts and records the next meeting. The GUI relies on this for back-to-back
-meetings: starting the next one doesn't wait for the previous one to finish transcribing/saving.
+directory) with no shared mutable state between instances, so one session's stop() — the slow part, given
+local transcription — can safely keep running on a background thread while a new MeetingSession starts
+and records the next meeting. The GUI relies on this for back-to-back meetings: starting the next one
+doesn't wait for the previous one to finish transcribing/saving.
 """
 
 from __future__ import annotations
 
 from typing import Callable
 
-from meeting_scribe.ai.copilot_bridge import CopilotResponseTimeout
-from meeting_scribe.ai.notes import generate_notes
+from meeting_scribe.ai.copilot_push import format_meeting_for_push, push_meeting
 from meeting_scribe.audio.recorder import Recorder
 from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
@@ -63,7 +62,6 @@ class MeetingSession:
             target=screen_target,
         )
         self._transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
-        self.notes_timed_out = False
 
     def start(self) -> None:
         self._recorder.start()
@@ -75,13 +73,13 @@ class MeetingSession:
         return self._recorder.mic_level, self._recorder.system_level
 
     def stop(self, on_progress: Callable[[str], None] | None = None) -> str:
-        """Stops recording, transcribes, generates notes, and saves the meeting. Returns the notes
-        (or the plain transcript if the Copilot Studio bridge isn't configured, or if it times out).
+        """Stops recording, transcribes, pushes the meeting to Copilot Studio (if configured), and saves
+        it locally. Returns the plain transcript — there's no AI-generated notes to return anymore; that
+        happens downstream, outside this app, once Copilot Studio picks up the pushed file.
 
-        `on_progress`, if given, is called with a short human-readable status at each stage — this whole
-        method can take anywhere from seconds to several minutes (the Copilot Studio round trip
-        dominates), so the caller (the GUI) uses this to keep an activity log current instead of the UI
-        looking frozen with no feedback."""
+        `on_progress`, if given, is called with a short human-readable status at each stage, since this
+        whole method can take a while (local transcription isn't instant) and the caller (the GUI) uses
+        it to keep an activity log current instead of the UI looking frozen with no feedback."""
 
         def report(message: str) -> None:
             if on_progress is not None:
@@ -107,27 +105,19 @@ class MeetingSession:
                 self.meeting_id, line.source, line.timestamp_seconds, line.text
             )
 
-        notes = None
         if self._settings.copilot_sync_dir is not None:
-            report("Waiting for Copilot Studio notes...")
-            try:
-                notes = generate_notes(
-                    transcript_text,
-                    inbox_dir=self._settings.copilot_inbox_dir,
-                    outbox_dir=self._settings.copilot_outbox_dir,
-                    poll_interval_seconds=self._settings.copilot_poll_interval_seconds,
-                    timeout_seconds=self._settings.copilot_timeout_seconds,
-                    system_prompt=self._settings.notes_system_prompt,
-                )
-                report("Notes received from Copilot Studio.")
-            except CopilotResponseTimeout:
-                # Don't lose the meeting over a slow/misconfigured flow — save the plain transcript and
-                # let the caller (the GUI) tell the user notes generation timed out via this flag.
-                self.notes_timed_out = True
-                report("Notes generation timed out.")
+            manual_notes = self._db.get_meeting(self.meeting_id).manual_notes
+            content = format_meeting_for_push(
+                project_name=self.project.name,
+                title=self.title,
+                transcript_text=transcript_text,
+                manual_notes=manual_notes,
+            )
+            push_meeting(content, inbox_dir=self._settings.copilot_inbox_dir)
+            report("Pushed to Copilot Studio.")
         else:
-            report("Copilot sync folder not configured — skipping notes generation.")
+            report("Copilot sync folder not configured — nothing pushed.")
 
-        self._db.finish_meeting(self.meeting_id, transcript_text=transcript_text, notes_markdown=notes)
+        self._db.finish_meeting(self.meeting_id, transcript_text=transcript_text)
         report("Meeting saved.")
-        return notes or transcript_text
+        return transcript_text
