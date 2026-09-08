@@ -8,6 +8,8 @@ def test_push_meeting_package_writes_transcripts_named_by_meeting_code(tmp_path)
 
     push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="[00:01] You: let's get started",
         screen_transcript_text="[00:02] Screen: Slide: Agenda",
         reference_documents=[],
@@ -25,6 +27,8 @@ def test_push_meeting_package_handles_empty_transcripts(tmp_path):
 
     push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="",
         screen_transcript_text="",
         reference_documents=[],
@@ -42,6 +46,8 @@ def test_push_meeting_package_copies_reference_documents_with_meeting_code_prefi
 
     push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="hello",
         screen_transcript_text="",
         reference_documents=[
@@ -65,6 +71,8 @@ def test_push_meeting_package_dedupes_reference_documents_with_the_same_original
 
     manifest_path = push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="",
         screen_transcript_text="",
         reference_documents=[
@@ -87,6 +95,8 @@ def test_push_meeting_package_skips_reference_documents_whose_source_file_is_mis
 
     manifest_path = push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="",
         screen_transcript_text="",
         reference_documents=[
@@ -108,6 +118,8 @@ def test_push_meeting_package_writes_a_well_formed_manifest_last(tmp_path):
 
     manifest_path = push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="hello",
         screen_transcript_text="world",
         reference_documents=[ReferenceDocument(original_filename="invite.pdf", source_path=doc_path)],
@@ -118,6 +130,8 @@ def test_push_meeting_package_writes_a_well_formed_manifest_last(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["meetingID"] == "20260728-1030"
+    assert manifest["projectName"] == "Test Project"
+    assert manifest["meetingTitle"] == "Kickoff"
     assert manifest["files"]["transcript_audio"] == "20260728-1030_transcript-audio.txt"
     assert manifest["files"]["transcript_screen"] == "20260728-1030_transcript-screen.txt"
     assert manifest["files"]["reference_docs"] == [
@@ -132,6 +146,8 @@ def test_push_meeting_package_writes_manual_notes_and_attendees_as_reference_doc
 
     manifest_path = push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="hello",
         screen_transcript_text="",
         reference_documents=[],
@@ -162,6 +178,8 @@ def test_push_meeting_package_dedupes_a_text_reference_doc_against_an_uploaded_o
 
     manifest_path = push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="",
         screen_transcript_text="",
         reference_documents=[
@@ -189,6 +207,8 @@ def test_push_meeting_package_creates_the_inbox_directory(tmp_path):
 
     push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="hello",
         screen_transcript_text="",
         reference_documents=[],
@@ -203,6 +223,8 @@ def test_push_meeting_package_reference_docs_is_empty_array_with_no_documents(tm
 
     manifest_path = push_meeting_package(
         meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
         audio_transcript_text="hello",
         screen_transcript_text="",
         reference_documents=[],

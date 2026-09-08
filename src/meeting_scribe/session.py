@@ -136,6 +136,8 @@ class MeetingSession:
             ]
             push_meeting_package(
                 meeting_code=self.meeting_code,
+                project_name=self.project.name,
+                meeting_title=self.title,
                 audio_transcript_text=render_transcript(audio_lines),
                 screen_transcript_text=render_transcript(screen_lines),
                 reference_documents=reference_documents,

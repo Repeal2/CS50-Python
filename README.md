@@ -181,6 +181,8 @@ else appearing in the folder should cause a trigger. Its shape:
 ```json
 {
   "meetingID": "20260728-1030",
+  "projectName": "Acme Rollout",
+  "meetingTitle": "Kickoff",
   "files": {
     "transcript_audio": "20260728-1030_transcript-audio.txt",
     "transcript_screen": "20260728-1030_transcript-screen.txt",
@@ -205,7 +207,9 @@ else appearing in the folder should cause a trigger. Its shape:
 ```
 
 `reference_docs` is `[]` (and `reference_count` is `0`) when no reference documents were attached to that
-meeting. `timestamp_completed` is always UTC, `Z`-suffixed ISO 8601.
+meeting. `timestamp_completed` is always UTC, `Z`-suffixed ISO 8601. `projectName` and `meetingTitle` are
+the project and meeting names as entered locally — they aren't part of the file-naming contract (that's
+still keyed on `meetingID` alone), just metadata for whatever consumes the manifest.
 
 Whatever picks that package up on the other end — a Power Automate flow, Copilot Studio, or however an org
 wires it up — owns managing, summarizing, and parsing the information from that point on. Building and

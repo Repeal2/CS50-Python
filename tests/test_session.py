@@ -139,6 +139,8 @@ def test_session_pushes_a_named_file_package_when_sync_dir_configured(tmp_path):
             assert "no on-screen text" in screen_transcript
             manifest = json.loads((inbox_dir / f"{code}_done.json").read_text(encoding="utf-8"))
             assert manifest["meetingID"] == code
+            assert manifest["projectName"] == "Test Project"
+            assert manifest["meetingTitle"] == "Kickoff"
             assert manifest["files"]["reference_docs"] == []
 
 

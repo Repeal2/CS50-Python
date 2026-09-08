@@ -60,6 +60,8 @@ def _dedupe_filename(candidate: str, used_names: set[str]) -> str:
 def push_meeting_package(
     *,
     meeting_code: str,
+    project_name: str,
+    meeting_title: str,
     audio_transcript_text: str,
     screen_transcript_text: str,
     reference_documents: list[ReferenceDocument],
@@ -110,6 +112,8 @@ def push_meeting_package(
 
     manifest = {
         "meetingID": meeting_code,
+        "projectName": project_name,
+        "meetingTitle": meeting_title,
         "files": {
             "transcript_audio": audio_filename,
             "transcript_screen": screen_filename,
