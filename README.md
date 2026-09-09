@@ -150,29 +150,37 @@ synthesized result. `ai/copilot_push.py` does the whole thing in two steps:
 
 Every meeting gets a **meetingID** — `YYYYMMDD-HHMM` (e.g. `20260728-1030`), or `YYYYMMDD-HHMM-XXX` with a
 random 3-character suffix if another meeting already started in that same minute — assigned once when the
-meeting is created and used to prefix every file in its package:
+meeting is created and used to prefix every file in its package. The app's own generated files (the two
+transcripts, the manual notes, the attendee list) also carry the meeting title between the meetingID and
+the description of what the file is, for readability in the inbox folder:
 
 | File | Naming pattern | Example |
 |---|---|---|
-| Audio transcript | `{meetingID}_transcript-audio.txt` | `20260728-1030_transcript-audio.txt` |
-| Screen transcript | `{meetingID}_transcript-screen.txt` | `20260728-1030_transcript-screen.txt` |
+| Audio transcript | `{meetingID}_{title}_transcript-audio.txt` | `20260728-1030_Kickoff_transcript-audio.txt` |
+| Screen transcript | `{meetingID}_{title}_transcript-screen.txt` | `20260728-1030_Kickoff_transcript-screen.txt` |
+| Manual notes | `{meetingID}_{title}_meeting-notes.txt` | `20260728-1030_Kickoff_meeting-notes.txt` |
+| Attendee list | `{meetingID}_{title}_attendees.txt` | `20260728-1030_Kickoff_attendees.txt` |
 | Reference document(s) | `{meetingID}_{original-filename}.{ext}` | `20260728-1030_Q3 Budget Proposal.pdf` |
 | Completion manifest | `{meetingID}_done.json` | `20260728-1030_done.json` |
 
-Reference documents are copied under their real original filename (just prefixed), not renamed or
-converted — this app keeps a copy of the original bytes it was uploaded with (see
-`storage/documents.py::save_original_copy`) specifically so it has something to hand off here later, since
-only its *extracted text* is otherwise kept in the local database. Two reference documents attached to the
-same meeting with identical original filenames get `-2`, `-3`, etc. appended before the extension to avoid
-overwriting each other; the manifest's `reference_docs` entries carry both the original and saved filename,
-so a rename is always visible there.
+`{title}` is the meeting title with characters Windows rejects in filenames (`<>:"/\|?*` and control
+characters) swapped for a space and whitespace collapsed (see `ai/copilot_push.py::_sanitize_title_for_filename`);
+a title that sanitizes down to nothing falls back to `Untitled`.
+
+Uploaded reference documents are copied under their real original filename (just prefixed with the
+meetingID, no title), not renamed or converted — this app keeps a copy of the original bytes it was
+uploaded with (see `storage/documents.py::save_original_copy`) specifically so it has something to hand off
+here later, since only its *extracted text* is otherwise kept in the local database. Any two files in the
+same meeting that land on the same saved filename get `-2`, `-3`, etc. appended before the extension to
+avoid overwriting each other; the manifest's `reference_docs` entries carry both the original and saved
+filename, so a rename is always visible there.
 
 Manual notes and the OCR'd attendee list aren't uploaded files, but they're handed off the same
-reference-doc-style way — same naming pattern, same manifest entry shape — as `{meetingID}_meeting-notes.txt`
-and `{meetingID}_attendees.txt` respectively, written from whatever's saved in the local database rather
-than copied from a file on disk. Either (or both) is simply omitted from `reference_docs` if nothing was
-recorded for that meeting — a manual notes box that was never typed in, or an attendee list that was never
-captured, doesn't produce an empty file.
+reference-doc-style way — same manifest entry shape — as `{meetingID}_{title}_meeting-notes.txt` and
+`{meetingID}_{title}_attendees.txt` respectively, written from whatever's saved in the local database
+rather than copied from a file on disk. Either (or both) is simply omitted from `reference_docs` if nothing
+was recorded for that meeting — a manual notes box that was never typed in, or an attendee list that was
+never captured, doesn't produce an empty file.
 
 The **completion manifest is written last**, only once the transcripts and every reference document have
 been fully copied — it's the single file the downstream workflow should watch for and trigger on; nothing
@@ -184,16 +192,16 @@ else appearing in the folder should cause a trigger. Its shape:
   "projectName": "Acme Rollout",
   "meetingTitle": "Kickoff",
   "files": {
-    "transcript_audio": "20260728-1030_transcript-audio.txt",
-    "transcript_screen": "20260728-1030_transcript-screen.txt",
+    "transcript_audio": "20260728-1030_Kickoff_transcript-audio.txt",
+    "transcript_screen": "20260728-1030_Kickoff_transcript-screen.txt",
     "reference_docs": [
       {
         "original_filename": "meeting-notes.txt",
-        "saved_filename": "20260728-1030_meeting-notes.txt"
+        "saved_filename": "20260728-1030_Kickoff_meeting-notes.txt"
       },
       {
         "original_filename": "attendees.txt",
-        "saved_filename": "20260728-1030_attendees.txt"
+        "saved_filename": "20260728-1030_Kickoff_attendees.txt"
       },
       {
         "original_filename": "Q3 Budget Proposal.pdf",

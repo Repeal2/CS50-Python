@@ -1,6 +1,23 @@
 import json
 
-from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
+from meeting_scribe.ai.copilot_push import (
+    ReferenceDocument,
+    TextReferenceDocument,
+    _sanitize_title_for_filename,
+    push_meeting_package,
+)
+
+
+def test_sanitize_title_for_filename_strips_windows_invalid_characters():
+    assert _sanitize_title_for_filename('Budget: Q3 <Draft>?') == "Budget Q3 Draft"
+
+
+def test_sanitize_title_for_filename_collapses_whitespace_and_trims_trailing_dots():
+    assert _sanitize_title_for_filename("  Kickoff   Sync..  ") == "Kickoff Sync"
+
+
+def test_sanitize_title_for_filename_falls_back_to_untitled_when_nothing_survives():
+    assert _sanitize_title_for_filename('???') == "Untitled"
 
 
 def test_push_meeting_package_writes_transcripts_named_by_meeting_code(tmp_path):
@@ -16,8 +33,8 @@ def test_push_meeting_package_writes_transcripts_named_by_meeting_code(tmp_path)
         inbox_dir=inbox_dir,
     )
 
-    audio = inbox_dir / "20260728-1030_transcript-audio.txt"
-    screen = inbox_dir / "20260728-1030_transcript-screen.txt"
+    audio = inbox_dir / "20260728-1030_Kickoff_transcript-audio.txt"
+    screen = inbox_dir / "20260728-1030_Kickoff_transcript-screen.txt"
     assert audio.read_text(encoding="utf-8") == "[00:01] You: let's get started"
     assert screen.read_text(encoding="utf-8") == "[00:02] Screen: Slide: Agenda"
 
@@ -35,8 +52,8 @@ def test_push_meeting_package_handles_empty_transcripts(tmp_path):
         inbox_dir=inbox_dir,
     )
 
-    assert "no audio transcript" in (inbox_dir / "20260728-1030_transcript-audio.txt").read_text()
-    assert "no on-screen text" in (inbox_dir / "20260728-1030_transcript-screen.txt").read_text()
+    assert "no audio transcript" in (inbox_dir / "20260728-1030_Kickoff_transcript-audio.txt").read_text()
+    assert "no on-screen text" in (inbox_dir / "20260728-1030_Kickoff_transcript-screen.txt").read_text()
 
 
 def test_push_meeting_package_copies_reference_documents_with_meeting_code_prefix(tmp_path):
@@ -132,8 +149,8 @@ def test_push_meeting_package_writes_a_well_formed_manifest_last(tmp_path):
     assert manifest["meetingID"] == "20260728-1030"
     assert manifest["projectName"] == "Test Project"
     assert manifest["meetingTitle"] == "Kickoff"
-    assert manifest["files"]["transcript_audio"] == "20260728-1030_transcript-audio.txt"
-    assert manifest["files"]["transcript_screen"] == "20260728-1030_transcript-screen.txt"
+    assert manifest["files"]["transcript_audio"] == "20260728-1030_Kickoff_transcript-audio.txt"
+    assert manifest["files"]["transcript_screen"] == "20260728-1030_Kickoff_transcript-screen.txt"
     assert manifest["files"]["reference_docs"] == [
         {"original_filename": "invite.pdf", "saved_filename": "20260728-1030_invite.pdf"}
     ]
@@ -158,20 +175,26 @@ def test_push_meeting_package_writes_manual_notes_and_attendees_as_reference_doc
         inbox_dir=inbox_dir,
     )
 
-    notes_path = inbox_dir / "20260728-1030_meeting-notes.txt"
-    attendees_path = inbox_dir / "20260728-1030_attendees.txt"
+    notes_path = inbox_dir / "20260728-1030_Kickoff_meeting-notes.txt"
+    attendees_path = inbox_dir / "20260728-1030_Kickoff_attendees.txt"
     assert notes_path.read_text(encoding="utf-8") == "Follow up with legal."
     assert attendees_path.read_text(encoding="utf-8") == "John Smith\nJane Doe"
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["reference_count"] == 2
     assert manifest["files"]["reference_docs"] == [
-        {"original_filename": "meeting-notes.txt", "saved_filename": "20260728-1030_meeting-notes.txt"},
-        {"original_filename": "attendees.txt", "saved_filename": "20260728-1030_attendees.txt"},
+        {
+            "original_filename": "meeting-notes.txt",
+            "saved_filename": "20260728-1030_Kickoff_meeting-notes.txt",
+        },
+        {"original_filename": "attendees.txt", "saved_filename": "20260728-1030_Kickoff_attendees.txt"},
     ]
 
 
-def test_push_meeting_package_dedupes_a_text_reference_doc_against_an_uploaded_one(tmp_path):
+def test_push_meeting_package_keeps_a_text_reference_doc_and_a_same_named_upload_separate(tmp_path):
+    """A text reference doc's saved filename carries the meeting title (it's this app's own generated
+    output) but an uploaded reference document's doesn't (it keeps its original name recognizable) — so
+    the two no longer land on the same saved filename just because they share an original_filename."""
     inbox_dir = tmp_path / "Inbox"
     uploaded_path = tmp_path / "uploaded-notes.txt"
     uploaded_path.write_bytes(b"uploaded copy")
@@ -191,15 +214,44 @@ def test_push_meeting_package_dedupes_a_text_reference_doc_against_an_uploaded_o
         inbox_dir=inbox_dir,
     )
 
-    # Text reference docs are written first, so the typed notes keep the plain name and the uploaded
-    # file (which happens to share that original filename) gets the "-2" suffix.
-    assert (inbox_dir / "20260728-1030_meeting-notes.txt").read_text(encoding="utf-8") == (
+    assert (inbox_dir / "20260728-1030_Kickoff_meeting-notes.txt").read_text(encoding="utf-8") == (
         "typed during the meeting"
     )
-    assert (inbox_dir / "20260728-1030_meeting-notes-2.txt").read_bytes() == b"uploaded copy"
+    assert (inbox_dir / "20260728-1030_meeting-notes.txt").read_bytes() == b"uploaded copy"
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["reference_count"] == 2
+
+
+def test_push_meeting_package_still_dedupes_an_upload_that_collides_with_a_text_reference_docs_saved_name(
+    tmp_path,
+):
+    """The shared used_names namespace (see _dedupe_filename) still protects against an actual collision:
+    here the uploaded file's original_filename happens to equal exactly what the typed notes' *saved*
+    filename becomes once the title is folded in."""
+    inbox_dir = tmp_path / "Inbox"
+    uploaded_path = tmp_path / "uploaded.txt"
+    uploaded_path.write_bytes(b"uploaded copy")
+
+    push_meeting_package(
+        meeting_code="20260728-1030",
+        project_name="Test Project",
+        meeting_title="Kickoff",
+        audio_transcript_text="",
+        screen_transcript_text="",
+        reference_documents=[
+            ReferenceDocument(original_filename="Kickoff_meeting-notes.txt", source_path=uploaded_path)
+        ],
+        text_reference_documents=[
+            TextReferenceDocument(original_filename="meeting-notes.txt", content="typed during the meeting")
+        ],
+        inbox_dir=inbox_dir,
+    )
+
+    assert (inbox_dir / "20260728-1030_Kickoff_meeting-notes.txt").read_text(encoding="utf-8") == (
+        "typed during the meeting"
+    )
+    assert (inbox_dir / "20260728-1030_Kickoff_meeting-notes-2.txt").read_bytes() == b"uploaded copy"
 
 
 def test_push_meeting_package_creates_the_inbox_directory(tmp_path):

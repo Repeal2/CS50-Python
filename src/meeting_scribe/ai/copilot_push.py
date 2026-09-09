@@ -16,6 +16,7 @@ downstream workflow triggers on, so nothing else in the folder should look like 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,18 @@ from pathlib import Path
 AUDIO_TRANSCRIPT_SUFFIX = "_transcript-audio.txt"
 SCREEN_TRANSCRIPT_SUFFIX = "_transcript-screen.txt"
 DONE_MANIFEST_SUFFIX = "_done.json"
+
+_FILENAME_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_title_for_filename(title: str) -> str:
+    """Makes a meeting title safe to drop into a filename: swaps out characters Windows rejects
+    (`<>:"/\\|?*` and control characters) for a space, collapses whitespace, and trims trailing dots/
+    spaces (which Windows silently strips from a saved filename anyway, so leaving them in would make the
+    file on disk not match what the manifest says was written)."""
+    cleaned = _FILENAME_INVALID_CHARS_RE.sub(" ", title)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned or "Untitled"
 
 
 @dataclass(frozen=True)
@@ -76,11 +89,18 @@ def push_meeting_package(
 
     `text_reference_documents` (manual notes, the OCR'd attendee list) share one filename namespace with
     `reference_documents` — a real uploaded file happening to be named the same as one of these gets
-    deduped against it the same way two uploaded files would be."""
-    inbox_dir.mkdir(parents=True, exist_ok=True)
+    deduped against it the same way two uploaded files would be.
 
-    audio_filename = f"{meeting_code}{AUDIO_TRANSCRIPT_SUFFIX}"
-    screen_filename = f"{meeting_code}{SCREEN_TRANSCRIPT_SUFFIX}"
+    The transcripts and `text_reference_documents` are this app's own generated output, so their filenames
+    carry the meeting title between the meetingID and the description of what the file is (e.g.
+    `20260728-1030_Kickoff_transcript-audio.txt`) for readability in the inbox folder. Uploaded
+    `reference_documents` keep their original filename as-is — the title isn't inserted into those, since
+    the point there is to keep the file recognizable as the thing the user attached."""
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    title_part = _sanitize_title_for_filename(meeting_title)
+
+    audio_filename = f"{meeting_code}_{title_part}{AUDIO_TRANSCRIPT_SUFFIX}"
+    screen_filename = f"{meeting_code}_{title_part}{SCREEN_TRANSCRIPT_SUFFIX}"
     (inbox_dir / audio_filename).write_text(
         audio_transcript_text or "(no audio transcript captured)", encoding="utf-8"
     )
@@ -91,7 +111,7 @@ def push_meeting_package(
     used_names: set[str] = set()
     manifest_docs = []
     for text_document in text_reference_documents:
-        candidate = f"{meeting_code}_{text_document.original_filename}"
+        candidate = f"{meeting_code}_{title_part}_{text_document.original_filename}"
         saved_filename = _dedupe_filename(candidate, used_names)
         used_names.add(saved_filename)
         (inbox_dir / saved_filename).write_text(text_document.content, encoding="utf-8")

@@ -133,8 +133,12 @@ def test_session_pushes_a_named_file_package_when_sync_dir_configured(tmp_path):
             assert result == db.get_meeting(session.meeting_id).transcript_text
             inbox_dir = tmp_path / "Bridge" / "Inbox"
             code = session.meeting_code
-            audio_transcript = (inbox_dir / f"{code}_transcript-audio.txt").read_text(encoding="utf-8")
-            screen_transcript = (inbox_dir / f"{code}_transcript-screen.txt").read_text(encoding="utf-8")
+            audio_transcript = (inbox_dir / f"{code}_Kickoff_transcript-audio.txt").read_text(
+                encoding="utf-8"
+            )
+            screen_transcript = (inbox_dir / f"{code}_Kickoff_transcript-screen.txt").read_text(
+                encoding="utf-8"
+            )
             assert "hello" in audio_transcript
             assert "no on-screen text" in screen_transcript
             manifest = json.loads((inbox_dir / f"{code}_done.json").read_text(encoding="utf-8"))
@@ -210,16 +214,19 @@ def test_session_pushes_manual_notes_and_attendees_as_reference_docs(tmp_path):
 
             inbox_dir = tmp_path / "Bridge" / "Inbox"
             code = session.meeting_code
-            notes = (inbox_dir / f"{code}_meeting-notes.txt").read_text(encoding="utf-8")
-            attendees = (inbox_dir / f"{code}_attendees.txt").read_text(encoding="utf-8")
+            notes = (inbox_dir / f"{code}_Kickoff_meeting-notes.txt").read_text(encoding="utf-8")
+            attendees = (inbox_dir / f"{code}_Kickoff_attendees.txt").read_text(encoding="utf-8")
             assert notes == "Follow up with legal."
             assert attendees == "John Smith\nJane Doe"
 
             manifest = json.loads((inbox_dir / f"{code}_done.json").read_text(encoding="utf-8"))
             assert manifest["reference_count"] == 2
             assert manifest["files"]["reference_docs"] == [
-                {"original_filename": "meeting-notes.txt", "saved_filename": f"{code}_meeting-notes.txt"},
-                {"original_filename": "attendees.txt", "saved_filename": f"{code}_attendees.txt"},
+                {
+                    "original_filename": "meeting-notes.txt",
+                    "saved_filename": f"{code}_Kickoff_meeting-notes.txt",
+                },
+                {"original_filename": "attendees.txt", "saved_filename": f"{code}_Kickoff_attendees.txt"},
             ]
 
 
