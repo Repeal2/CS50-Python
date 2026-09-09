@@ -40,33 +40,43 @@ class RegionTarget:
 
 @dataclass(frozen=True)
 class WindowRegionTarget:
-    """A custom rectangle pinned to a window instead of to fixed screen coordinates: `offset_left`/
-    `offset_top` are relative to the window's own top-left corner rather than the screen's, so wherever
-    the window is when a capture runs — including if it's been dragged to another monitor since this was
-    picked — the captured rectangle moves with it. The window-relative counterpart to RegionTarget (a
-    fixed screen rectangle) for when the wanted area is "a piece of a specific window" rather than either
-    the whole window (WindowTarget) or a fixed spot on the screen."""
+    """A custom rectangle pinned to a window instead of to fixed screen coordinates: the offset and size
+    are stored as *fractions* of the window's own width/height (both 0..1) rather than fixed pixels, so
+    wherever the window is and whatever size it's at when a capture runs — moved to another monitor,
+    resized, or re-laid-out at a different DPI scale since this was picked — the captured rectangle
+    scales and moves with it, landing in roughly the same relative spot on the window. This is a
+    best-effort approximation, not exact layout tracking: it assumes whatever's inside the pinned area
+    (e.g. a captions bar) moves/resizes proportionally with the window, which holds for a simple corner
+    or edge crop but not for UI that Teams recenters or clamps to a fixed size regardless of window size.
+    The window-relative counterpart to RegionTarget (a fixed screen rectangle) for when the wanted area
+    is "a piece of a specific window" rather than either the whole window (WindowTarget) or a fixed spot
+    on the screen."""
 
     hwnd: int
     window_title: str
-    offset_left: int
-    offset_top: int
-    width: int
-    height: int
+    offset_left_frac: float
+    offset_top_frac: float
+    width_frac: float
+    height_frac: float
+    # The pixel size at the moment this was picked, kept only for the dropdown label — display purposes,
+    # not used to resolve a capture region (mss_region always derives the actual pixel size from the
+    # window's *current* dimensions, which is the whole point of storing fractions instead of pixels).
+    picked_width: int
+    picked_height: int
 
     @property
     def label(self) -> str:
-        return f"{self.window_title} — custom area ({self.width}x{self.height})"
+        return f"{self.window_title} — custom area ({self.picked_width}x{self.picked_height})"
 
     def mss_region(self, window_rect: dict) -> dict:
         """Resolves to an mss-style region given the window's *current* bounds (as returned by
-        window_picker.get_window_region) — call this fresh every capture cycle, not once, so a moved
-        window is reflected immediately."""
+        window_picker.get_window_region) — call this fresh every capture cycle, not once, so a moved,
+        resized, or rescaled window is reflected immediately."""
         return {
-            "left": window_rect["left"] + self.offset_left,
-            "top": window_rect["top"] + self.offset_top,
-            "width": self.width,
-            "height": self.height,
+            "left": round(window_rect["left"] + self.offset_left_frac * window_rect["width"]),
+            "top": round(window_rect["top"] + self.offset_top_frac * window_rect["height"]),
+            "width": round(self.width_frac * window_rect["width"]),
+            "height": round(self.height_frac * window_rect["height"]),
         }
 
 
@@ -74,17 +84,21 @@ def pin_region_to_window(
     region: RegionTarget, window: "WindowTarget", window_rect: dict
 ) -> WindowRegionTarget:
     """Converts an absolute, drag-selected RegionTarget into one pinned to `window`, using the window's
-    bounds at the moment of picking (`window_rect`, from window_picker.get_window_region) to work out the
-    offset from the window's corner. The region is expected to have been drawn somewhere on/near that
-    window, but nothing enforces that — an offset that ends up outside the window's current bounds just
-    means the pinned area doesn't overlap the window, same as picking any other area that isn't there."""
+    bounds at the moment of picking (`window_rect`, from window_picker.get_window_region) to express the
+    offset and size as fractions of the window's dimensions rather than fixed pixels — see
+    WindowRegionTarget. The region is expected to have been drawn somewhere on/near that window, but
+    nothing enforces that — an offset that ends up outside the window's current bounds just means the
+    pinned area doesn't overlap the window, same as picking any other area that isn't there. Requires a
+    non-empty window_rect (get_window_region already only returns one with positive width/height)."""
     return WindowRegionTarget(
         hwnd=window.hwnd,
         window_title=window.title,
-        offset_left=region.left - window_rect["left"],
-        offset_top=region.top - window_rect["top"],
-        width=region.width,
-        height=region.height,
+        offset_left_frac=(region.left - window_rect["left"]) / window_rect["width"],
+        offset_top_frac=(region.top - window_rect["top"]) / window_rect["height"],
+        width_frac=region.width / window_rect["width"],
+        height_frac=region.height / window_rect["height"],
+        picked_width=region.width,
+        picked_height=region.height,
     )
 
 

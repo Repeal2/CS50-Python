@@ -9,6 +9,7 @@ and so starting the next meeting doesn't have to wait for the previous one to fi
 from __future__ import annotations
 
 import re
+import sys
 import threading
 import tkinter as tk
 import traceback
@@ -72,8 +73,32 @@ def _set_text(widget: tk.Text, content: str) -> None:
     widget.insert("1.0", content)
 
 
+def _enable_per_monitor_dpi_awareness() -> None:
+    """Marks this process per-monitor DPI aware, so Windows reports actual physical-pixel window and
+    monitor coordinates instead of scaling them to match whatever DPI setting the *primary* monitor
+    happens to use. Without this, a DPI-unaware process gets coordinates that Windows silently
+    virtualizes for it on any other monitor with a different scale factor — which would throw off
+    win32gui.GetWindowRect (window_picker) and mss's screen capture, and make this app's own picker
+    overlay and region outline render blurry or the wrong size/position on such a monitor. Must run
+    before any window is created, including this Tk root, which is why MeetingScribeApp.__init__ calls
+    it before super().__init__(). A failure here (e.g. shcore.dll missing on a very old Windows version)
+    just leaves the process at its default awareness rather than crashing the app over it."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE (Windows 8.1+)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # coarser system-DPI-aware fallback (Vista+)
+        except (AttributeError, OSError):
+            pass  # very old Windows with neither API — just runs DPI-unaware, as it always did
+
+
 class MeetingScribeApp(tk.Tk):
     def __init__(self, settings: Settings | None = None):
+        _enable_per_monitor_dpi_awareness()
         super().__init__()
         self.title("Meeting Scribe")
         self.geometry("980x680")
