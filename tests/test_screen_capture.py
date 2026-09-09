@@ -5,7 +5,7 @@ from meeting_scribe.screen.capture import (
     _new_lines,
     _ocr_region_once,
 )
-from meeting_scribe.screen.region_picker import RegionTarget
+from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
 
 
 class FakeShot:
@@ -178,6 +178,39 @@ def test_resolve_region_returns_the_fixed_rectangle_for_a_region_target():
     watcher = ScreenWatcher(on_text=lambda e: None, target=target)
 
     assert watcher._resolve_region(sct=None) == {"left": 10, "top": 20, "width": 300, "height": 200}
+
+
+def test_resolve_region_tracks_a_window_pinned_custom_area_to_its_current_position(monkeypatch):
+    """A WindowRegionTarget's absolute position should follow the pinned window wherever it currently
+    is — including a move to another monitor — rather than staying at the screen coordinates it was
+    drawn at."""
+    import meeting_scribe.screen.window_picker as window_picker
+
+    target = WindowRegionTarget(
+        hwnd=42, window_title="Microsoft Teams", offset_left=10, offset_top=20, width=300, height=80
+    )
+    watcher = ScreenWatcher(on_text=lambda e: None, target=target)
+
+    current_rect = {"left": 100, "top": 200, "width": 900, "height": 700}
+    monkeypatch.setattr(window_picker, "get_window_region", lambda hwnd: current_rect)
+    assert watcher._resolve_region(sct=None) == {"left": 110, "top": 220, "width": 300, "height": 80}
+
+    # The window moved to a second monitor to the left of the primary one (negative coordinates) -> the
+    # captured rectangle moves by the same amount, staying pinned to the same spot on the window.
+    current_rect = {"left": -1920, "top": 50, "width": 900, "height": 700}
+    assert watcher._resolve_region(sct=None) == {"left": -1910, "top": 70, "width": 300, "height": 80}
+
+
+def test_resolve_region_returns_none_when_the_pinned_window_has_closed(monkeypatch):
+    import meeting_scribe.screen.window_picker as window_picker
+
+    target = WindowRegionTarget(
+        hwnd=42, window_title="Microsoft Teams", offset_left=10, offset_top=20, width=300, height=80
+    )
+    watcher = ScreenWatcher(on_text=lambda e: None, target=target)
+    monkeypatch.setattr(window_picker, "get_window_region", lambda hwnd: None)
+
+    assert watcher._resolve_region(sct=None) is None
 
 
 def test_resolve_region_returns_the_whole_virtual_screen_with_no_target():

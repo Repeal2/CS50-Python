@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from meeting_scribe.screen.region_picker import RegionTarget
+from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
 from meeting_scribe.screen.window_picker import WindowTarget
 
 # Tuned to reject short/symbol-heavy OCR misreads of UI chrome (avatar initials like "MB", icon rows
@@ -118,7 +118,7 @@ class ScreenWatcher:
         on_text: Callable[[ScreenTextEvent], None],
         interval_seconds: float = 3.0,
         tesseract_cmd: str | None = None,
-        target: WindowTarget | RegionTarget | None = None,
+        target: WindowTarget | RegionTarget | WindowRegionTarget | None = None,
         settle_seconds: float = 0.15,
     ):
         self._on_text = on_text
@@ -164,8 +164,9 @@ class ScreenWatcher:
         self._flush_pending()
 
     def _resolve_region(self, sct) -> dict | None:
-        """Returns the mss region to capture: the whole virtual screen, a fixed user-drawn rectangle,
-        or the selected window's current bounds — None if a selected window has since closed or been
+        """Returns the mss region to capture: the whole virtual screen, a fixed user-drawn rectangle, a
+        user-drawn rectangle pinned to a window's current position, or the selected window's current
+        bounds — None if a selected window (pinned-area or whole-window) has since closed or been
         minimized, in which case the caller skips that capture cycle rather than falling back to the
         whole screen."""
         if self._target is None:
@@ -174,6 +175,9 @@ class ScreenWatcher:
             return self._target.mss_region
         from meeting_scribe.screen.window_picker import get_window_region
 
+        if isinstance(self._target, WindowRegionTarget):
+            window_rect = get_window_region(self._target.hwnd)
+            return None if window_rect is None else self._target.mss_region(window_rect)
         return get_window_region(self._target.hwnd)
 
     def _grab_stable_frame(self, sct, region, Image):

@@ -18,7 +18,7 @@ from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocum
 from meeting_scribe.audio.recorder import Recorder
 from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
-from meeting_scribe.screen.region_picker import RegionTarget
+from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
 from meeting_scribe.screen.window_picker import WindowTarget
 from meeting_scribe.storage.database import Database
 from meeting_scribe.transcription.engine import (
@@ -36,10 +36,12 @@ class MeetingSession:
         db: Database,
         project_name: str,
         title: str,
-        screen_target: WindowTarget | RegionTarget | None = None,
+        screen_target: WindowTarget | RegionTarget | WindowRegionTarget | None = None,
     ):
-        """`screen_target` selects a single window, or a fixed user-drawn rectangle, to OCR instead of
-        the whole screen — e.g. just the Teams/Zoom window, or just a captions bar. Leave it None to
+        """`screen_target` selects a single window, a fixed user-drawn rectangle, or a user-drawn
+        rectangle pinned to a window's current position, to OCR instead of the whole screen — e.g. just
+        the Teams/Zoom window, just a captions bar, or just a corner of the Teams window that keeps
+        capturing that same corner even if the window is moved to another monitor. Leave it None to
         capture the whole screen."""
         self._settings = settings
         self._db = db

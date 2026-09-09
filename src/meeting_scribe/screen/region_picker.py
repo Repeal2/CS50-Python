@@ -17,6 +17,8 @@ from dataclasses import dataclass
 if typing.TYPE_CHECKING:
     import tkinter as tk
 
+    from meeting_scribe.screen.window_picker import WindowTarget
+
 MIN_REGION_SIZE = 8
 
 
@@ -34,6 +36,56 @@ class RegionTarget:
     @property
     def mss_region(self) -> dict:
         return {"left": self.left, "top": self.top, "width": self.width, "height": self.height}
+
+
+@dataclass(frozen=True)
+class WindowRegionTarget:
+    """A custom rectangle pinned to a window instead of to fixed screen coordinates: `offset_left`/
+    `offset_top` are relative to the window's own top-left corner rather than the screen's, so wherever
+    the window is when a capture runs — including if it's been dragged to another monitor since this was
+    picked — the captured rectangle moves with it. The window-relative counterpart to RegionTarget (a
+    fixed screen rectangle) for when the wanted area is "a piece of a specific window" rather than either
+    the whole window (WindowTarget) or a fixed spot on the screen."""
+
+    hwnd: int
+    window_title: str
+    offset_left: int
+    offset_top: int
+    width: int
+    height: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.window_title} — custom area ({self.width}x{self.height})"
+
+    def mss_region(self, window_rect: dict) -> dict:
+        """Resolves to an mss-style region given the window's *current* bounds (as returned by
+        window_picker.get_window_region) — call this fresh every capture cycle, not once, so a moved
+        window is reflected immediately."""
+        return {
+            "left": window_rect["left"] + self.offset_left,
+            "top": window_rect["top"] + self.offset_top,
+            "width": self.width,
+            "height": self.height,
+        }
+
+
+def pin_region_to_window(
+    region: RegionTarget, window: "WindowTarget", window_rect: dict
+) -> WindowRegionTarget:
+    """Converts an absolute, drag-selected RegionTarget into one pinned to `window`, using the window's
+    bounds at the moment of picking (`window_rect`, from window_picker.get_window_region) to work out the
+    offset from the window's corner. The region is expected to have been drawn somewhere on/near that
+    window, but nothing enforces that — an offset that ends up outside the window's current bounds just
+    means the pinned area doesn't overlap the window, same as picking any other area that isn't there."""
+    return WindowRegionTarget(
+        hwnd=window.hwnd,
+        window_title=window.title,
+        offset_left=region.left - window_rect["left"],
+        offset_top=region.top - window_rect["top"],
+        width=region.width,
+        height=region.height,
+    )
 
 
 def _region_from_drag(x1: int, y1: int, x2: int, y2: int) -> RegionTarget | None:
@@ -129,28 +181,35 @@ def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
     return state["result"]
 
 
-def _frame_geometries(target: RegionTarget, thickness: int) -> tuple[str, str, str, str]:
+def _frame_geometries(rect: dict, thickness: int) -> tuple[str, str, str, str]:
     """Tk geometry strings ("WxH+X+Y") for four thin strips forming a hollow frame just *outside*
-    `target`'s bounds — outside, not on top of it, so the border itself never ends up inside the
-    captured region and doesn't contaminate the OCR frame. Order: top, bottom, left, right."""
-    outer_width = target.width + 2 * thickness
-    top = f"{outer_width}x{thickness}+{target.left - thickness}+{target.top - thickness}"
-    bottom = f"{outer_width}x{thickness}+{target.left - thickness}+{target.top + target.height}"
-    left = f"{thickness}x{target.height}+{target.left - thickness}+{target.top}"
-    right = f"{thickness}x{target.height}+{target.left + target.width}+{target.top}"
-    return top, bottom, left, right
+    `rect`'s bounds (an mss-style {left, top, width, height} dict — RegionTarget.mss_region or
+    WindowRegionTarget.mss_region both produce one) — outside, not on top of it, so the border itself
+    never ends up inside the captured region and doesn't contaminate the OCR frame. Order: top, bottom,
+    left, right."""
+    left, top, width, height = rect["left"], rect["top"], rect["width"], rect["height"]
+    outer_width = width + 2 * thickness
+    frame_top = f"{outer_width}x{thickness}+{left - thickness}+{top - thickness}"
+    bottom = f"{outer_width}x{thickness}+{left - thickness}+{top + height}"
+    frame_left = f"{thickness}x{height}+{left - thickness}+{top}"
+    right = f"{thickness}x{height}+{left + width}+{top}"
+    return frame_top, bottom, frame_left, right
 
 
 class RegionOutline:
-    """A thin, always-on-top border drawn around a RegionTarget so the user can see — for as long as
-    it's the selected screen source, not just at the moment they picked it — exactly what's being
+    """A thin, always-on-top border drawn around a capture rectangle so the user can see — for as long
+    as it's the selected screen source, not just at the moment they picked it — exactly what's being
     captured. Four separate borderless windows form a hollow frame rather than one covering the whole
-    region, so nothing sits on top of (or is captured as part of) the content underneath."""
+    region, so nothing sits on top of (or is captured as part of) the content underneath.
+
+    Takes a plain mss-style rect rather than a RegionTarget so it also works for a WindowRegionTarget,
+    whose absolute position depends on the pinned window's current bounds rather than being fixed —
+    `reposition()` lets the caller re-draw the frame around wherever that window has moved to."""
 
     THICKNESS = 3
     COLOR = "#00e5ff"
 
-    def __init__(self, parent: "tk.Misc", target: RegionTarget):
+    def __init__(self, parent: "tk.Misc", rect: dict):
         import tkinter as tk
 
         self._parts = [tk.Toplevel(parent) for _ in range(4)]
@@ -158,7 +217,10 @@ class RegionOutline:
             part.overrideredirect(True)
             part.attributes("-topmost", True)
             part.configure(bg=self.COLOR)
-        for part, geometry in zip(self._parts, _frame_geometries(target, self.THICKNESS)):
+        self.reposition(rect)
+
+    def reposition(self, rect: dict) -> None:
+        for part, geometry in zip(self._parts, _frame_geometries(rect, self.THICKNESS)):
             part.geometry(geometry)
 
     def close(self) -> None:

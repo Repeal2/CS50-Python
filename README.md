@@ -18,7 +18,10 @@ saves everything locally, and pushes.
   messages become part of the transcript even if they're never spoken aloud. You can point this at the
   whole screen, a single selected window (e.g. just the Teams/Zoom window), or a custom rectangle you
   drag out yourself (e.g. just a captions bar) — the app draws a live boundary around whichever custom
-  area is active so it's always visible on screen what's being captured.
+  area is active so it's always visible on screen what's being captured. A custom rectangle can also be
+  pinned to a window ("Pin area to window" next to "Select area…") instead of a fixed screen position —
+  e.g. just the captions bar within the Teams window — so dragging that window to another monitor moves
+  the captured area (and its on-screen outline) with it, the same way whole-window capture already does.
 - **Transcribes** the recorded audio locally (no audio ever leaves the machine) and merges it with the
   OCR stream into one time-ordered transcript. This — plus the push to Copilot Studio below — happens in
   the background after you hit Stop, so it doesn't block starting the next meeting right away; the
@@ -266,6 +269,7 @@ everything together but likewise needs a Windows desktop session to click throug
 - Speaker diarization (who said what) — faster-whisper alone doesn't separate speakers; mic vs. system
   audio gives a coarse "you" vs. "everyone else" split today.
 - Auto-detect meeting start (e.g. when Teams/Zoom is foregrounded) instead of a manual start button.
-- A selected window that's moved to another monitor still captures correctly (bounds are re-read every
-  cycle), but there's no UI feedback yet if the selected window closes mid-meeting — it just silently
-  stops contributing screen text for the rest of the meeting.
+- A selected window (or a custom area pinned to one) that's moved to another monitor still captures
+  correctly (bounds are re-read every cycle), but there's no UI feedback yet if the selected/pinned
+  window closes mid-meeting — it just silently stops contributing screen text for the rest of the
+  meeting.
