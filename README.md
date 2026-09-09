@@ -18,7 +18,11 @@ saves everything locally, and pushes.
   messages become part of the transcript even if they're never spoken aloud. You can point this at the
   whole screen, a single selected window (e.g. just the Teams/Zoom window), or a custom rectangle you
   drag out yourself (e.g. just a captions bar) — the app draws a live boundary around whichever custom
-  area is active so it's always visible on screen what's being captured.
+  area is active so it's always visible on screen what's being captured. A custom rectangle can also be
+  pinned to a window ("Pin area to window" next to "Select area…") instead of a fixed screen position —
+  e.g. just the captions bar within the Teams window — so the captured area (and its on-screen outline)
+  moves and scales with that window: dragged to another monitor, resized, or re-laid-out at a different
+  per-monitor DPI scale, it stays in roughly the same relative spot rather than at fixed screen pixels.
 - **Transcribes** the recorded audio locally (no audio ever leaves the machine) and merges it with the
   OCR stream into one time-ordered transcript. This — plus the push to Copilot Studio below — happens in
   the background after you hit Stop, so it doesn't block starting the next meeting right away; the
@@ -70,6 +74,7 @@ saves everything locally, and pushes.
 | Screen OCR | [pytesseract](https://github.com/madmaze/pytesseract) (wraps Tesseract) | Lightweight, no GPU, no ML runtime to bundle — important for a single-file Windows executable. Requires the Tesseract binary (see Packaging). |
 | System audio capture | [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) | A PyAudio fork with WASAPI loopback support, i.e. it can record "what the speakers are playing" on Windows without a virtual audio cable. |
 | Window selection for OCR | [pywin32](https://github.com/mhammond/pywin32) (`win32gui`) | Enumerates open windows and re-reads a selected window's bounding box every capture cycle (it may move/resize), so OCR can be scoped to one app instead of the whole desktop. |
+| Multi-monitor DPI coordinates | Per-monitor DPI awareness (`shcore.SetProcessDpiAwareness`, set before any window is created) | Without this, Windows virtualizes window/monitor coordinates for the process on any monitor that isn't running the primary monitor's DPI scale, which would throw `GetWindowRect` and mss's screen capture out of sync with each other on a mixed-DPI multi-monitor setup. |
 | Handoff to Copilot Studio | One-way file drop (see below), no API call, no response | Governance doesn't allow calling a third-party AI API directly. This app's scope ends at recording and handing off; managing/parsing the information is Copilot Studio's job, not this app's. |
 | Packaging | PyInstaller, one-file build | Produces the standalone `.exe` the project requires. |
 | GUI | Tkinter | Ships with Python, keeps the PyInstaller build small and dependency-free. |
@@ -274,6 +279,12 @@ everything together but likewise needs a Windows desktop session to click throug
 - Speaker diarization (who said what) — faster-whisper alone doesn't separate speakers; mic vs. system
   audio gives a coarse "you" vs. "everyone else" split today.
 - Auto-detect meeting start (e.g. when Teams/Zoom is foregrounded) instead of a manual start button.
-- A selected window that's moved to another monitor still captures correctly (bounds are re-read every
-  cycle), but there's no UI feedback yet if the selected window closes mid-meeting — it just silently
-  stops contributing screen text for the rest of the meeting.
+- A selected window (or a custom area pinned to one) that's moved to another monitor, or resized, still
+  captures correctly (bounds are re-read every cycle, and a pinned area's offset/size scale with the
+  window rather than staying at fixed pixels), but there's no UI feedback yet if the selected/pinned
+  window closes mid-meeting — it just silently stops contributing screen text for the rest of the
+  meeting.
+- A pinned custom area's proportional scaling is a best-effort approximation, not real layout tracking:
+  it assumes whatever's inside the area moves/resizes in proportion to the window, which holds for a
+  simple corner/edge crop but not for UI an app clamps to a fixed size or recenters regardless of window
+  size — that could still need re-picking after a big resize.

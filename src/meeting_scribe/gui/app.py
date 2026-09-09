@@ -9,6 +9,7 @@ and so starting the next meeting doesn't have to wait for the previous one to fi
 from __future__ import annotations
 
 import re
+import sys
 import threading
 import tkinter as tk
 import traceback
@@ -23,7 +24,13 @@ from meeting_scribe.config import (
     update_copilot_settings,
 )
 from meeting_scribe.screen.capture import ocr_region
-from meeting_scribe.screen.region_picker import RegionOutline, RegionTarget, pick_region_interactively
+from meeting_scribe.screen.region_picker import (
+    RegionOutline,
+    RegionTarget,
+    WindowRegionTarget,
+    pick_region_interactively,
+    pin_region_to_window,
+)
 from meeting_scribe.session import MeetingSession
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
@@ -66,8 +73,32 @@ def _set_text(widget: tk.Text, content: str) -> None:
     widget.insert("1.0", content)
 
 
+def _enable_per_monitor_dpi_awareness() -> None:
+    """Marks this process per-monitor DPI aware, so Windows reports actual physical-pixel window and
+    monitor coordinates instead of scaling them to match whatever DPI setting the *primary* monitor
+    happens to use. Without this, a DPI-unaware process gets coordinates that Windows silently
+    virtualizes for it on any other monitor with a different scale factor — which would throw off
+    win32gui.GetWindowRect (window_picker) and mss's screen capture, and make this app's own picker
+    overlay and region outline render blurry or the wrong size/position on such a monitor. Must run
+    before any window is created, including this Tk root, which is why MeetingScribeApp.__init__ calls
+    it before super().__init__(). A failure here (e.g. shcore.dll missing on a very old Windows version)
+    just leaves the process at its default awareness rather than crashing the app over it."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE (Windows 8.1+)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # coarser system-DPI-aware fallback (Vista+)
+        except (AttributeError, OSError):
+            pass  # very old Windows with neither API — just runs DPI-unaware, as it always did
+
+
 class MeetingScribeApp(tk.Tk):
     def __init__(self, settings: Settings | None = None):
+        _enable_per_monitor_dpi_awareness()
         super().__init__()
         self.title("Meeting Scribe")
         self.geometry("980x680")
@@ -132,12 +163,13 @@ class MeetingScribeApp(tk.Tk):
 
 class RecordTab(ttk.Frame):
     ENTIRE_SCREEN_LABEL = "Entire screen"
+    PIN_NONE_LABEL = "(fixed position)"
 
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
         self.app = app
         self._window_targets: list = []
-        self._region_target: RegionTarget | None = None
+        self._region_target: RegionTarget | WindowRegionTarget | None = None
         self._region_outline: RegionOutline | None = None
         self._input_devices: list = []
         self._loopback_devices: list = []
@@ -180,22 +212,34 @@ class RecordTab(ttk.Frame):
             side="left", padx=(4, 0)
         )
 
-        ttk.Label(form, text="Microphone").grid(row=3, column=0, sticky="w")
+        # "(fixed position)" keeps the area at whatever screen coordinates it was drawn at; picking a
+        # window here instead pins it to that window's current bounds, so a later "Select area…" makes
+        # a WindowRegionTarget (offset from the window's corner) rather than a plain RegionTarget — see
+        # _pick_region. Moving/dragging that window afterwards, including to another monitor, moves the
+        # captured area with it, the same way whole-window capture already does.
+        ttk.Label(form, text="Pin area to window").grid(row=3, column=0, sticky="w")
+        self.pin_window_var = tk.StringVar(value=self.PIN_NONE_LABEL)
+        self.pin_window_combo = ttk.Combobox(
+            form, textvariable=self.pin_window_var, width=40, state="readonly"
+        )
+        self.pin_window_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
+
+        ttk.Label(form, text="Microphone").grid(row=4, column=0, sticky="w")
         self.mic_var = tk.StringVar(value=self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
         self.mic_combo = ttk.Combobox(form, textvariable=self.mic_var, width=40, state="readonly")
-        self.mic_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
+        self.mic_combo.grid(row=4, column=1, sticky="we", padx=6, pady=4)
         self.mic_combo.bind("<<ComboboxSelected>>", self._on_devices_changed)
 
-        ttk.Label(form, text="System audio (speaker)").grid(row=4, column=0, sticky="w")
+        ttk.Label(form, text="System audio (speaker)").grid(row=5, column=0, sticky="w")
         self.system_var = tk.StringVar(
             value=self.app.settings.system_device_name or SYSTEM_DEFAULT_LABEL
         )
         self.system_combo = ttk.Combobox(form, textvariable=self.system_var, width=40, state="readonly")
-        self.system_combo.grid(row=4, column=1, sticky="we", padx=6, pady=4)
+        self.system_combo.grid(row=5, column=1, sticky="we", padx=6, pady=4)
         self.system_combo.bind("<<ComboboxSelected>>", self._on_devices_changed)
 
         ttk.Button(form, text="Refresh devices", command=self._refresh_devices).grid(
-            row=3, column=2, rowspan=2, padx=(6, 0)
+            row=4, column=2, rowspan=2, padx=(6, 0)
         )
         form.columnconfigure(1, weight=1)
 
@@ -276,6 +320,7 @@ class RecordTab(ttk.Frame):
         self._refresh_windows()
         self._refresh_devices()
         self._poll_audio_levels()
+        self._poll_region_outline()
 
     def refresh_projects(self) -> None:
         names = [p.name for p in self.app.db.list_projects()]
@@ -312,6 +357,17 @@ class RecordTab(ttk.Frame):
         self.system_level_bar["value"] = system_level * 100
         self.after(150, self._poll_audio_levels)
 
+    def _poll_region_outline(self) -> None:
+        """Keeps a window-pinned custom area's on-screen outline glued to its window as the window
+        moves — including across monitors — by re-reading the window's current bounds on a timer, the
+        same idea as _poll_audio_levels. A plain (unpinned) area never moves, so there's nothing to do
+        for it here; _sync_region_outline positions it once, when it's picked or selected."""
+        if self._region_outline is not None and isinstance(self._region_target, WindowRegionTarget):
+            rect = self._current_absolute_rect(self._region_target)
+            if rect is not None:
+                self._region_outline.reposition(rect)
+        self.after(400, self._poll_region_outline)
+
     def select_project(self, name: str) -> None:
         self.project_var.set(name)
 
@@ -324,7 +380,9 @@ class RecordTab(ttk.Frame):
     def _refresh_windows(self) -> None:
         """Repopulates the screen-source dropdown with currently open, titled windows the user can
         pick as an OCR target instead of the whole screen (e.g. just the Teams/Zoom window). Keeps
-        whatever custom area is currently picked (if any) as an option alongside them."""
+        whatever custom area is currently picked (if any) as an option alongside them. Also repopulates
+        the "pin area to window" dropdown from the same window list, so a window that's closed since the
+        last refresh disappears from both."""
         from meeting_scribe.screen.window_picker import list_capturable_windows
 
         try:
@@ -336,29 +394,64 @@ class RecordTab(ttk.Frame):
         self.source_combo["values"] = values
         if self.source_var.get() not in values:
             self.source_var.set(self.ENTIRE_SCREEN_LABEL)
+
+        pin_values = [self.PIN_NONE_LABEL] + [w.title for w in self._window_targets]
+        self.pin_window_combo["values"] = pin_values
+        if self.pin_window_var.get() not in pin_values:
+            self.pin_window_var.set(self.PIN_NONE_LABEL)
         self._sync_region_outline()
 
     def _pick_region(self) -> None:
         """Opens the drag-to-select overlay, and if the user completes a selection, adds it to the
-        screen-source dropdown as a new option and switches to it immediately."""
+        screen-source dropdown as a new option and switches to it immediately. If a window is chosen in
+        the "pin area to window" dropdown, the drawn rectangle is converted to an offset from that
+        window's current position (WindowRegionTarget) instead of a fixed screen rectangle, so it keeps
+        capturing the same part of the window even after the window moves — including to another
+        monitor. A window that's closed/minimized right when "Select area…" is clicked has no current
+        position to measure the offset from, so that case falls back to a fixed-position area, same as
+        leaving the pin dropdown on "(fixed position)"."""
         region = pick_region_interactively(self)
         if region is None:
             return
+
+        window = next((w for w in self._window_targets if w.title == self.pin_window_var.get()), None)
+        if window is not None:
+            from meeting_scribe.screen.window_picker import get_window_region
+
+            window_rect = get_window_region(window.hwnd)
+            if window_rect is not None:
+                region = pin_region_to_window(region, window, window_rect)
+
         self._region_target = region
         self._refresh_windows()
         self.source_var.set(region.label)
         self._sync_region_outline()
 
+    def _current_absolute_rect(self, target: RegionTarget | WindowRegionTarget) -> dict | None:
+        """Resolves a region target to an mss-style {left, top, width, height} rect in current screen
+        coordinates — a fixed RegionTarget already is one; a WindowRegionTarget needs its pinned
+        window's current bounds re-read first. None if a pinned window has since closed or minimized,
+        in which case there's nowhere on screen to draw the outline right now."""
+        if isinstance(target, RegionTarget):
+            return target.mss_region
+        from meeting_scribe.screen.window_picker import get_window_region
+
+        window_rect = get_window_region(target.hwnd)
+        return None if window_rect is None else target.mss_region(window_rect)
+
     def _sync_region_outline(self) -> None:
         """Shows a live boundary around the custom area on screen for as long as it's the selected
         screen source — not just at the moment it was drawn — so it's always obvious what's being
         captured, the same idea as the audio level meters. Hides it the moment something else is
-        picked instead."""
+        picked instead. For a window-pinned area this only sets the *initial* position;
+        _poll_region_outline keeps it glued to the window's current position afterwards."""
         if self._region_outline is not None:
             self._region_outline.close()
             self._region_outline = None
         if self._region_target is not None and self.source_var.get() == self._region_target.label:
-            self._region_outline = RegionOutline(self, self._region_target)
+            rect = self._current_absolute_rect(self._region_target)
+            if rect is not None:
+                self._region_outline = RegionOutline(self, rect)
 
     def close_region_outline(self) -> None:
         """Called when a meeting stops (nothing is being captured anymore, so the boundary shouldn't
