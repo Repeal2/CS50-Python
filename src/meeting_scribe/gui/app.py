@@ -164,6 +164,8 @@ class MeetingScribeApp(tk.Tk):
 class RecordTab(ttk.Frame):
     ENTIRE_SCREEN_LABEL = "Entire screen"
     PIN_NONE_LABEL = "(fixed position)"
+    # Long enough to say a sentence into the microphone, short enough that nobody skips the test.
+    MIC_TEST_SECONDS = 3.0
 
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
@@ -173,10 +175,11 @@ class RecordTab(ttk.Frame):
         self._region_outline: RegionOutline | None = None
         self._input_devices: list = []
         self._loopback_devices: list = []
-        # Which session's capture errors have already been written to the activity log, and how many of
-        # them — see _log_new_capture_errors.
-        self._capture_error_session = None
-        self._capture_errors_logged = 0
+        # Which session's recorder notices have already been written to the activity log, how many of
+        # them, and which live input problems have been mentioned — see _refresh_input_warnings.
+        self._notice_session = None
+        self._notices_logged = 0
+        self._logged_input_problems: set[str] = set()
 
         form = ttk.Frame(self)
         form.pack(fill="x", padx=12, pady=12)
@@ -242,9 +245,15 @@ class RecordTab(ttk.Frame):
         self.system_combo.grid(row=5, column=1, sticky="we", padx=6, pady=4)
         self.system_combo.bind("<<ComboboxSelected>>", self._on_devices_changed)
 
-        ttk.Button(form, text="Refresh devices", command=self._refresh_devices).grid(
-            row=4, column=2, rowspan=2, padx=(6, 0)
+        device_buttons = ttk.Frame(form)
+        device_buttons.grid(row=4, column=2, rowspan=2, padx=(6, 0))
+        ttk.Button(device_buttons, text="Refresh devices", command=self._refresh_devices).pack(fill="x")
+        # Before a meeting is the only moment when a quiet microphone is unambiguous — the user knows
+        # they're supposed to be making noise — and the moment when fixing it costs nothing.
+        self.test_mic_button = ttk.Button(
+            device_buttons, text="Test mic…", command=self._test_microphone
         )
+        self.test_mic_button.pack(fill="x", pady=(4, 0))
         form.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(self)
@@ -279,6 +288,19 @@ class RecordTab(ttk.Frame):
         )
         self.system_level_bar.grid(row=1, column=1, sticky="we", padx=(6, 0), pady=(2, 0))
         levels_frame.columnconfigure(1, weight=1)
+
+        # A meter can't distinguish "muted" from "nobody is talking" — this is where the app says which
+        # it thinks it is. Blank whenever both inputs look healthy, so anything showing here is worth
+        # reading. Deliberately inline rather than a dialog: a modal popping up mid-meeting would steal
+        # focus from the call it's warning about.
+        self.input_warning_var = tk.StringVar(value="")
+        ttk.Label(
+            self,
+            textvariable=self.input_warning_var,
+            foreground="#b00020",
+            wraplength=900,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(4, 0))
 
         # Manual notes and the activity log split the remaining vertical space evenly: both frames below
         # use fill="both", expand=True inside the same parent, and Tkinter's pack geometry manager
@@ -359,24 +381,76 @@ class RecordTab(ttk.Frame):
         mic_level, system_level = session.audio_levels() if session is not None else (0.0, 0.0)
         self.mic_level_bar["value"] = mic_level * 100
         self.system_level_bar["value"] = system_level * 100
-        if session is not None:
-            self._log_new_capture_errors(session)
+        self._refresh_input_warnings(session)
         self.after(150, self._poll_audio_levels)
 
-    def _log_new_capture_errors(self, session) -> None:
-        """Reports a capture stream that has died mid-meeting, once each, as it happens.
+    def _refresh_input_warnings(self, session) -> None:
+        """Surfaces anything wrong with what's being captured, while the meeting can still be fixed.
 
-        The level meters alone can't tell this story: a microphone whose capture thread has fallen over
-        reads exactly like a microphone nobody is talking into. Saying it out loud in the activity log
-        is the difference between noticing now — while the meeting could still be restarted — and
-        finding out when the transcript comes back with one side of the conversation missing."""
-        if session is not self._capture_error_session:
-            self._capture_error_session = session
-            self._capture_errors_logged = 0
-        errors = session.capture_errors()
-        for message in errors[self._capture_errors_logged:]:
+        The level meters alone can't tell this story: a microphone whose capture thread has fallen over,
+        or that was never the right device, reads exactly like a microphone nobody is talking into.
+        Recorder notices (a dead capture thread, a substituted device) are statements of fact and go
+        straight to the activity log, once each. Input problems (silence, clipping) are a live judgement
+        that can correct itself, so they hold the warning line for as long as they last and are logged
+        the first time each appears — noticing now beats finding out when the transcript comes back with
+        one side of the conversation missing."""
+        if session is not self._notice_session:
+            self._notice_session = session
+            self._notices_logged = 0
+            self._logged_input_problems = set()
+        if session is None:
+            self.input_warning_var.set("")
+            return
+
+        notices = session.capture_notices()
+        for message in notices[self._notices_logged:]:
             self._log(f"[{session.title}] {message}")
-        self._capture_errors_logged = len(errors)
+        self._notices_logged = len(notices)
+
+        problems = session.input_problems()
+        self.input_warning_var.set("\n".join(problems))
+        for problem in problems:
+            if problem not in self._logged_input_problems:
+                self._logged_input_problems.add(problem)
+                self._log(f"[{session.title}] {problem}")
+
+    def _test_microphone(self) -> None:
+        """Listens to the selected microphone for a few seconds and reports what it actually heard.
+
+        Runs off the GUI thread — it's a few seconds of blocking stream reads — and works whether or not
+        a meeting is recording, since WASAPI shared mode lets the same device be opened twice and "has
+        my mic gone dead?" is exactly the question you want to answer mid-meeting."""
+        from meeting_scribe.audio.recorder import check_input_device
+
+        device_name = None if self.mic_var.get() == SYSTEM_DEFAULT_LABEL else self.mic_var.get()
+        self.test_mic_button["state"] = "disabled"
+        self.test_mic_button["text"] = "Listening…"
+        self._log(f"Mic test: listening for {self.MIC_TEST_SECONDS:.0f}s — say something.")
+
+        def worker() -> None:
+            try:
+                result = check_input_device(device_name, seconds=self.MIC_TEST_SECONDS)
+            except Exception as exc:  # surfaced to the user regardless of cause
+                self.after(0, self._on_mic_test_failed, exc)
+                return
+            self.after(0, self._on_mic_test_done, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mic_test_done(self, result) -> None:
+        self._reset_test_mic_button()
+        self._log(f"Mic test: {result.summary}")
+        show = messagebox.showinfo if result.is_ok else messagebox.showwarning
+        show("Meeting Scribe", result.summary)
+
+    def _on_mic_test_failed(self, exc: Exception) -> None:
+        self._reset_test_mic_button()
+        self._log(f"Mic test failed: {exc}")
+        messagebox.showerror("Meeting Scribe", f"Couldn't test that microphone: {exc}")
+
+    def _reset_test_mic_button(self) -> None:
+        self.test_mic_button["state"] = "normal"
+        self.test_mic_button["text"] = "Test mic…"
 
     def _poll_region_outline(self) -> None:
         """Keeps a window-pinned custom area's on-screen outline glued to its window as the window
@@ -961,10 +1035,6 @@ class SettingsTab(ttk.Frame):
         self.app = app
         self._input_devices: list = []
         self._loopback_devices: list = []
-        # Which session's capture errors have already been written to the activity log, and how many of
-        # them — see _log_new_capture_errors.
-        self._capture_error_session = None
-        self._capture_errors_logged = 0
 
         form = ttk.Frame(self)
         form.pack(fill="x", padx=12, pady=12, anchor="n")

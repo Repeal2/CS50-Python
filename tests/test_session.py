@@ -444,7 +444,7 @@ def test_session_reports_a_capture_stream_that_died_mid_meeting(tmp_path):
             mic_paths=(tmp_path / "mic.wav",),
             system_paths=(tmp_path / "system.wav",),
             started_at_monotonic=0.0,
-            errors=("Microphone capture stopped early: OSError: device disconnected",),
+            notices=("Microphone capture stopped early: OSError: device disconnected",),
         )
         MockTranscriber.return_value.transcribe_parts.return_value = []
 
@@ -484,3 +484,24 @@ def test_session_transcribes_every_recorded_part(tmp_path):
             session.stop()
 
             MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic")
+
+
+def test_session_reads_input_health_through_to_the_recorder(tmp_path):
+    # The Record tab polls these while a meeting runs, so a misconfigured input is caught during the
+    # meeting rather than in the transcript afterwards.
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        recorder_instance = MockRecorder.return_value
+        recorder_instance.capture_notices.return_value = ("Microphone 'Jabra' isn't available",)
+        recorder_instance.input_problems.return_value = ("Microphone: no signal at all",)
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+
+            assert session.capture_notices() == ("Microphone 'Jabra' isn't available",)
+            assert session.input_problems() == ("Microphone: no signal at all",)

@@ -78,11 +78,18 @@ class MeetingSession:
         picking up audio" meter while recording. Both are 0.0 before start() or after stop()."""
         return self._recorder.mic_level, self._recorder.system_level
 
-    def capture_errors(self) -> tuple[str, ...]:
-        """Anything that has killed one of the recorder's capture threads so far, newest last — empty
-        while both streams are healthy. The GUI polls this alongside audio_levels() so a microphone that
-        drops out mid-meeting is visible immediately, not a surprise in the finished transcript."""
-        return self._recorder.capture_errors()
+    def capture_notices(self) -> tuple[str, ...]:
+        """Anything the recorder wants said about this recording so far, newest last — a capture thread
+        that died, a selected device Windows no longer has. Empty while nothing is wrong. The GUI polls
+        this alongside audio_levels() so a microphone that drops out mid-meeting is visible immediately,
+        not a surprise in the finished transcript."""
+        return self._recorder.capture_notices()
+
+    def input_problems(self) -> tuple[str, ...]:
+        """What currently looks wrong with what's being captured — a microphone producing digital
+        silence, an input that has heard nothing while the other track was busy, a clipping device.
+        Empty while both inputs look healthy; recomputed per call, so it clears if the input recovers."""
+        return self._recorder.input_problems()
 
     def stop(self, on_progress: Callable[[str], None] | None = None) -> str:
         """Stops recording, transcribes, pushes the meeting to Copilot Studio (if configured), and saves
@@ -100,10 +107,11 @@ class MeetingSession:
         self._screen_watcher.stop()
         recorded = self._recorder.stop()
         report("Recording stopped.")
-        # A capture thread that died mid-meeting (device unplugged, disk full, a driver error) leaves
-        # the rest of that track silent. Say so rather than letting a half-recorded meeting look like a
-        # quiet one — the transcript that comes out of it is genuinely incomplete.
-        for message in recorded.errors:
+        # A capture thread that died mid-meeting (device unplugged, disk full, a driver error), a
+        # device that had to be substituted, an input that never picked anything up — all of it lands
+        # here. Say so rather than letting a half-recorded meeting look like a quiet one; the transcript
+        # that comes out of it is genuinely incomplete, and the reason is worth having on the record.
+        for message in recorded.notices:
             report(message)
 
         mic_lines = self._transcriber.transcribe_parts(recorded.mic_paths, source="mic")

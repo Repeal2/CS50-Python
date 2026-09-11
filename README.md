@@ -14,6 +14,16 @@ saves everything locally, and pushes.
   meter for each confirms it's actually picking up audio rather than guessing. The meters use a
   logarithmic (dBFS) scale rather than a plain linear ratio, since normal microphone volume is often only
   a few percent of full scale and would otherwise barely move a linear meter.
+- **Checks the microphone is actually the right one.** "Test mic…" next to the device dropdown records
+  three seconds from the selected device and says what it heard — a peak level, or the specific reason it
+  heard nothing — which is the one moment when a silent mic is unambiguous (you know you're supposed to
+  be talking) and one dropdown away from being fixed. During a meeting the same analysis runs on both
+  tracks: a device Windows no longer has is named rather than silently substituted, an input producing
+  nothing but digital silence is called out on the spot (a working device always has *some* noise floor),
+  and an input that has heard nothing while the *other* track was busy is queried after a minute and a
+  half. That last one is a heuristic, not a verdict — it can't tell a wrong device from a muted one from
+  a meeting nobody has spoken in yet — so it appears as a warning line under the meters and in the
+  activity log, never as a dialog that steals focus from the call it's warning about.
 - **Watches the screen** at a low frame rate and OCRs it, so on-screen captions, shared slides, and chat
   messages become part of the transcript even if they're never spoken aloud. You can point this at the
   whole screen, a single selected window (e.g. just the Teams/Zoom window), or a custom rectangle you
