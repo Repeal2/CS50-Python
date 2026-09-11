@@ -1,4 +1,6 @@
+import contextlib
 import sys
+import wave
 from types import ModuleType
 
 from meeting_scribe.transcription.engine import (
@@ -6,6 +8,7 @@ from meeting_scribe.transcription.engine import (
     WhisperTranscriber,
     merge_transcript_lines,
     render_transcript,
+    wav_duration_seconds,
 )
 
 
@@ -62,3 +65,61 @@ def test_render_transcript_formats_timestamps_and_labels():
         "[01:05] Others: hi there\n"
         "[01:10] Screen: Q3 Roadmap"
     )
+
+
+def _write_wav(path, seconds, framerate=16000):
+    with contextlib.closing(wave.open(str(path), "wb")) as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(framerate)
+        wav_file.writeframes(b"\x00\x00" * int(framerate * seconds))
+
+
+def test_wav_duration_seconds_reads_the_header(tmp_path):
+    _write_wav(tmp_path / "mic.wav", seconds=2.5)
+    assert wav_duration_seconds(tmp_path / "mic.wav") == 2.5
+
+
+def test_wav_duration_seconds_tolerates_a_file_it_cannot_read(tmp_path):
+    missing = tmp_path / "nope.wav"
+    not_a_wav = tmp_path / "junk.wav"
+    not_a_wav.write_bytes(b"not audio")
+
+    assert wav_duration_seconds(missing) == 0.0
+    assert wav_duration_seconds(not_a_wav) == 0.0
+
+
+def test_transcribe_parts_puts_every_part_back_on_the_meetings_clock(tmp_path, monkeypatch):
+    # A meeting long enough to fill a WAV header rolls over into further part files (see
+    # audio.recorder). Whisper timestamps each part from its own zero, so without the offset every
+    # part after the first would land back at the start of the transcript.
+    first, second = tmp_path / "mic.wav", tmp_path / "mic.part2.wav"
+    _write_wav(first, seconds=60.0)
+    _write_wav(second, seconds=30.0)
+
+    def fake_transcribe(self, audio_path, source):
+        said = "first part" if audio_path == first else "second part"
+        return [TranscriptLine(5.0, source, said)]
+
+    monkeypatch.setattr(WhisperTranscriber, "transcribe", fake_transcribe)
+
+    lines = WhisperTranscriber(model_size="tiny").transcribe_parts([first, second], source="mic")
+
+    assert [(line.timestamp_seconds, line.source, line.text) for line in lines] == [
+        (5.0, "mic", "first part"),
+        (65.0, "mic", "second part"),
+    ]
+
+
+def test_transcribe_parts_of_a_single_file_leaves_timestamps_alone(tmp_path, monkeypatch):
+    only = tmp_path / "mic.wav"
+    _write_wav(only, seconds=10.0)
+    monkeypatch.setattr(
+        WhisperTranscriber,
+        "transcribe",
+        lambda self, audio_path, source: [TranscriptLine(3.0, source, "hello")],
+    )
+
+    lines = WhisperTranscriber(model_size="tiny").transcribe_parts([only], source="mic")
+
+    assert [(line.timestamp_seconds, line.text) for line in lines] == [(3.0, "hello")]

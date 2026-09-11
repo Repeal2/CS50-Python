@@ -34,19 +34,21 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
 
         screen_watcher_instance = MockScreenWatcher.return_value
 
         transcriber_instance = MockTranscriber.return_value
 
-        def fake_transcribe(path, source):
+        def fake_transcribe(paths, source):
             if source == "mic":
                 return [TranscriptLine(1.0, "mic", "let's get started")]
             return [TranscriptLine(2.0, "system", "sounds good")]
 
-        transcriber_instance.transcribe.side_effect = fake_transcribe
+        transcriber_instance.transcribe_parts.side_effect = fake_transcribe
 
         from meeting_scribe.session import MeetingSession
 
@@ -117,9 +119,11 @@ def test_session_pushes_a_named_file_package_when_sync_dir_configured(tmp_path):
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import MeetingSession
 
@@ -156,9 +160,11 @@ def test_session_pushes_a_meetings_reference_documents_under_their_original_file
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import MeetingSession
 
@@ -197,9 +203,11 @@ def test_session_pushes_manual_notes_and_attendees_as_reference_docs(tmp_path):
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import MeetingSession
 
@@ -238,9 +246,11 @@ def test_session_omits_manual_notes_and_attendees_from_the_push_when_neither_was
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import MeetingSession
 
@@ -265,9 +275,11 @@ def test_session_pushes_nothing_without_a_copilot_sync_dir(tmp_path):
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import MeetingSession
 
@@ -288,9 +300,11 @@ def test_session_stop_reports_progress_through_each_stage(tmp_path):
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import MeetingSession
 
@@ -318,9 +332,11 @@ def test_session_stop_reports_skip_message_without_a_copilot_sync_dir(tmp_path):
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import MeetingSession
 
@@ -347,9 +363,11 @@ def test_session_stop_works_without_an_on_progress_callback(tmp_path):
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import MeetingSession
 
@@ -384,9 +402,11 @@ def test_two_sessions_can_be_active_at_once_without_interfering(tmp_path):
         patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
     ):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
-            mic_path=tmp_path / "mic.wav", system_path=tmp_path / "system.wav", started_at_monotonic=0.0
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import MeetingSession
 
@@ -409,3 +429,58 @@ def test_two_sessions_can_be_active_at_once_without_interfering(tmp_path):
             assert "hello" in second_result
             assert db.get_meeting(first.meeting_id).transcript_text == first_result
             assert db.get_meeting(second.meeting_id).transcript_text == second_result
+
+
+def test_session_reports_a_capture_stream_that_died_mid_meeting(tmp_path):
+    # A recording that lost its microphone half way through produces a transcript that's genuinely
+    # missing one side of the conversation — the activity log has to say so rather than leaving it
+    # looking like a quiet meeting.
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
+            errors=("Microphone capture stopped early: OSError: device disconnected",),
+        )
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+
+            progress: list[str] = []
+            session.stop(on_progress=progress.append)
+
+            assert "Microphone capture stopped early: OSError: device disconnected" in progress
+
+
+def test_session_transcribes_every_recorded_part(tmp_path):
+    # A meeting long enough to overflow a WAV header comes back as several part files per stream, and
+    # all of them belong in the transcript.
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        mic_paths = (tmp_path / "mic.wav", tmp_path / "mic.part2.wav")
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=mic_paths,
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
+        )
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+            session.stop()
+
+            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic")

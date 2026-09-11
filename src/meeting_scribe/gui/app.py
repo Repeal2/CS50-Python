@@ -173,6 +173,10 @@ class RecordTab(ttk.Frame):
         self._region_outline: RegionOutline | None = None
         self._input_devices: list = []
         self._loopback_devices: list = []
+        # Which session's capture errors have already been written to the activity log, and how many of
+        # them — see _log_new_capture_errors.
+        self._capture_error_session = None
+        self._capture_errors_logged = 0
 
         form = ttk.Frame(self)
         form.pack(fill="x", padx=12, pady=12)
@@ -355,7 +359,24 @@ class RecordTab(ttk.Frame):
         mic_level, system_level = session.audio_levels() if session is not None else (0.0, 0.0)
         self.mic_level_bar["value"] = mic_level * 100
         self.system_level_bar["value"] = system_level * 100
+        if session is not None:
+            self._log_new_capture_errors(session)
         self.after(150, self._poll_audio_levels)
+
+    def _log_new_capture_errors(self, session) -> None:
+        """Reports a capture stream that has died mid-meeting, once each, as it happens.
+
+        The level meters alone can't tell this story: a microphone whose capture thread has fallen over
+        reads exactly like a microphone nobody is talking into. Saying it out loud in the activity log
+        is the difference between noticing now — while the meeting could still be restarted — and
+        finding out when the transcript comes back with one side of the conversation missing."""
+        if session is not self._capture_error_session:
+            self._capture_error_session = session
+            self._capture_errors_logged = 0
+        errors = session.capture_errors()
+        for message in errors[self._capture_errors_logged:]:
+            self._log(f"[{session.title}] {message}")
+        self._capture_errors_logged = len(errors)
 
     def _poll_region_outline(self) -> None:
         """Keeps a window-pinned custom area's on-screen outline glued to its window as the window
@@ -940,6 +961,10 @@ class SettingsTab(ttk.Frame):
         self.app = app
         self._input_devices: list = []
         self._loopback_devices: list = []
+        # Which session's capture errors have already been written to the activity log, and how many of
+        # them — see _log_new_capture_errors.
+        self._capture_error_session = None
+        self._capture_errors_logged = 0
 
         form = ttk.Frame(self)
         form.pack(fill="x", padx=12, pady=12, anchor="n")

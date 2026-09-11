@@ -4,8 +4,11 @@ event stream into one time-ordered meeting transcript.
 
 from __future__ import annotations
 
+import contextlib
+import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 SOURCE_LABELS = {"mic": "You", "system": "Others", "screen_ocr": "Screen"}
 
@@ -45,6 +48,35 @@ class WhisperTranscriber:
             for segment in segments
             if segment.text.strip()
         ]
+
+    def transcribe_parts(self, audio_paths: Sequence[Path], source: str) -> list[TranscriptLine]:
+        """Transcribes one capture stream that may have been written as several WAV parts.
+
+        A WAV file can't hold more than a couple of hours of audio before its header runs out of room,
+        so a long meeting rolls over into numbered parts (see audio.recorder). Whisper timestamps each
+        part from its own zero; shifting every part by the total duration of the ones before it puts
+        the whole stream back on the meeting's clock, which is what the merge into one transcript
+        assumes."""
+        lines: list[TranscriptLine] = []
+        offset_seconds = 0.0
+        for audio_path in audio_paths:
+            lines.extend(
+                TranscriptLine(line.timestamp_seconds + offset_seconds, line.source, line.text)
+                for line in self.transcribe(audio_path, source=source)
+            )
+            offset_seconds += wav_duration_seconds(audio_path)
+        return lines
+
+
+def wav_duration_seconds(path: Path) -> float:
+    """Length of a WAV file in seconds, or 0.0 if it can't be read — a missing or unreadable part
+    shouldn't sink a transcript that otherwise came out fine."""
+    try:
+        with contextlib.closing(wave.open(str(path), "rb")) as wav_file:
+            framerate = wav_file.getframerate()
+            return wav_file.getnframes() / framerate if framerate else 0.0
+    except (OSError, wave.Error):
+        return 0.0
 
 
 def merge_transcript_lines(*line_groups: list[TranscriptLine]) -> list[TranscriptLine]:

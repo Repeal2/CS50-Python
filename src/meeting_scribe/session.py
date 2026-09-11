@@ -78,6 +78,12 @@ class MeetingSession:
         picking up audio" meter while recording. Both are 0.0 before start() or after stop()."""
         return self._recorder.mic_level, self._recorder.system_level
 
+    def capture_errors(self) -> tuple[str, ...]:
+        """Anything that has killed one of the recorder's capture threads so far, newest last — empty
+        while both streams are healthy. The GUI polls this alongside audio_levels() so a microphone that
+        drops out mid-meeting is visible immediately, not a surprise in the finished transcript."""
+        return self._recorder.capture_errors()
+
     def stop(self, on_progress: Callable[[str], None] | None = None) -> str:
         """Stops recording, transcribes, pushes the meeting to Copilot Studio (if configured), and saves
         it locally. Returns the plain transcript — there's no AI-generated notes to return anymore; that
@@ -94,9 +100,14 @@ class MeetingSession:
         self._screen_watcher.stop()
         recorded = self._recorder.stop()
         report("Recording stopped.")
+        # A capture thread that died mid-meeting (device unplugged, disk full, a driver error) leaves
+        # the rest of that track silent. Say so rather than letting a half-recorded meeting look like a
+        # quiet one — the transcript that comes out of it is genuinely incomplete.
+        for message in recorded.errors:
+            report(message)
 
-        mic_lines = self._transcriber.transcribe(recorded.mic_path, source="mic")
-        system_lines = self._transcriber.transcribe(recorded.system_path, source="system")
+        mic_lines = self._transcriber.transcribe_parts(recorded.mic_paths, source="mic")
+        system_lines = self._transcriber.transcribe_parts(recorded.system_paths, source="system")
         screen_lines = [
             TranscriptLine(event.timestamp_seconds, "screen_ocr", event.text)
             for event in self._screen_events
