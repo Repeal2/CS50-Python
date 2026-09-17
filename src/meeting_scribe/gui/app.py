@@ -57,6 +57,16 @@ def _format_meeting_timestamp(iso_string: str) -> str:
         return iso_string
 
 
+def _has_no_mic_signal(problems: "tuple[str, ...]") -> bool:
+    """Whether `problems` (as returned by MeetingSession.input_problems()) currently includes the mic
+    reading digital silence — used to flash the OCR region outline red (see
+    RecordTab._refresh_input_warnings / screen.region_picker.RegionOutline.set_alert). Matches the exact
+    wording audio.recorder._describe_stream_problem uses for that case ("no signal at all ... digital
+    silence" — see its own "digital silence" test) rather than re-deriving the condition from scratch, so
+    this stays in lockstep with whatever counts as that warning there."""
+    return any(problem.startswith("Microphone:") and "digital silence" in problem for problem in problems)
+
+
 def _add_scrollable_text_tab(notebook: ttk.Notebook, title: str) -> tk.Text:
     """Adds a read-only-by-convention Text+Scrollbar pair as a new tab and returns the Text widget."""
     frame = ttk.Frame(notebook)
@@ -441,13 +451,18 @@ class RecordTab(ttk.Frame):
         straight to the activity log, once each. Input problems (silence, clipping) are a live judgement
         that can correct itself, so they hold the warning line for as long as they last and are logged
         the first time each appears — noticing now beats finding out when the transcript comes back with
-        one side of the conversation missing."""
+        one side of the conversation missing.
+
+        A dead-silent mic additionally flashes the OCR region outline red (see _sync_alert_outline) —
+        right at the thing a user is actually looking at during a meeting, not just another line in an
+        activity log they may not have scrolled to."""
         if session is not self._notice_session:
             self._notice_session = session
             self._notices_logged = 0
             self._logged_input_problems = set()
         if session is None:
             self.input_warning_var.set("")
+            self._sync_alert_outline(no_mic_signal=False)
             return
 
         notices = session.capture_notices()
@@ -461,6 +476,12 @@ class RecordTab(ttk.Frame):
             if problem not in self._logged_input_problems:
                 self._logged_input_problems.add(problem)
                 self._log(f"[{session.title}] {problem}")
+
+        self._sync_alert_outline(no_mic_signal=_has_no_mic_signal(problems))
+
+    def _sync_alert_outline(self, *, no_mic_signal: bool) -> None:
+        if self._region_outline is not None:
+            self._region_outline.set_alert(no_mic_signal)
 
     def _test_microphone(self) -> None:
         """Listens to the selected microphone for a few seconds and reports what it actually heard.

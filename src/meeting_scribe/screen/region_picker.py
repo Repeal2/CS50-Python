@@ -210,6 +210,12 @@ def _frame_geometries(rect: dict, thickness: int) -> tuple[str, str, str, str]:
     return frame_top, bottom, frame_left, right
 
 
+def _outline_color(normal_color: str, alert_color: str, *, alerting: bool, flash_on: bool) -> str:
+    """The border color for one tick of RegionOutline.set_alert's flash — split out as a pure function
+    so the on/off decision is testable without a real Tk display (see set_alert/_flash)."""
+    return alert_color if alerting and flash_on else normal_color
+
+
 class RegionOutline:
     """A thin, always-on-top border drawn around a capture rectangle so the user can see — for as long
     as it's the selected screen source, not just at the moment they picked it — exactly what's being
@@ -218,26 +224,68 @@ class RegionOutline:
 
     Takes a plain mss-style rect rather than a RegionTarget so it also works for a WindowRegionTarget,
     whose absolute position depends on the pinned window's current bounds rather than being fixed —
-    `reposition()` lets the caller re-draw the frame around wherever that window has moved to."""
+    `reposition()` lets the caller re-draw the frame around wherever that window has moved to.
+
+    `set_alert(True)` flashes the border red — used when the mic has no detectable input at all, so
+    "nothing is being picked up" is visible right at the OCR capture area a user is actually looking at,
+    not just as another line in the activity log they may not have scrolled to. `set_alert(False)`
+    (or letting the outline get destroyed by `close()`) returns it to its normal color and stops the
+    flash timer."""
 
     THICKNESS = 3
     COLOR = "#00e5ff"
+    ALERT_COLOR = "#ff3b30"
+    # How often the border toggles between its normal color and ALERT_COLOR while alerting.
+    ALERT_FLASH_MS = 400
 
     def __init__(self, parent: "tk.Misc", rect: dict):
         import tkinter as tk
 
+        self._parent = parent
         self._parts = [tk.Toplevel(parent) for _ in range(4)]
         for part in self._parts:
             part.overrideredirect(True)
             part.attributes("-topmost", True)
             part.configure(bg=self.COLOR)
         self.reposition(rect)
+        self._alerting = False
+        self._flash_on = False
+        self._flash_after_id: str | None = None
 
     def reposition(self, rect: dict) -> None:
         for part, geometry in zip(self._parts, _frame_geometries(rect, self.THICKNESS)):
             part.geometry(geometry)
 
+    def set_alert(self, active: bool) -> None:
+        """Starts or stops the red flash. Safe to call every poll tick with the current condition —
+        it's a no-op once the state already matches, so it doesn't reset the flash's phase or restart
+        its timer on every call while the alert continues."""
+        if active == self._alerting:
+            return
+        self._alerting = active
+        if active:
+            self._flash_on = False
+            self._flash()
+        else:
+            self._cancel_flash()
+            self._paint(self.COLOR)
+
+    def _flash(self) -> None:
+        self._flash_on = not self._flash_on
+        self._paint(_outline_color(self.COLOR, self.ALERT_COLOR, alerting=True, flash_on=self._flash_on))
+        self._flash_after_id = self._parent.after(self.ALERT_FLASH_MS, self._flash)
+
+    def _cancel_flash(self) -> None:
+        if self._flash_after_id is not None:
+            self._parent.after_cancel(self._flash_after_id)
+            self._flash_after_id = None
+
+    def _paint(self, color: str) -> None:
+        for part in self._parts:
+            part.configure(bg=color)
+
     def close(self) -> None:
+        self._cancel_flash()
         for part in self._parts:
             part.destroy()
         self._parts = []
