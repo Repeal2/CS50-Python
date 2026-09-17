@@ -37,3 +37,34 @@ def test_notes_bullet_prefix_matches_asterisk_and_dot_bullets():
 def test_notes_bullet_prefix_matches_an_empty_line():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     assert gui_app._NOTES_BULLET_PREFIX.match("").group(0) == ""
+
+
+def test_no_mic_signal_is_true_for_the_digital_silence_warning():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    problems = (
+        "Microphone: no signal at all — every sample is digital silence. A working device always has "
+        "some noise floor, so this is almost certainly the wrong input, an unplugged one, or one muted "
+        "at the driver.",
+    )
+    assert gui_app._has_no_mic_signal(problems) is True
+
+
+def test_no_mic_signal_is_false_with_no_problems():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._has_no_mic_signal(()) is False
+
+
+def test_no_mic_signal_ignores_other_kinds_of_mic_and_system_problems():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    # A quiet mic (still producing signal, just nothing above speech level) and clipping are real
+    # problems, but neither one is "no input at all" — only digital silence is.
+    problems = (
+        "Microphone: nothing above speech level in 120s (peak -58 dBFS) while the other track was "
+        "active — check the right device is selected and that it isn't muted.",
+        "Microphone: clipping (peak -1 dBFS). Turn the input level down in Windows, or the recording "
+        "will distort.",
+        "System audio: no signal at all — every sample is digital silence. A working device always has "
+        "some noise floor, so this is almost certainly the wrong input, an unplugged one, or one muted "
+        "at the driver.",
+    )
+    assert gui_app._has_no_mic_signal(problems) is False

@@ -2,6 +2,7 @@ from meeting_scribe.screen.region_picker import (
     RegionTarget,
     WindowRegionTarget,
     _frame_geometries,
+    _outline_color,
     _region_from_drag,
     pin_region_to_window,
 )
@@ -135,3 +136,18 @@ def test_pin_region_to_window_computes_fractional_offset_from_the_windows_curren
     )
     # Resolving against the same window_rect it was pinned from reproduces the original absolute region.
     assert pinned.mss_region(window_rect) == region.mss_region
+
+
+# --- the OCR region outline's "no mic input" flash --------------------------------------------------
+
+
+def test_outline_color_is_the_normal_color_while_not_alerting():
+    # Not alerting always shows the normal color, regardless of which half of the flash cycle it is —
+    # a stopped flash shouldn't be able to leave the border stuck red.
+    assert _outline_color("#00e5ff", "#ff3b30", alerting=False, flash_on=True) == "#00e5ff"
+    assert _outline_color("#00e5ff", "#ff3b30", alerting=False, flash_on=False) == "#00e5ff"
+
+
+def test_outline_color_alternates_while_alerting():
+    assert _outline_color("#00e5ff", "#ff3b30", alerting=True, flash_on=True) == "#ff3b30"
+    assert _outline_color("#00e5ff", "#ff3b30", alerting=True, flash_on=False) == "#00e5ff"
