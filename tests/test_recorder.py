@@ -1,6 +1,7 @@
 import contextlib
 import struct
 import sys
+import threading
 import wave
 from types import SimpleNamespace
 
@@ -222,8 +223,15 @@ class _FakePyAudio:
 def _run_capture_thread(recorder, stream, path):
     recorder._pyaudio = _FakePyAudio(stream)
     device_info = {"maxInputChannels": 1, "defaultSampleRate": 16000, "index": 3}
-    writer, thread = recorder._spawn_capture_thread(
-        SimpleNamespace(paInt16=8), device_info, path, "mic_level", recorder._mic_monitor, "Microphone"
+    writer = _SegmentedWavWriter(path, 1, SAMPLE_WIDTH_BYTES, 16000)
+    thread = recorder._spawn_capture_thread(
+        SimpleNamespace(paInt16=8),
+        device_info,
+        writer,
+        "mic_level",
+        recorder._mic_monitor,
+        "Microphone",
+        recorder._mic_stop_event,
     )
     thread.join(timeout=5)
     assert not thread.is_alive()
@@ -232,7 +240,7 @@ def _run_capture_thread(recorder, stream, path):
 
 def test_capture_thread_writes_what_it_read_and_tears_the_stream_down(tmp_path):
     recorder = Recorder(tmp_path)
-    stream = _FakeStream([b"\x01\x00" * 10, b"\x02\x00" * 10], stop_event=recorder._stop_event)
+    stream = _FakeStream([b"\x01\x00" * 10, b"\x02\x00" * 10], stop_event=recorder._mic_stop_event)
 
     writer = _run_capture_thread(recorder, stream, tmp_path / "mic.wav")
 
@@ -265,19 +273,104 @@ def test_a_stream_that_never_opens_is_reported_without_taking_the_meeting_down(t
         open=lambda **kwargs: (_ for _ in ()).throw(OSError("no such device"))
     )
     device_info = {"maxInputChannels": 1, "defaultSampleRate": 16000, "index": 3}
-    _writer, thread = recorder._spawn_capture_thread(
+    writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
+    thread = recorder._spawn_capture_thread(
         SimpleNamespace(paInt16=8),
         device_info,
-        tmp_path / "mic.wav",
+        writer,
         "mic_level",
         recorder._mic_monitor,
         "Microphone",
+        recorder._mic_stop_event,
     )
     thread.join(timeout=5)
 
     assert recorder.capture_notices() == ("Microphone capture stopped early: OSError: no such device",)
     # The empty WAV is still valid and still finalized, so transcription reads it as silence.
     assert _wav_frames(tmp_path / "mic.wav") == b""
+
+
+# --- live device switching --------------------------------------------------------------------------
+
+
+def _finished_thread() -> threading.Thread:
+    """A Thread object that has already run to completion — stands in for a capture thread's previous
+    incarnation so a test can hand it to the recorder without a real (racy) capture loop in flight."""
+    thread = threading.Thread(target=lambda: None)
+    thread.start()
+    thread.join()
+    return thread
+
+
+def test_switch_mic_device_rolls_into_a_new_part_with_the_new_devices_parameters(tmp_path):
+    # The bug this fixes: switching mics mid-meeting used to silently keep recording whatever device was
+    # originally opened, with no error, no rollover, nothing — a full-length file of an idle device. A
+    # switch should instead close out the old part and start a fresh one on the new device.
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+
+    recorder._mic_writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
+    recorder._mic_writer.write(b"\x01\x00" * 10)
+    recorder._mic_thread = _finished_thread()
+
+    # The new device is stereo at a different sample rate — a WAV part can't change either mid-file,
+    # which is exactly why a switch has to roll into a new part rather than continuing the old one.
+    new_device = {"name": "USB Headset", "index": 1, "maxInputChannels": 2, "defaultSampleRate": 48000}
+    stream = _FakeStream([b"\x02\x00\x03\x00" * 5], stop_event=recorder._mic_stop_event)
+    recorder._pyaudio = _FakeAudioHost([new_device], default_input=new_device)
+    recorder._pyaudio.open = lambda **kwargs: stream
+    recorder._pyaudio_module = SimpleNamespace(paInt16=8)
+
+    recorder.switch_mic_device("USB Headset")
+    recorder._mic_thread.join(timeout=5)
+
+    assert [path.name for path in recorder._mic_writer.paths] == ["mic.wav", "mic.part2.wav"]
+    assert recorder._mic_device_name == "USB Headset"
+    assert recorder.capture_notices() == ("Microphone switched to 'USB Headset' mid-meeting.",)
+
+    with contextlib.closing(wave.open(str(tmp_path / "mic.wav"), "rb")) as first_part:
+        assert first_part.getnchannels() == 1
+        assert first_part.getframerate() == 16000
+        assert first_part.readframes(first_part.getnframes()) == b"\x01\x00" * 10
+
+    with contextlib.closing(wave.open(str(tmp_path / "mic.part2.wav"), "rb")) as second_part:
+        assert second_part.getnchannels() == 2
+        assert second_part.getframerate() == 48000
+        assert second_part.readframes(second_part.getnframes()) == b"\x02\x00\x03\x00" * 5
+
+
+def test_switching_the_microphone_does_not_touch_the_system_audio_stream(tmp_path):
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+
+    recorder._mic_writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
+    recorder._mic_writer.write(b"\x01\x00" * 10)
+    recorder._mic_thread = _finished_thread()
+
+    recorder._system_writer = _SegmentedWavWriter(tmp_path / "system.wav", 2, SAMPLE_WIDTH_BYTES, 48000)
+    recorder._system_writer.write(b"\x09\x00\x0a\x00" * 5)
+    system_thread = _finished_thread()
+    recorder._system_thread = system_thread
+
+    new_device = {"name": "USB Headset", "index": 1, "maxInputChannels": 1, "defaultSampleRate": 16000}
+    stream = _FakeStream([b"\x02\x00" * 5], stop_event=recorder._mic_stop_event)
+    recorder._pyaudio = _FakeAudioHost([new_device], default_input=new_device)
+    recorder._pyaudio.open = lambda **kwargs: stream
+    recorder._pyaudio_module = SimpleNamespace(paInt16=8)
+
+    recorder.switch_mic_device("USB Headset")
+    recorder._mic_thread.join(timeout=5)
+
+    # Nothing about the system-audio side was stopped, closed, or rolled over by a mic-only switch.
+    assert recorder._system_thread is system_thread
+    assert recorder._system_writer.paths == (tmp_path / "system.wav",)
+    recorder._system_writer.close()
+
+
+def test_a_recorder_that_never_started_refuses_to_switch(tmp_path):
+    recorder = Recorder(tmp_path)
+    with pytest.raises(RuntimeError):
+        recorder.switch_mic_device("USB Headset")
 
 
 def _pcm16(*values, repeat=1):
@@ -565,7 +658,7 @@ def test_a_missing_system_audio_device_is_reported_the_same_way(tmp_path):
 
 def test_a_stream_of_pure_silence_is_visible_in_the_recorders_health(tmp_path):
     recorder = Recorder(tmp_path)
-    stream = _FakeStream([_pcm16(0, repeat=100)] * 3, stop_event=recorder._stop_event)
+    stream = _FakeStream([_pcm16(0, repeat=100)] * 3, stop_event=recorder._mic_stop_event)
 
     _run_capture_thread(recorder, stream, tmp_path / "mic.wav")
 
@@ -576,7 +669,7 @@ def test_a_stream_of_pure_silence_is_visible_in_the_recorders_health(tmp_path):
 
 def test_a_stream_that_hears_the_room_is_visible_in_the_recorders_health(tmp_path):
     recorder = Recorder(tmp_path)
-    stream = _FakeStream([_pcm16(6000, -6000, repeat=50)] * 3, stop_event=recorder._stop_event)
+    stream = _FakeStream([_pcm16(6000, -6000, repeat=50)] * 3, stop_event=recorder._mic_stop_event)
 
     _run_capture_thread(recorder, stream, tmp_path / "mic.wav")
 

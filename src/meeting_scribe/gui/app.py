@@ -16,6 +16,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
+from typing import Callable
 
 from meeting_scribe.config import (
     Settings,
@@ -133,6 +134,53 @@ class MeetingScribeApp(tk.Tk):
         whichever one didn't make the change calls this so it doesn't keep showing a stale value."""
         self._record_tab.sync_from_settings()
         self._settings_tab.sync_from_settings()
+
+    def switch_active_recording(
+        self,
+        *,
+        mic_changed: bool = False,
+        mic_name: str | None = None,
+        system_changed: bool = False,
+        system_name: str | None = None,
+    ) -> None:
+        """If a meeting is actively recording right now, moves it onto the newly chosen device(s)
+        immediately instead of leaving the recording on whatever device was open when it started — the
+        old behavior, which silently kept recording an unused device for the rest of the meeting. Called
+        by both the Record tab's live dropdowns and the Settings tab's Save button whenever either
+        device actually changed. No-ops if nothing is currently recording, or if neither changed.
+
+        Runs the switch on a background thread — it can block briefly joining the old capture thread —
+        and reports the outcome to the Record tab's activity log once it's done, the same pattern
+        _stop() uses for its own background finish-up work."""
+        session = self._session
+        if session is None or not (mic_changed or system_changed):
+            return
+
+        def worker() -> None:
+            if mic_changed:
+                self._switch_one_device(session.switch_mic_device, mic_name, "Microphone")
+            if system_changed:
+                self._switch_one_device(session.switch_system_device, system_name, "System audio")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _switch_one_device(
+        self, switch: Callable[[str | None], None], device_name: str | None, label: str
+    ) -> None:
+        try:
+            switch(device_name)
+        except Exception as exc:  # surfaced to the user regardless of cause
+            self.after(0, self._on_device_switch_failed, label, exc)
+        else:
+            self.after(0, self._on_device_switch_done, label, device_name)
+
+    def _on_device_switch_done(self, label: str, device_name: str | None) -> None:
+        shown = device_name or "System default"
+        self._record_tab._log(f"{label} switched to {shown!r} mid-meeting.")
+
+    def _on_device_switch_failed(self, label: str, exc: Exception) -> None:
+        self._record_tab._log(f"{label} switch failed: {exc}")
+        messagebox.showerror("Meeting Scribe", f"Couldn't switch {label.lower()}: {exc}")
 
     def prompt_new_project(self) -> None:
         """Opens a small dialog to create a project by name, then refreshes both tabs and selects the
@@ -591,13 +639,20 @@ class RecordTab(ttk.Frame):
 
     def _on_devices_changed(self, _event=None) -> None:
         """Persists the mic/system choice immediately (rather than waiting for a Settings-tab Save) so
-        it takes effect the next time the user hits Start Meeting."""
+        it takes effect the next time the user hits Start Meeting — and, if a meeting is actively
+        recording right now, switches that recording onto the newly chosen device(s) immediately too
+        (see MeetingScribeApp.switch_active_recording)."""
         mic_name = None if self.mic_var.get() == SYSTEM_DEFAULT_LABEL else self.mic_var.get()
         system_name = None if self.system_var.get() == SYSTEM_DEFAULT_LABEL else self.system_var.get()
+        mic_changed = mic_name != self.app.settings.mic_device_name
+        system_changed = system_name != self.app.settings.system_device_name
         self.app.settings = update_audio_devices(
             self.app.settings, mic_device_name=mic_name, system_device_name=system_name
         )
         self.app.sync_device_displays()
+        self.app.switch_active_recording(
+            mic_changed=mic_changed, mic_name=mic_name, system_changed=system_changed, system_name=system_name
+        )
 
     def _log(self, message: str) -> None:
         """Appends a timestamped line to the activity log and scrolls to it. This is a log of what the
@@ -1130,6 +1185,8 @@ class SettingsTab(ttk.Frame):
         system_name = (
             None if self.system_var.get() == SYSTEM_DEFAULT_LABEL else self.system_var.get()
         )
+        mic_changed = mic_name != self.app.settings.mic_device_name
+        system_changed = system_name != self.app.settings.system_device_name
 
         self.app.settings = update_copilot_settings(
             self.app.settings, copilot_sync_dir=self.sync_dir_var.get().strip()
@@ -1139,6 +1196,11 @@ class SettingsTab(ttk.Frame):
         )
         self._refresh_status()
         self.app.sync_device_displays()
+        # If a meeting is actively recording, move it onto the newly chosen device(s) now rather than
+        # only applying the change to the next meeting — see MeetingScribeApp.switch_active_recording.
+        self.app.switch_active_recording(
+            mic_changed=mic_changed, mic_name=mic_name, system_changed=system_changed, system_name=system_name
+        )
         messagebox.showinfo("Meeting Scribe", "Settings saved.")
 
     def sync_from_settings(self) -> None:
