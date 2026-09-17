@@ -2,6 +2,7 @@ import contextlib
 import struct
 import sys
 import threading
+import time
 import wave
 from types import SimpleNamespace
 
@@ -371,6 +372,82 @@ def test_a_recorder_that_never_started_refuses_to_switch(tmp_path):
     recorder = Recorder(tmp_path)
     with pytest.raises(RuntimeError):
         recorder.switch_mic_device("USB Headset")
+
+
+# --- noticing a Windows default-device change on its own --------------------------------------------
+
+
+def _run_watcher_until(recorder, condition, timeout=2.0) -> None:
+    """Starts the default-device watcher, waits (briefly) for `condition` to become true, then always
+    stops it again — a real meeting's watcher would otherwise poll for the rest of the process."""
+    recorder._DEFAULT_DEVICE_POLL_SECONDS = 0.01
+    recorder._watch_stop_event.clear()
+    recorder._watcher_thread = threading.Thread(target=recorder._watch_default_devices, daemon=True)
+    recorder._watcher_thread.start()
+    try:
+        deadline = time.monotonic() + timeout
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        recorder._watch_stop_event.set()
+        recorder._watcher_thread.join(timeout=5)
+
+
+def test_the_watcher_switches_to_a_new_default_microphone_it_notices(tmp_path):
+    # The gap live-switching alone doesn't cover: Windows' default mic changing (Sound settings, a
+    # headset that was default getting unplugged) without the user ever touching this app's own
+    # dropdowns. A stream that's following "system default" (device name None) should notice that on its
+    # own rather than keep reading from whatever used to be default.
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    recorder._mic_device_name = None
+    recorder._mic_active_device_name = "Old Mic"
+    recorder._mic_writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
+    recorder._mic_writer.write(b"\x01\x00" * 10)
+    recorder._mic_thread = _finished_thread()
+
+    new_default = {"name": "New Mic", "index": 0, "maxInputChannels": 1, "defaultSampleRate": 16000}
+    stream = _FakeStream([b"\x02\x00" * 5], stop_event=recorder._mic_stop_event)
+    recorder._pyaudio = _FakeAudioHost([new_default], default_input=new_default)
+    recorder._pyaudio.open = lambda **kwargs: stream
+    recorder._pyaudio_module = SimpleNamespace(paInt16=8)
+
+    _run_watcher_until(recorder, lambda: recorder._mic_active_device_name == "New Mic")
+
+    assert recorder._mic_active_device_name == "New Mic"
+    assert [path.name for path in recorder._mic_writer.paths] == ["mic.wav", "mic.part2.wav"]
+    assert recorder.capture_notices() == (
+        "Microphone switched to 'New Mic' — the Windows default microphone changed.",
+    )
+
+
+def test_the_watcher_leaves_an_explicitly_chosen_microphone_alone(tmp_path):
+    recorder = Recorder(tmp_path, mic_device_name="Jabra Evolve")
+    recorder._started_at = 0.0
+    recorder._mic_active_device_name = "Jabra Evolve"
+    recorder._mic_writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
+    recorder._mic_thread = _finished_thread()
+
+    # No .open() is wired up on this fake host — if the watcher ever tried to switch despite the
+    # explicit device choice, that would surface as an AttributeError notice instead of silently passing.
+    other_default = {"name": "Built-in Mic", "index": 0, "maxInputChannels": 1, "defaultSampleRate": 16000}
+    recorder._pyaudio = _FakeAudioHost([other_default], default_input=other_default)
+    recorder._pyaudio_module = SimpleNamespace(paInt16=8)
+
+    _run_watcher_until(recorder, lambda: False, timeout=0.15)
+
+    assert recorder._mic_active_device_name == "Jabra Evolve"
+    assert recorder.capture_notices() == ()
+
+
+def test_current_default_name_helpers_swallow_enumeration_errors(tmp_path):
+    # A background poll shouldn't ever be able to take the meeting down over a transient enumeration
+    # hiccup — it just tries again next tick.
+    recorder = Recorder(tmp_path)
+    recorder._pyaudio = SimpleNamespace(
+        get_default_input_device_info=lambda: (_ for _ in ()).throw(OSError("no default")),
+    )
+    assert recorder._current_default_input_name() is None
 
 
 def _pcm16(*values, repeat=1):
