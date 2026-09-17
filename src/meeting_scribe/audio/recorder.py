@@ -485,6 +485,16 @@ class Recorder:
     when a user changed their mic mid-meeting, producing a full-length recording of an idle device
     instead of an error.
 
+    That still left one gap: leaving a device as None ("whatever Windows currently considers the
+    default") only resolves the *actual* default once, at `start()` — same as an explicit name, it isn't
+    re-checked while the meeting runs. If the user changes the Windows default mic/speaker outside the
+    app (Sound settings, unplugging a headset that was the default) without ever touching this app's
+    dropdowns, the recording would otherwise keep reading from whatever device *used to be* default. A
+    background thread — started in `start()`, stopped in `stop()` — polls Windows' current default input/
+    loopback device every `_DEFAULT_DEVICE_POLL_SECONDS` and calls switch_mic_device(None)/
+    switch_system_device(None) itself when it changes, but only for a stream whose device is still None
+    (an explicitly-chosen device is never second-guessed by this).
+
     While running, `mic_level` and `system_level` hold each stream's current input level (roughly 0..1,
     see `_pcm16_level`), updated every chunk by the capture threads — a GUI can poll these to show a
     live "is this actually picking up audio" meter without needing any thread synchronization beyond
@@ -500,6 +510,12 @@ class Recorder:
     being captured looks like a working input at all — see StreamHealth and describe_input_problems.
     """
 
+    # How often the background thread checks whether Windows' current default input/loopback device has
+    # changed out from under a stream that's following "system default" (device name None). Frequent
+    # enough that a mid-meeting default change is caught within a few seconds; infrequent enough that
+    # it's not worth its own thread waking up more than that.
+    _DEFAULT_DEVICE_POLL_SECONDS = 3.0
+
     def __init__(
         self,
         output_dir: Path,
@@ -510,6 +526,11 @@ class Recorder:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._mic_device_name = mic_device_name
         self._system_device_name = system_device_name
+        # The device actually in use right now, as opposed to _mic_device_name/_system_device_name above
+        # (the requested name, which stays None for "follow the Windows default") — what the default-
+        # device watcher compares Windows' current default against to notice it changed.
+        self._mic_active_device_name: str | None = None
+        self._system_active_device_name: str | None = None
         self._pyaudio = None
         self._pyaudio_module = None
         self._mic_thread: threading.Thread | None = None
@@ -520,6 +541,8 @@ class Recorder:
         self._system_monitor = _StreamActivityMonitor()
         self._mic_stop_event = threading.Event()
         self._system_stop_event = threading.Event()
+        self._watch_stop_event = threading.Event()
+        self._watcher_thread: threading.Thread | None = None
         # Serializes stop() against switch_mic_device()/switch_system_device(), and switches against
         # each other. Without this, a switch racing stop() could still be opening a new stream on
         # self._pyaudio in one thread while stop() is terminating that same PyAudio instance in
@@ -552,6 +575,8 @@ class Recorder:
 
         mic_info = self._resolve_input_device(self._mic_device_name)
         system_info = self._resolve_loopback_device(pyaudio, self._system_device_name)
+        self._mic_active_device_name = mic_info["name"]
+        self._system_active_device_name = system_info["name"]
 
         self._mic_writer = _SegmentedWavWriter(
             self._mic_path, int(mic_info["maxInputChannels"]), SAMPLE_WIDTH_BYTES,
@@ -571,10 +596,18 @@ class Recorder:
             "System audio", self._system_stop_event,
         )
 
-    def switch_mic_device(self, device_name: str | None) -> None:
+        self._watch_stop_event.clear()
+        self._watcher_thread = threading.Thread(
+            target=self._watch_default_devices, daemon=True, name="recorder-default-device-watch"
+        )
+        self._watcher_thread.start()
+
+    def switch_mic_device(self, device_name: str | None, *, reason: str | None = None) -> None:
         """Moves the microphone stream to a different device without stopping the meeting. The system-
         audio stream is untouched. `device_name` follows the same convention as the constructor: None
-        means "whatever Windows currently considers the default"."""
+        means "whatever Windows currently considers the default". `reason`, if given, replaces the
+        generic wording in the notice this records (see _watch_default_devices, which switches on its
+        own when the *actual* Windows default changes out from under a None-device stream)."""
         with self._lifecycle_lock:
             self._switch_stream(
                 stop_event=self._mic_stop_event,
@@ -584,13 +617,15 @@ class Recorder:
                 label="Microphone",
                 thread_attr="_mic_thread",
                 device_name_attr="_mic_device_name",
+                active_name_attr="_mic_active_device_name",
                 resolve=lambda: self._resolve_input_device(device_name),
                 device_name=device_name,
+                reason=reason,
             )
 
-    def switch_system_device(self, device_name: str | None) -> None:
+    def switch_system_device(self, device_name: str | None, *, reason: str | None = None) -> None:
         """Moves the system-audio (loopback) stream to a different device without stopping the meeting.
-        The microphone stream is untouched."""
+        The microphone stream is untouched. See switch_mic_device for `reason`."""
         with self._lifecycle_lock:
             self._switch_stream(
                 stop_event=self._system_stop_event,
@@ -600,8 +635,10 @@ class Recorder:
                 label="System audio",
                 thread_attr="_system_thread",
                 device_name_attr="_system_device_name",
+                active_name_attr="_system_active_device_name",
                 resolve=lambda: self._resolve_loopback_device(self._pyaudio_module, device_name),
                 device_name=device_name,
+                reason=reason,
             )
 
     def _switch_stream(
@@ -614,8 +651,10 @@ class Recorder:
         label: str,
         thread_attr: str,
         device_name_attr: str,
+        active_name_attr: str,
         resolve: Callable[[], dict],
         device_name: str | None,
+        reason: str | None,
     ) -> None:
         if self._started_at is None:
             raise RuntimeError("Recorder.start() was never called")
@@ -631,6 +670,7 @@ class Recorder:
 
         device_info = resolve()
         setattr(self, device_name_attr, device_name)
+        setattr(self, active_name_attr, device_info["name"])
 
         # A new device can have a different channel count or sample rate than the old one, which a WAV
         # file can't change mid-stream — roll over into a new part with the new device's parameters
@@ -643,11 +683,61 @@ class Recorder:
             self._pyaudio_module, device_info, writer, level_attr, monitor, label, stop_event
         )
         setattr(self, thread_attr, new_thread)
-        self._record_switch(f"{label} switched to {device_info['name']!r} mid-meeting.")
+        if reason is None:
+            self._record_switch(f"{label} switched to {device_info['name']!r} mid-meeting.")
+        else:
+            self._record_switch(f"{label} switched to {device_info['name']!r} — {reason}.")
+
+    def _watch_default_devices(self) -> None:
+        """Runs on its own thread for the life of the meeting, noticing when Windows' actual default
+        input/loopback device changes out from under a stream that's following it (device name None —
+        see the class docstring) and switching that stream onto the new default itself. An explicitly
+        chosen device is never touched here, since _mic_device_name/_system_device_name being non-None
+        is exactly what "not following the default" means.
+
+        `Event.wait(timeout)` both sleeps between checks and returns True the instant stop() sets
+        _watch_stop_event, so this exits promptly on stop rather than finishing out a long poll interval.
+        """
+        while not self._watch_stop_event.wait(self._DEFAULT_DEVICE_POLL_SECONDS):
+            if self._mic_device_name is None:
+                current = self._current_default_input_name()
+                if current is not None and current != self._mic_active_device_name:
+                    try:
+                        self.switch_mic_device(None, reason="the Windows default microphone changed")
+                    except Exception as exc:
+                        self._record_capture_failure("Microphone", exc)
+            if self._system_device_name is None:
+                current = self._current_default_loopback_name()
+                if current is not None and current != self._system_active_device_name:
+                    try:
+                        self.switch_system_device(None, reason="the Windows default output device changed")
+                    except Exception as exc:
+                        self._record_capture_failure("System audio", exc)
+
+    def _current_default_input_name(self) -> str | None:
+        # Swallows everything: this is a background poll, not something a transient enumeration hiccup
+        # should ever be allowed to take the meeting down over. It just tries again next tick.
+        try:
+            return self._pyaudio.get_default_input_device_info().get("name")
+        except Exception:
+            return None
+
+    def _current_default_loopback_name(self) -> str | None:
+        try:
+            return self._get_default_loopback_device(self._pyaudio_module).get("name")
+        except Exception:
+            return None
 
     def stop(self) -> RecordedAudio:
         if self._started_at is None:
             raise RuntimeError("Recorder.start() was never called")
+        # Stopped and joined before the lifecycle lock below, rather than under it: if a switch it
+        # triggered is mid-flight holding that lock, this waits for it to finish naturally (the watcher
+        # loop then sees _watch_stop_event and exits) instead of tearing down self._pyaudio while that
+        # switch might still be opening a stream on it.
+        self._watch_stop_event.set()
+        if self._watcher_thread is not None:
+            self._watcher_thread.join(timeout=5)
         with self._lifecycle_lock:
             self._mic_stop_event.set()
             self._system_stop_event.set()
