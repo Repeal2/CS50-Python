@@ -16,6 +16,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -414,6 +415,18 @@ class _SegmentedWavWriter:
     def close(self) -> None:
         self._close_current_part()
 
+    def start_new_part(self, channels: int, framerate: int) -> None:
+        """Forces a rollover into a fresh part right now, rather than waiting for the current one to
+        grow past MAX_WAV_DATA_BYTES — for when the *device* being captured changed (see
+        Recorder.switch_mic_device / switch_system_device), which can bring a different channel count
+        or sample rate that the current part's WAV header was already committed to and can't change
+        mid-file. The old part is closed with whatever it has so far; a new one starts with the new
+        device's parameters."""
+        self._close_current_part()
+        self._channels = channels
+        self._framerate = framerate
+        self._open_next_part()
+
     def _part_path(self, number: int) -> Path:
         if number == 1:
             return self._base_path
@@ -465,6 +478,13 @@ class Recorder:
     back to the current Windows default rather than failing. Leave either as None to always use
     whatever Windows currently considers the default — the original, simpler behavior.
 
+    `switch_mic_device()` / `switch_system_device()` change the device a stream is reading from without
+    stopping the meeting: the other stream keeps recording uninterrupted, and the switched stream rolls
+    over into a new WAV part on the new device (see _SegmentedWavWriter.start_new_part) rather than
+    silently continuing to read from whatever device happened to be open — which is what used to happen
+    when a user changed their mic mid-meeting, producing a full-length recording of an idle device
+    instead of an error.
+
     While running, `mic_level` and `system_level` hold each stream's current input level (roughly 0..1,
     see `_pcm16_level`), updated every chunk by the capture threads — a GUI can poll these to show a
     live "is this actually picking up audio" meter without needing any thread synchronization beyond
@@ -491,13 +511,22 @@ class Recorder:
         self._mic_device_name = mic_device_name
         self._system_device_name = system_device_name
         self._pyaudio = None
+        self._pyaudio_module = None
         self._mic_thread: threading.Thread | None = None
         self._system_thread: threading.Thread | None = None
         self._mic_writer: _SegmentedWavWriter | None = None
         self._system_writer: _SegmentedWavWriter | None = None
         self._mic_monitor = _StreamActivityMonitor()
         self._system_monitor = _StreamActivityMonitor()
-        self._stop_event = threading.Event()
+        self._mic_stop_event = threading.Event()
+        self._system_stop_event = threading.Event()
+        # Serializes stop() against switch_mic_device()/switch_system_device(), and switches against
+        # each other. Without this, a switch racing stop() could still be opening a new stream on
+        # self._pyaudio in one thread while stop() is terminating that same PyAudio instance in
+        # another — exactly the kind of WASAPI/COM teardown race _pyaudio_lifecycle_lock exists to
+        # prevent across *different* Recorder instances, but that lock doesn't cover this in-instance
+        # case.
+        self._lifecycle_lock = threading.Lock()
         self._started_at: float | None = None
         self._mic_path = self._output_dir / "mic.wav"
         self._system_path = self._output_dir / "system.wav"
@@ -514,31 +543,120 @@ class Recorder:
             )
         import pyaudiowpatch as pyaudio
 
+        self._pyaudio_module = pyaudio
         with _pyaudio_lifecycle_lock:
             self._pyaudio = pyaudio.PyAudio()
-        self._stop_event.clear()
+        self._mic_stop_event.clear()
+        self._system_stop_event.clear()
         self._started_at = time.monotonic()
 
         mic_info = self._resolve_input_device(self._mic_device_name)
         system_info = self._resolve_loopback_device(pyaudio, self._system_device_name)
 
-        self._mic_writer, self._mic_thread = self._spawn_capture_thread(
-            pyaudio, mic_info, self._mic_path, "mic_level", self._mic_monitor, "Microphone"
+        self._mic_writer = _SegmentedWavWriter(
+            self._mic_path, int(mic_info["maxInputChannels"]), SAMPLE_WIDTH_BYTES,
+            int(mic_info["defaultSampleRate"]),
         )
-        self._system_writer, self._system_thread = self._spawn_capture_thread(
-            pyaudio, system_info, self._system_path, "system_level", self._system_monitor, "System audio"
+        self._mic_thread = self._spawn_capture_thread(
+            pyaudio, mic_info, self._mic_writer, "mic_level", self._mic_monitor, "Microphone",
+            self._mic_stop_event,
         )
+
+        self._system_writer = _SegmentedWavWriter(
+            self._system_path, int(system_info["maxInputChannels"]), SAMPLE_WIDTH_BYTES,
+            int(system_info["defaultSampleRate"]),
+        )
+        self._system_thread = self._spawn_capture_thread(
+            pyaudio, system_info, self._system_writer, "system_level", self._system_monitor,
+            "System audio", self._system_stop_event,
+        )
+
+    def switch_mic_device(self, device_name: str | None) -> None:
+        """Moves the microphone stream to a different device without stopping the meeting. The system-
+        audio stream is untouched. `device_name` follows the same convention as the constructor: None
+        means "whatever Windows currently considers the default"."""
+        with self._lifecycle_lock:
+            self._switch_stream(
+                stop_event=self._mic_stop_event,
+                writer=self._mic_writer,
+                level_attr="mic_level",
+                monitor=self._mic_monitor,
+                label="Microphone",
+                thread_attr="_mic_thread",
+                device_name_attr="_mic_device_name",
+                resolve=lambda: self._resolve_input_device(device_name),
+                device_name=device_name,
+            )
+
+    def switch_system_device(self, device_name: str | None) -> None:
+        """Moves the system-audio (loopback) stream to a different device without stopping the meeting.
+        The microphone stream is untouched."""
+        with self._lifecycle_lock:
+            self._switch_stream(
+                stop_event=self._system_stop_event,
+                writer=self._system_writer,
+                level_attr="system_level",
+                monitor=self._system_monitor,
+                label="System audio",
+                thread_attr="_system_thread",
+                device_name_attr="_system_device_name",
+                resolve=lambda: self._resolve_loopback_device(self._pyaudio_module, device_name),
+                device_name=device_name,
+            )
+
+    def _switch_stream(
+        self,
+        *,
+        stop_event: threading.Event,
+        writer: _SegmentedWavWriter | None,
+        level_attr: str,
+        monitor: _StreamActivityMonitor,
+        label: str,
+        thread_attr: str,
+        device_name_attr: str,
+        resolve: Callable[[], dict],
+        device_name: str | None,
+    ) -> None:
+        if self._started_at is None:
+            raise RuntimeError("Recorder.start() was never called")
+        if writer is None:
+            raise RuntimeError(f"{label} stream was never started")
+
+        # Stop only this stream's capture thread — the other one is left running, which is the whole
+        # point of switching one device without restarting the meeting.
+        stop_event.set()
+        old_thread: threading.Thread | None = getattr(self, thread_attr)
+        if old_thread is not None:
+            old_thread.join(timeout=5)
+
+        device_info = resolve()
+        setattr(self, device_name_attr, device_name)
+
+        # A new device can have a different channel count or sample rate than the old one, which a WAV
+        # file can't change mid-stream — roll over into a new part with the new device's parameters
+        # instead. Transcription already stitches parts back onto one clock (see
+        # transcription.engine.transcribe_parts), which is exactly what's needed here too.
+        writer.start_new_part(int(device_info["maxInputChannels"]), int(device_info["defaultSampleRate"]))
+
+        stop_event.clear()
+        new_thread = self._spawn_capture_thread(
+            self._pyaudio_module, device_info, writer, level_attr, monitor, label, stop_event
+        )
+        setattr(self, thread_attr, new_thread)
+        self._record_switch(f"{label} switched to {device_info['name']!r} mid-meeting.")
 
     def stop(self) -> RecordedAudio:
         if self._started_at is None:
             raise RuntimeError("Recorder.start() was never called")
-        self._stop_event.set()
-        for thread in (self._mic_thread, self._system_thread):
-            if thread is not None:
-                thread.join(timeout=5)
-        if self._pyaudio is not None:
-            with _pyaudio_lifecycle_lock:
-                self._pyaudio.terminate()
+        with self._lifecycle_lock:
+            self._mic_stop_event.set()
+            self._system_stop_event.set()
+            for thread in (self._mic_thread, self._system_thread):
+                if thread is not None:
+                    thread.join(timeout=5)
+            if self._pyaudio is not None:
+                with _pyaudio_lifecycle_lock:
+                    self._pyaudio.terminate()
         # The GUI may already have flagged these live; recording them here too is what puts them in
         # front of whoever reads the finished meeting, who wasn't necessarily watching at the time.
         for problem in self.input_problems():
@@ -586,6 +704,12 @@ class Recorder:
             # two separate things that went wrong, and both are worth saying.
             self._notices.append(f"{label} capture stopped early: {type(exc).__name__}: {exc}")
 
+    def _record_switch(self, message: str) -> None:
+        # Not deduplicated: switching back and forth between the same two devices should show every
+        # switch, not just the first.
+        with self._notices_lock:
+            self._notices.append(message)
+
     def _resolve_input_device(self, name: str | None) -> dict:
         chosen = _find_input_device(self._pyaudio, name)
         if chosen is not None:
@@ -632,15 +756,21 @@ class Recorder:
         self,
         pyaudio_module,
         device_info: dict,
-        path: Path,
+        writer: _SegmentedWavWriter,
         level_attr: str,
         monitor: _StreamActivityMonitor,
         label: str,
-    ) -> tuple[_SegmentedWavWriter, threading.Thread]:
+        stop_event: threading.Event,
+    ) -> threading.Thread:
+        """Starts one capture thread reading `device_info` into `writer` until `stop_event` is set —
+        either the meeting stopping (see stop()) or this one stream being switched to a different device
+        (see switch_mic_device/switch_system_device), which set only that stream's event and hand the
+        same writer to a freshly spawned thread on the new device, so the writer's WAV parts stay
+        continuous across the switch. `writer.close()` always runs when this thread ends, which finalizes
+        whatever part is currently open — the last one on a real stop, or the one being rolled over on a
+        switch."""
         channels = int(device_info["maxInputChannels"])
         rate = int(device_info["defaultSampleRate"])
-
-        writer = _SegmentedWavWriter(path, channels, SAMPLE_WIDTH_BYTES, rate)
 
         def run() -> None:
             stream = None
@@ -653,7 +783,7 @@ class Recorder:
                     input_device_index=device_info["index"],
                     frames_per_buffer=CHUNK_FRAMES,
                 )
-                while not self._stop_event.is_set():
+                while not stop_event.is_set():
                     data = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
                     writer.write(data)
                     stats = _analyze_pcm16(data)
@@ -676,6 +806,6 @@ class Recorder:
                         self._record_capture_failure(label, exc)
                 setattr(self, level_attr, 0.0)
 
-        thread = threading.Thread(target=run, daemon=True, name=f"recorder-{path.stem}")
+        thread = threading.Thread(target=run, daemon=True, name=f"recorder-{label.lower().replace(' ', '-')}")
         thread.start()
-        return writer, thread
+        return thread

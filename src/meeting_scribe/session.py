@@ -73,6 +73,17 @@ class MeetingSession:
         self._recorder.start()
         self._screen_watcher.start()
 
+    def switch_mic_device(self, device_name: str | None) -> None:
+        """Moves the mic recording to a different device mid-meeting instead of the old silent no-op
+        (picking a new device used to only change the *next* meeting's default — see Recorder for why
+        that used to produce a full-length recording of whatever device was originally opened, with no
+        error, if the user switched mics partway through)."""
+        self._recorder.switch_mic_device(device_name)
+
+    def switch_system_device(self, device_name: str | None) -> None:
+        """Moves the system-audio recording to a different device mid-meeting. See switch_mic_device."""
+        self._recorder.switch_system_device(device_name)
+
     def audio_levels(self) -> tuple[float, float]:
         """Current (mic, system) input levels, roughly 0..1 — lets the GUI show a live "is this actually
         picking up audio" meter while recording. Both are 0.0 before start() or after stop()."""
