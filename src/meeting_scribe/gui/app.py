@@ -34,6 +34,7 @@ from meeting_scribe.screen.region_picker import (
     pick_region_interactively,
     pin_region_to_window,
 )
+from meeting_scribe.screen.window_picker import WindowTarget, window_exists
 from meeting_scribe.session import MeetingSession, retry_meeting_transcription
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
@@ -76,6 +77,18 @@ def _has_no_mic_signal(problems: "tuple[str, ...]") -> bool:
     silence" — see its own "digital silence" test) rather than re-deriving the condition from scratch, so
     this stays in lockstep with whatever counts as that warning there."""
     return any(problem.startswith("Microphone:") and "digital silence" in problem for problem in problems)
+
+
+def _hwnd_to_watch_for_auto_stop(
+    target: "WindowTarget | RegionTarget | WindowRegionTarget | None",
+) -> int | None:
+    """The window handle "Stop when the screen-source window closes" should watch for this screen
+    target, or None if there isn't one to watch. A plain RegionTarget (fixed screen coordinates) and
+    "Entire screen" (None) have no associated window, so the checkbox simply has no effect when either is
+    selected — there's nothing for it to notice closing."""
+    if isinstance(target, (WindowTarget, WindowRegionTarget)):
+        return target.hwnd
+    return None
 
 
 def _add_scrollable_text_tab(notebook: ttk.Notebook, title: str) -> tk.Text:
@@ -235,6 +248,10 @@ class RecordTab(ttk.Frame):
     PIN_NONE_LABEL = "(fixed position)"
     # Long enough to say a sentence into the microphone, short enough that nobody skips the test.
     MIC_TEST_SECONDS = 3.0
+    # How often _poll_auto_stop checks whether a watched screen-source window has closed. Frequent enough
+    # that "forgot to click Stop" doesn't leave a meeting recording for long after the call actually
+    # ended; infrequent enough that it's not worth its own tighter polling loop than that.
+    _AUTO_STOP_POLL_MS = 2000
 
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
@@ -242,6 +259,13 @@ class RecordTab(ttk.Frame):
         self._window_targets: list = []
         self._region_target: RegionTarget | WindowRegionTarget | None = None
         self._region_outline: RegionOutline | None = None
+        # The (session, hwnd) pair _poll_auto_stop watches for "stop when the screen-source window
+        # closes" — None whenever that isn't in effect for whatever's currently recording (checkbox left
+        # unchecked, or "Entire screen"/a fixed area was the screen source). Captured once at Start, like
+        # screen_target itself; comparing the session by identity is what makes this automatically inert
+        # the instant Stop is pressed (by the poll itself or manually) or a different meeting starts,
+        # with no separate cleanup needed beyond what _stop() already does.
+        self._auto_stop_watch: tuple[MeetingSession, int] | None = None
         self._input_devices: list = []
         self._loopback_devices: list = []
         # Which session's recorder notices have already been written to the activity log, how many of
@@ -300,22 +324,35 @@ class RecordTab(ttk.Frame):
         )
         self.pin_window_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
 
-        ttk.Label(form, text="Microphone").grid(row=4, column=0, sticky="w")
+        # Off by default, and only meaningful when the screen source picked at Start is a specific
+        # window or an area pinned to one (see _hwnd_to_watch_for_auto_stop) — there's no window handle
+        # to watch for "Entire screen" or a fixed-position area, so checking this with either of those
+        # selected simply has no effect. Read once at Start, like screen_target itself; changing the
+        # dropdown or this checkbox mid-meeting doesn't retroactively change what's being watched.
+        ttk.Label(form, text="Auto-stop").grid(row=4, column=0, sticky="w")
+        self.stop_on_window_close_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            form,
+            text="Stop recording when the screen-source window closes",
+            variable=self.stop_on_window_close_var,
+        ).grid(row=4, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Label(form, text="Microphone").grid(row=5, column=0, sticky="w")
         self.mic_var = tk.StringVar(value=self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
         self.mic_combo = ttk.Combobox(form, textvariable=self.mic_var, width=40, state="readonly")
-        self.mic_combo.grid(row=4, column=1, sticky="we", padx=6, pady=4)
+        self.mic_combo.grid(row=5, column=1, sticky="we", padx=6, pady=4)
         self.mic_combo.bind("<<ComboboxSelected>>", self._on_devices_changed)
 
-        ttk.Label(form, text="System audio (speaker)").grid(row=5, column=0, sticky="w")
+        ttk.Label(form, text="System audio (speaker)").grid(row=6, column=0, sticky="w")
         self.system_var = tk.StringVar(
             value=self.app.settings.system_device_name or SYSTEM_DEFAULT_LABEL
         )
         self.system_combo = ttk.Combobox(form, textvariable=self.system_var, width=40, state="readonly")
-        self.system_combo.grid(row=5, column=1, sticky="we", padx=6, pady=4)
+        self.system_combo.grid(row=6, column=1, sticky="we", padx=6, pady=4)
         self.system_combo.bind("<<ComboboxSelected>>", self._on_devices_changed)
 
         device_buttons = ttk.Frame(form)
-        device_buttons.grid(row=4, column=2, rowspan=2, padx=(6, 0))
+        device_buttons.grid(row=5, column=2, rowspan=2, padx=(6, 0))
         ttk.Button(device_buttons, text="Refresh devices", command=self._refresh_devices).pack(fill="x")
         # Before a meeting is the only moment when a quiet microphone is unambiguous — the user knows
         # they're supposed to be making noise — and the moment when fixing it costs nothing.
@@ -416,6 +453,7 @@ class RecordTab(ttk.Frame):
         self._refresh_devices()
         self._poll_audio_levels()
         self._poll_region_outline()
+        self._poll_auto_stop()
 
     def refresh_projects(self) -> None:
         names = [p.name for p in self.app.db.list_projects()]
@@ -542,6 +580,22 @@ class RecordTab(ttk.Frame):
             if rect is not None:
                 self._region_outline.reposition(rect)
         self.after(400, self._poll_region_outline)
+
+    def _poll_auto_stop(self) -> None:
+        """Stops the currently recording meeting on its own once its screen-source window (a specific
+        window, or an area pinned to one) closes — for apps like Teams/Zoom that open a distinct call
+        window and close it, not just minimize it, the instant the call ends, this means a forgotten Stop
+        button doesn't leave the meeting recording indefinitely. Only in effect when "Stop when the
+        screen-source window closes" was checked at Start (see _start's use of
+        _hwnd_to_watch_for_auto_stop) — a no-op otherwise, including for "Entire screen" or a
+        fixed-position area, neither of which has a window to watch."""
+        if self._auto_stop_watch is not None:
+            session, hwnd = self._auto_stop_watch
+            if session is self.app._session and not window_exists(hwnd):
+                self._auto_stop_watch = None
+                self._log(f'[{session.title}] Screen-source window closed — stopping automatically.')
+                self._stop()
+        self.after(self._AUTO_STOP_POLL_MS, self._poll_auto_stop)
 
     def select_project(self, name: str) -> None:
         self.project_var.set(name)
@@ -714,13 +768,14 @@ class RecordTab(ttk.Frame):
             messagebox.showerror("Meeting Scribe", "Enter a project name first.")
             return
         meeting_title = self.title_var.get()
+        screen_target = self._selected_screen_target()
         try:
             session = MeetingSession(
                 self.app.settings,
                 self.app.db,
                 project_name,
                 meeting_title,
-                screen_target=self._selected_screen_target(),
+                screen_target=screen_target,
             )
             session.start()
         except RuntimeError as exc:
@@ -728,6 +783,11 @@ class RecordTab(ttk.Frame):
             return
 
         self.app._session = session
+        # Only takes effect if the screen source has a window to watch in the first place — see
+        # _hwnd_to_watch_for_auto_stop — and only for this meeting: unchecking the box or changing the
+        # screen source afterwards doesn't retroactively stop watching (or start watching) anything.
+        watched_hwnd = _hwnd_to_watch_for_auto_stop(screen_target) if self.stop_on_window_close_var.get() else None
+        self._auto_stop_watch = (session, watched_hwnd) if watched_hwnd is not None else None
         self.status_var.set(f"Recording — {project_name} / {meeting_title}")
         self.start_button["state"] = "disabled"
         self.stop_button["state"] = "normal"
@@ -804,6 +864,10 @@ class RecordTab(ttk.Frame):
         # the next meeting. Everything the background job needs (the session, its title) is already
         # captured in this closure, so the app has no more use for the "current" session slot.
         self.app._session = None
+        # Redundant when _poll_auto_stop is what called _stop() (it already cleared this before doing
+        # so), but necessary for a manual click on the Stop button — either way, nothing should still be
+        # watching a session that's no longer the active one.
+        self._auto_stop_watch = None
 
         self.stop_button["state"] = "disabled"
         self.capture_attendees_button["state"] = "disabled"

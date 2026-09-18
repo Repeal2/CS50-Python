@@ -42,8 +42,10 @@ def list_capturable_windows() -> list[WindowTarget]:
 
 
 def get_window_region(hwnd: int) -> dict | None:
-    """Returns an mss-compatible capture region for the window, or None if it's been closed or
-    minimized since it was selected (the caller should skip that capture cycle)."""
+    """Returns an mss-compatible capture region for the window, or None if it's been closed *or*
+    minimized since it was selected (the caller should skip that capture cycle either way — there's
+    nothing to grab a screenshot of). That conflation is fine for screen capture, but wrong for anything
+    that needs to tell "closed" apart from "temporarily minimized" — see window_exists for that."""
     if sys.platform != "win32":
         raise RuntimeError("Window capture requires Windows (win32gui)")
     import win32gui
@@ -55,3 +57,16 @@ def get_window_region(hwnd: int) -> dict | None:
     if width <= 0 or height <= 0:
         return None
     return {"left": left, "top": top, "width": width, "height": height}
+
+
+def window_exists(hwnd: int) -> bool:
+    """Whether this window handle still refers to a real window at all — true even while it's minimized
+    or hidden, unlike get_window_region's None (which also covers "temporarily not capturable" and so
+    can't be used to tell a closed window from a merely minimized one). This is the right check for "has
+    the window actually closed" — see gui.app's "stop recording when the screen-source window closes",
+    where mistaking a minimized Teams call for an ended one would stop a meeting still in progress."""
+    if sys.platform != "win32":
+        raise RuntimeError("Window state requires Windows (win32gui)")
+    import win32gui
+
+    return bool(win32gui.IsWindow(hwnd))

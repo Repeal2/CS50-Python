@@ -68,3 +68,41 @@ def test_no_mic_signal_ignores_other_kinds_of_mic_and_system_problems():
         "at the driver.",
     )
     assert gui_app._has_no_mic_signal(problems) is False
+
+
+def test_hwnd_to_watch_for_auto_stop_finds_a_whole_window_targets_handle():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    from meeting_scribe.screen.window_picker import WindowTarget
+
+    target = WindowTarget(hwnd=4242, title="Microsoft Teams")
+    assert gui_app._hwnd_to_watch_for_auto_stop(target) == 4242
+
+
+def test_hwnd_to_watch_for_auto_stop_finds_a_window_pinned_areas_handle():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    from meeting_scribe.screen.region_picker import WindowRegionTarget
+
+    target = WindowRegionTarget(
+        hwnd=4242,
+        window_title="Microsoft Teams",
+        offset_left_frac=0.1,
+        offset_top_frac=0.1,
+        width_frac=0.5,
+        height_frac=0.2,
+        picked_width=300,
+        picked_height=100,
+    )
+    assert gui_app._hwnd_to_watch_for_auto_stop(target) == 4242
+
+
+def test_hwnd_to_watch_for_auto_stop_is_none_for_the_whole_screen():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._hwnd_to_watch_for_auto_stop(None) is None
+
+
+def test_hwnd_to_watch_for_auto_stop_is_none_for_a_fixed_position_area():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    from meeting_scribe.screen.region_picker import RegionTarget
+
+    target = RegionTarget(left=10, top=10, width=200, height=150)
+    assert gui_app._hwnd_to_watch_for_auto_stop(target) is None

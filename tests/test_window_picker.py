@@ -2,7 +2,12 @@ import sys
 
 import pytest
 
-from meeting_scribe.screen.window_picker import WindowTarget, get_window_region, list_capturable_windows
+from meeting_scribe.screen.window_picker import (
+    WindowTarget,
+    get_window_region,
+    list_capturable_windows,
+    window_exists,
+)
 
 # The functions guard on sys.platform, so what's testable differs by platform: off Windows we can only
 # verify the guard raises; on Windows the guard is a no-op and we exercise the real win32gui calls.
@@ -20,6 +25,12 @@ def test_get_window_region_requires_windows():
         get_window_region(12345)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the platform guard only triggers off Windows")
+def test_window_exists_requires_windows():
+    with pytest.raises(RuntimeError):
+        window_exists(12345)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="exercises real win32gui calls")
 def test_list_capturable_windows_returns_window_targets_on_windows():
     windows = list_capturable_windows()
@@ -31,3 +42,8 @@ def test_list_capturable_windows_returns_window_targets_on_windows():
 def test_get_window_region_returns_none_for_nonexistent_window_on_windows():
     # A window handle this large is essentially guaranteed not to exist.
     assert get_window_region(999_999_999) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="exercises real win32gui calls")
+def test_window_exists_is_false_for_a_nonexistent_window_on_windows():
+    assert window_exists(999_999_999) is False
