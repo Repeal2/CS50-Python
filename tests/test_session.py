@@ -28,6 +28,15 @@ def _settings(
     )
 
 
+@pytest.fixture(autouse=True)
+def _plenty_of_memory(monkeypatch):
+    """Keeps transcription.engine's low-memory warning out of tests that aren't specifically exercising
+    it. Without this, exact on_progress message-list assertions below would be at the mercy of how much
+    RAM happens to be free on whatever machine actually runs the suite; tests that want to exercise the
+    warning override this with a low value of their own."""
+    monkeypatch.setattr("meeting_scribe.session.available_memory_mb", lambda: 1_000_000.0)
+
+
 def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
@@ -326,6 +335,36 @@ def test_session_stop_reports_progress_through_each_stage(tmp_path):
             ]
 
 
+def test_stop_reports_a_low_memory_warning_before_transcribing(tmp_path, monkeypatch):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=(tmp_path / "mic.wav",),
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
+        )
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+        monkeypatch.setattr("meeting_scribe.session.available_memory_mb", lambda: 10.0)
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+
+            messages = []
+            session.stop(on_progress=messages.append)
+
+            warnings = [m for m in messages if m.startswith("Low memory warning")]
+            assert len(warnings) == 1
+            # The warning has to land before transcription actually starts, not alongside or after it —
+            # otherwise it's just a postmortem, not the heads-up it's meant to be.
+            assert messages.index(warnings[0]) < messages.index("Transcription complete.")
+
+
 def test_session_stop_reports_skip_message_without_a_copilot_sync_dir(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
@@ -618,6 +657,25 @@ def test_retry_reports_progress(tmp_path):
                 "Copilot sync folder not configured — nothing pushed.",
                 "Meeting saved.",
             ]
+
+
+def test_retry_reports_a_low_memory_warning_before_transcribing(tmp_path, monkeypatch):
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+        monkeypatch.setattr("meeting_scribe.session.available_memory_mb", lambda: 10.0)
+
+        from meeting_scribe.session import retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            _project, meeting_id = _stuck_meeting(settings, db)
+
+            messages = []
+            retry_meeting_transcription(settings, db, meeting_id, on_progress=messages.append)
+
+            warnings = [m for m in messages if m.startswith("Low memory warning")]
+            assert len(warnings) == 1
+            assert messages.index(warnings[0]) < messages.index("Transcription complete.")
 
 
 def test_retry_replaces_segments_left_by_an_earlier_partial_attempt(tmp_path):

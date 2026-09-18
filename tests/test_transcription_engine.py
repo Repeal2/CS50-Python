@@ -6,6 +6,8 @@ from types import ModuleType
 from meeting_scribe.transcription.engine import (
     TranscriptLine,
     WhisperTranscriber,
+    available_memory_mb,
+    low_memory_warning,
     merge_transcript_lines,
     render_transcript,
     wav_duration_seconds,
@@ -39,6 +41,43 @@ def test_ensure_model_forces_cpu_device(monkeypatch):
 
     assert captured_kwargs["model_size_or_path"] == "small"
     assert captured_kwargs["device"] == "cpu"
+
+
+def test_available_memory_mb_is_none_off_windows(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert available_memory_mb() is None
+
+
+def test_low_memory_warning_is_none_when_memory_could_not_be_measured():
+    # available_memory_mb() returns None off Windows or if the OS call itself fails — silence is safer
+    # than a false alarm when there's nothing real to compare against.
+    assert low_memory_warning("small", available_mb=None) is None
+
+
+def test_low_memory_warning_is_none_with_plenty_of_headroom():
+    assert low_memory_warning("small", available_mb=100_000) is None
+
+
+def test_low_memory_warning_fires_when_headroom_is_thin():
+    warning = low_memory_warning("small", available_mb=200)
+    assert warning is not None
+    assert "small" in warning
+    assert "200" in warning
+
+
+def test_low_memory_warning_scales_with_model_size():
+    # The same amount of free memory that's fine for "small" should trip the warning for "medium", which
+    # needs meaningfully more.
+    assert low_memory_warning("small", available_mb=1100) is None
+    assert low_memory_warning("medium", available_mb=1100) is not None
+
+
+def test_low_memory_warning_falls_back_to_a_default_for_an_unrecognized_model_name():
+    # e.g. a distil-*/.en variant set directly via MEETING_SCRIBE_WHISPER_MODEL rather than picked from
+    # the Settings tab dropdown — not in the lookup table, but still worth checking against a reasonable
+    # default rather than skipping the check entirely.
+    assert low_memory_warning("distil-medium.en", available_mb=200) is not None
+    assert low_memory_warning("distil-medium.en", available_mb=100_000) is None
 
 
 def test_merge_interleaves_by_timestamp():

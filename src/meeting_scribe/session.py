@@ -24,6 +24,8 @@ from meeting_scribe.storage.database import Database
 from meeting_scribe.transcription.engine import (
     TranscriptLine,
     WhisperTranscriber,
+    available_memory_mb,
+    low_memory_warning,
     merge_transcript_lines,
     render_transcript,
 )
@@ -124,6 +126,13 @@ class MeetingSession:
         # that comes out of it is genuinely incomplete, and the reason is worth having on the record.
         for message in recorded.notices:
             report(message)
+
+        # Checked right before the expensive part starts, not any earlier — a warning here is what a
+        # `mkl_malloc: failed to allocate memory` crash further down would otherwise give no advance
+        # notice of at all (see transcription.engine.low_memory_warning).
+        warning = low_memory_warning(self._settings.whisper_model_size, available_memory_mb())
+        if warning is not None:
+            report(warning)
 
         mic_lines = self._transcriber.transcribe_parts(recorded.mic_paths, source="mic")
         system_lines = self._transcriber.transcribe_parts(recorded.system_paths, source="system")
@@ -226,6 +235,10 @@ def retry_meeting_transcription(
         raise FileNotFoundError(
             f'No recorded audio found for "{meeting.title}" in {meeting_dir} — nothing to retranscribe.'
         )
+
+    warning = low_memory_warning(settings.whisper_model_size, available_memory_mb())
+    if warning is not None:
+        report(warning)
 
     transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
     mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")

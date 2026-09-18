@@ -1130,15 +1130,24 @@ class ProjectsTab(ttk.Frame):
         self.retry_button["state"] = "disabled"
         self.retry_status_var.set(f'Retrying transcription for "{meeting.title}"…')
 
+        def report(message: str) -> None:
+            # Surfaces things like transcription.engine's low-memory warning while the retry is running —
+            # but only if the user is still looking at this meeting (see _still_viewing).
+            self.after(0, self._show_retry_progress, meeting.id, message)
+
         def worker() -> None:
             try:
-                retry_meeting_transcription(self.app.settings, self.app.db, meeting.id)
+                retry_meeting_transcription(self.app.settings, self.app.db, meeting.id, on_progress=report)
             except Exception as exc:
                 self.after(0, self._on_retry_failed, meeting.id, meeting.title, exc)
                 return
             self.after(0, self._on_retry_done, meeting.id, meeting.title)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_retry_progress(self, meeting_id: int, message: str) -> None:
+        if self._still_viewing(meeting_id):
+            self.retry_status_var.set(message)
 
     def _still_viewing(self, meeting_id: int) -> bool:
         """Whether the meeting a background retry just finished for is still the one on screen — by the
