@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from meeting_scribe.audio.recorder import RecordedAudio
 from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent
@@ -484,6 +486,162 @@ def test_session_transcribes_every_recorded_part(tmp_path):
             session.stop()
 
             MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic")
+
+
+def _stuck_meeting(settings: Settings, db: Database, project_name="Test Project", title="Kickoff"):
+    """Simulates a meeting whose recording finished but whose transcription didn't: a meeting row with no
+    `ended_at`, plus real (if fake) audio files sitting exactly where MeetingSession.stop() would have
+    left them — the state a `mkl_malloc: failed to allocate memory` crash mid-transcription leaves
+    behind."""
+    project = db.get_or_create_project(project_name)
+    meeting_id = db.create_meeting(project.id, title)
+    meeting_dir = settings.meeting_dir(project.slug, meeting_id)
+    meeting_dir.mkdir(parents=True, exist_ok=True)
+    (meeting_dir / "mic.wav").write_bytes(b"fake mic audio")
+    (meeting_dir / "system.wav").write_bytes(b"fake system audio")
+    return project, meeting_id
+
+
+def test_retry_transcribes_recorded_audio_and_finishes_the_meeting(tmp_path):
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+
+        def fake_transcribe(paths, source):
+            if source == "mic":
+                return [TranscriptLine(1.0, "mic", "let's get started")]
+            return [TranscriptLine(2.0, "system", "sounds good")]
+
+        MockTranscriber.return_value.transcribe_parts.side_effect = fake_transcribe
+
+        from meeting_scribe.session import retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            _project, meeting_id = _stuck_meeting(settings, db)
+
+            result = retry_meeting_transcription(settings, db, meeting_id)
+
+            assert "let's get started" in result
+            assert "sounds good" in result
+            meeting = db.get_meeting(meeting_id)
+            assert meeting.transcript_text == result
+            assert meeting.ended_at is not None
+            assert len(db.get_segments(meeting_id)) == 2
+
+
+def test_retry_raises_when_the_meeting_already_has_a_transcript(tmp_path):
+    from meeting_scribe.session import retry_meeting_transcription
+
+    with Database(tmp_path / "test.db") as db:
+        settings = _settings(tmp_path)
+        _project, meeting_id = _stuck_meeting(settings, db)
+        db.finish_meeting(meeting_id, transcript_text="already done")
+
+        with pytest.raises(ValueError):
+            retry_meeting_transcription(settings, db, meeting_id)
+
+
+def test_retry_raises_for_a_meeting_id_that_does_not_exist(tmp_path):
+    from meeting_scribe.session import retry_meeting_transcription
+
+    with Database(tmp_path / "test.db") as db:
+        settings = _settings(tmp_path)
+
+        with pytest.raises(ValueError):
+            retry_meeting_transcription(settings, db, 999)
+
+
+def test_retry_raises_when_no_audio_was_ever_recorded(tmp_path):
+    from meeting_scribe.session import retry_meeting_transcription
+
+    with Database(tmp_path / "test.db") as db:
+        settings = _settings(tmp_path)
+        project = db.get_or_create_project("Test Project")
+        meeting_id = db.create_meeting(project.id, "Kickoff")  # no audio files written for it
+
+        with pytest.raises(FileNotFoundError):
+            retry_meeting_transcription(settings, db, meeting_id)
+
+
+def test_retry_transcribes_every_recorded_part(tmp_path):
+    # A meeting long enough to overflow a WAV header left several numbered part files behind — retry has
+    # to rediscover all of them from disk, not just the plainly-named first one.
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+
+        from meeting_scribe.session import retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            project, meeting_id = _stuck_meeting(settings, db)
+            meeting_dir = settings.meeting_dir(project.slug, meeting_id)
+            (meeting_dir / "mic.part2.wav").write_bytes(b"more fake mic audio")
+
+            retry_meeting_transcription(settings, db, meeting_id)
+
+            mic_paths = (meeting_dir / "mic.wav", meeting_dir / "mic.part2.wav")
+            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic")
+
+
+def test_retry_pushes_to_copilot_studio_when_a_sync_dir_is_configured(tmp_path):
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path, copilot_sync_dir=tmp_path / "Bridge")
+            _project, meeting_id = _stuck_meeting(settings, db)
+
+            retry_meeting_transcription(settings, db, meeting_id)
+
+            inbox_dir = tmp_path / "Bridge" / "Inbox"
+            meeting_code = db.get_meeting(meeting_id).meeting_code
+            manifest = json.loads((inbox_dir / f"{meeting_code}_done.json").read_text())
+            assert manifest["meetingID"] == meeting_code
+
+
+def test_retry_reports_progress(tmp_path):
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            _project, meeting_id = _stuck_meeting(settings, db)
+
+            messages = []
+            retry_meeting_transcription(settings, db, meeting_id, on_progress=messages.append)
+
+            assert messages == [
+                "Transcription complete.",
+                "Copilot sync folder not configured — nothing pushed.",
+                "Meeting saved.",
+            ]
+
+
+def test_retry_replaces_segments_left_by_an_earlier_partial_attempt(tmp_path):
+    # Simulates a retry that transcribed fine but then failed later (e.g. pushing to Copilot Studio) —
+    # its segments were already committed to the DB even though the meeting was never marked finished. A
+    # second retry has to replace those, not add to them.
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+
+        def fake_transcribe(paths, source):
+            return [TranscriptLine(1.0, "mic", "hello")] if source == "mic" else []
+
+        MockTranscriber.return_value.transcribe_parts.side_effect = fake_transcribe
+
+        from meeting_scribe.session import retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            _project, meeting_id = _stuck_meeting(settings, db)
+            db.add_transcript_segment(meeting_id, "mic", 0.0, "leftover from a failed earlier retry")
+
+            retry_meeting_transcription(settings, db, meeting_id)
+
+            segments = db.get_segments(meeting_id)
+            assert [s["text"] for s in segments] == ["hello"]
 
 
 def test_session_reads_input_health_through_to_the_recorder(tmp_path):

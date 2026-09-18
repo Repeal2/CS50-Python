@@ -32,7 +32,7 @@ from meeting_scribe.screen.region_picker import (
     pick_region_interactively,
     pin_region_to_window,
 )
-from meeting_scribe.session import MeetingSession
+from meeting_scribe.session import MeetingSession, retry_meeting_transcription
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
 from meeting_scribe.transcription.engine import TranscriptLine, render_transcript
@@ -46,6 +46,15 @@ SYSTEM_DEFAULT_LABEL = "System default"
 # bullet) just matches its leading whitespace, so it stays plain rather than getting a bullet forced on.
 _NOTES_BULLET_PREFIX = re.compile(r"^[ \t]*(?:[-*•]\s+)?")
 _NOTES_INDENT = "    "
+
+# Shown on the Projects tab for a meeting whose recording finished but whose transcription didn't (see
+# session.retry_meeting_transcription) — e.g. a `mkl_malloc: failed to allocate memory` crash partway
+# through a long meeting. The recorded audio survives that crash; only the transcript is missing.
+_UNFINISHED_MEETING_NOTICE = (
+    "Transcription didn't finish for this meeting, but the recording is safe. Retry to transcribe it "
+    "— note that on-screen text captured during the meeting can't be recovered this way, only spoken "
+    "audio."
+)
 
 
 def _format_meeting_timestamp(iso_string: str) -> str:
@@ -940,6 +949,22 @@ class ProjectsTab(ttk.Frame):
         right = ttk.Frame(self)
         right.pack(side="left", fill="both", expand=True, padx=12, pady=12)
 
+        # Shown only for a meeting whose recording finished but whose transcription didn't (e.g. it hit
+        # an out-of-memory error) — the audio is safe on disk, so this re-runs transcription from it
+        # instead of asking the user to re-record. Hidden (empty label, disabled button) for a meeting
+        # that already has a transcript.
+        retry_bar = ttk.Frame(right)
+        retry_bar.pack(fill="x", pady=(0, 8))
+        self.retry_status_var = tk.StringVar()
+        ttk.Label(
+            retry_bar, textvariable=self.retry_status_var, foreground="#a33", wraplength=440,
+            justify="left",
+        ).pack(side="left", fill="x", expand=True)
+        self.retry_button = ttk.Button(
+            retry_bar, text="Retry Transcription…", command=self._retry_transcription, state="disabled"
+        )
+        self.retry_button.pack(side="right", anchor="n")
+
         # Selecting a meeting fans its details out across these tabs, rather than dumping everything
         # into one pane — the raw on-screen OCR log, the spoken-audio transcript, and the notes the user
         # typed themselves during the meeting are different things a user reaches for at different times.
@@ -1065,6 +1090,8 @@ class ProjectsTab(ttk.Frame):
         self._meeting_documents = []
         self.meeting_documents_list.delete(0, "end")
         _set_text(self.meeting_document_viewer, "")
+        self.retry_status_var.set("")
+        self.retry_button["state"] = "disabled"
 
     def _on_meeting_selected(self, _event) -> None:
         meeting = self._selected_meeting()
@@ -1081,7 +1108,62 @@ class ProjectsTab(ttk.Frame):
         _set_text(self.manual_notes_text, meeting.manual_notes or "(no manual notes for this meeting)")
         _set_text(self.attendees_text, meeting.attendees or "(no attendees captured)")
 
+        if meeting.ended_at is None:
+            self.retry_status_var.set(_UNFINISHED_MEETING_NOTICE)
+            self.retry_button["state"] = "normal"
+        else:
+            self.retry_status_var.set("")
+            self.retry_button["state"] = "disabled"
+
         self._load_meeting_documents(meeting.id)
+
+    def _retry_transcription(self) -> None:
+        """Re-runs transcription for the selected (unfinished) meeting on a background thread — mirrors
+        RecordTab._stop's pattern of keeping the UI responsive while faster-whisper runs. Disabled while
+        it's running so a slow retry can't be double-clicked into two overlapping ones for the same
+        meeting."""
+        meeting = self._selected_meeting()
+        if meeting is None:
+            return
+        self.retry_button["state"] = "disabled"
+        self.retry_status_var.set(f'Retrying transcription for "{meeting.title}"…')
+
+        def worker() -> None:
+            try:
+                retry_meeting_transcription(self.app.settings, self.app.db, meeting.id)
+            except Exception as exc:
+                self.after(0, self._on_retry_failed, meeting.id, meeting.title, exc)
+                return
+            self.after(0, self._on_retry_done, meeting.id, meeting.title)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _still_viewing(self, meeting_id: int) -> bool:
+        """Whether the meeting a background retry just finished for is still the one on screen — by the
+        time a retry completes, the user may have clicked to a different meeting or project entirely, and
+        neither the selection nor the detail pane should jump back out from under them (same reasoning as
+        RecordTab._on_stop_done not overwriting a newer status)."""
+        selected = self._selected_meeting()
+        return selected is not None and selected.id == meeting_id
+
+    def _on_retry_done(self, meeting_id: int, meeting_title: str) -> None:
+        still_viewing_it = self._still_viewing(meeting_id)
+        if self._selected_project() is not None:
+            self._on_project_selected(None)  # reloads the meeting list, now with this one finished
+        if still_viewing_it:
+            for index, meeting in enumerate(self._meetings):
+                if meeting.id == meeting_id:
+                    self.meeting_list.selection_set(index)
+                    self.meeting_list.see(index)
+                    self._on_meeting_selected(None)
+                    break
+        messagebox.showinfo("Meeting Scribe", f'"{meeting_title}" transcribed successfully.')
+
+    def _on_retry_failed(self, meeting_id: int, meeting_title: str, exc: Exception) -> None:
+        if self._still_viewing(meeting_id):
+            self.retry_status_var.set(_UNFINISHED_MEETING_NOTICE)
+            self.retry_button["state"] = "normal"
+        messagebox.showerror("Meeting Scribe", f'Couldn\'t retry "{meeting_title}": {exc}')
 
     def _load_meeting_documents(self, meeting_id: int) -> None:
         self._meeting_documents = self.app.db.list_documents_for_meeting(meeting_id)

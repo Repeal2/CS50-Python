@@ -187,6 +187,11 @@ class Database:
             row = self._conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
         return Project(**dict(row)) if row else None
 
+    def get_project(self, project_id: int) -> Project | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return Project(**dict(row)) if row else None
+
     def list_projects(self) -> list[Project]:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
@@ -286,6 +291,15 @@ class Database:
                 "SELECT * FROM transcript_segments WHERE meeting_id = ? ORDER BY timestamp_seconds",
                 (meeting_id,),
             ).fetchall()
+
+    def clear_transcript_segments(self, meeting_id: int) -> None:
+        """Deletes every transcript segment recorded for one meeting. Used when retrying a meeting's
+        transcription (see session.retry_meeting_transcription) so that retrying twice — the first
+        attempt having inserted segments before failing on a later step, like the Copilot push — doesn't
+        leave the first attempt's segments sitting alongside a fresh set from the second."""
+        with self._lock:
+            self._conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?", (meeting_id,))
+            self._conn.commit()
 
     # -- Documents ------------------------------------------------------------
 

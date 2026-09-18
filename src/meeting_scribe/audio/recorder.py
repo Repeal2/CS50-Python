@@ -451,6 +451,27 @@ class _SegmentedWavWriter:
             wav_file.close()
 
 
+def discover_wav_parts(base_path: Path) -> tuple[Path, ...]:
+    """The inverse of _SegmentedWavWriter's part naming: given "mic.wav", finds however many parts of
+    that stream were actually written to disk ("mic.wav", "mic.part2.wav", ...) and returns them in
+    order. Stops at the first missing number, which is safe because parts are always written
+    sequentially with no gaps.
+
+    This is what lets a stream be re-transcribed later from just its base path — no live
+    _SegmentedWavWriter or Recorder needed — which retrying a meeting whose transcription failed (see
+    session.retry_meeting_transcription) relies on."""
+    parts: list[Path] = []
+    number = 1
+    while True:
+        path = base_path if number == 1 else base_path.with_name(
+            f"{base_path.stem}.part{number}{base_path.suffix}"
+        )
+        if not path.exists():
+            return tuple(parts)
+        parts.append(path)
+        number += 1
+
+
 @dataclass(frozen=True)
 class RecordedAudio:
     """`mic_paths` / `system_paths` are each one capture stream in chronological order — normally a

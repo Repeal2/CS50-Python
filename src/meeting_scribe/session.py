@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
-from meeting_scribe.audio.recorder import Recorder
+from meeting_scribe.audio.recorder import Recorder, discover_wav_parts
 from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
 from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
@@ -183,3 +183,94 @@ class MeetingSession:
         self._db.finish_meeting(self.meeting_id, transcript_text=transcript_text)
         report("Meeting saved.")
         return transcript_text
+
+
+def retry_meeting_transcription(
+    settings: Settings,
+    db: Database,
+    meeting_id: int,
+    on_progress: Callable[[str], None] | None = None,
+) -> str:
+    """Re-runs transcription for a meeting whose recording finished but whose transcription didn't — the
+    situation left behind by, say, a `mkl_malloc: failed to allocate memory` crash partway through a long
+    meeting (transcription is the expensive, failure-prone step; MeetingSession.stop() already writes the
+    mic/system WAV files to disk before attempting it). This works from those files directly, so nothing
+    has to be re-recorded.
+
+    On-screen OCR text isn't recoverable this way: it only ever lived in the failed MeetingSession's
+    in-memory `_screen_events` list, which was lost along with that session, so a retried transcript
+    covers spoken audio only — the GUI should make that limitation visible rather than presenting the
+    result as a complete redo.
+
+    Raises ValueError if the meeting (or its project) doesn't exist, or if the meeting already has a
+    transcript (nothing to retry); raises FileNotFoundError if no recorded audio can be found for it.
+    """
+
+    def report(message: str) -> None:
+        if on_progress is not None:
+            on_progress(message)
+
+    meeting = db.get_meeting(meeting_id)
+    if meeting is None:
+        raise ValueError(f"No meeting with id {meeting_id}")
+    if meeting.ended_at is not None:
+        raise ValueError(f'"{meeting.title}" already has a transcript — nothing to retry.')
+    project = db.get_project(meeting.project_id)
+    if project is None:
+        raise ValueError(f"Meeting {meeting_id}'s project no longer exists")
+
+    meeting_dir = settings.meeting_dir(project.slug, meeting_id)
+    mic_paths = discover_wav_parts(meeting_dir / "mic.wav")
+    system_paths = discover_wav_parts(meeting_dir / "system.wav")
+    if not mic_paths and not system_paths:
+        raise FileNotFoundError(
+            f'No recorded audio found for "{meeting.title}" in {meeting_dir} — nothing to retranscribe.'
+        )
+
+    transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
+    mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")
+    system_lines = transcriber.transcribe_parts(system_paths, source="system")
+    report("Transcription complete.")
+
+    audio_lines = merge_transcript_lines(mic_lines, system_lines)
+    transcript_text = render_transcript(audio_lines)
+
+    # Clears any segments a previous, partially-successful retry left behind (e.g. one that transcribed
+    # fine but then failed pushing to Copilot Studio) before inserting this attempt's — otherwise a
+    # second retry would leave both attempts' segments sitting side by side.
+    db.clear_transcript_segments(meeting_id)
+    for line in audio_lines:
+        db.add_transcript_segment(meeting_id, line.source, line.timestamp_seconds, line.text)
+
+    if settings.copilot_sync_dir is not None:
+        text_reference_documents = []
+        if meeting.manual_notes and meeting.manual_notes.strip():
+            text_reference_documents.append(
+                TextReferenceDocument(original_filename="meeting-notes.txt", content=meeting.manual_notes)
+            )
+        if meeting.attendees and meeting.attendees.strip():
+            text_reference_documents.append(
+                TextReferenceDocument(original_filename="attendees.txt", content=meeting.attendees)
+            )
+        reference_documents = [
+            ReferenceDocument(original_filename=row["filename"], source_path=Path(row["source_path"]))
+            for row in db.list_documents_for_meeting(meeting_id)
+            if row["source_path"]
+        ]
+        push_meeting_package(
+            meeting_code=meeting.meeting_code,
+            project_name=project.name,
+            meeting_title=meeting.title,
+            audio_transcript_text=transcript_text,
+            screen_transcript_text="",
+            reference_documents=reference_documents,
+            text_reference_documents=text_reference_documents,
+            inbox_dir=settings.copilot_inbox_dir,
+        )
+        report("Pushed to Copilot Studio.")
+    else:
+        report("Copilot sync folder not configured — nothing pushed.")
+
+    db.finish_meeting(meeting_id, transcript_text=transcript_text)
+    report("Meeting saved.")
+    return transcript_text

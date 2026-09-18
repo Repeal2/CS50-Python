@@ -79,6 +79,31 @@ def test_project_isolation(tmp_path):
         assert db.list_documents(p2.id) == []
 
 
+def test_get_project_looks_up_by_id(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        created = db.create_project("Acme Renewal")
+
+        assert db.get_project(created.id) == created
+        assert db.get_project(created.id + 999) is None
+
+
+def test_clear_transcript_segments_removes_only_that_meetings_rows(tmp_path):
+    # Regression test for session.retry_meeting_transcription: retrying a meeting whose transcription
+    # partially completed before failing has to wipe that meeting's own segments without touching any
+    # other meeting's.
+    with Database(tmp_path / "test.db") as db:
+        project = db.create_project("Retry Project")
+        first = db.create_meeting(project.id, "First")
+        second = db.create_meeting(project.id, "Second")
+        db.add_transcript_segment(first, "mic", 0.0, "from the first meeting")
+        db.add_transcript_segment(second, "mic", 0.0, "from the second meeting")
+
+        db.clear_transcript_segments(first)
+
+        assert db.get_segments(first) == []
+        assert [row["text"] for row in db.get_segments(second)] == ["from the second meeting"]
+
+
 def test_set_manual_notes_persists_and_can_be_overwritten(tmp_path):
     with Database(tmp_path / "test.db") as db:
         project = db.create_project("Manual Notes")
