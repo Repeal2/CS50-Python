@@ -375,6 +375,11 @@ class _SegmentedWavWriter:
     The first part keeps the plain name it was given ("mic.wav"), so an ordinary meeting produces
     exactly the same single file it always did; only a recording long enough to overflow ever grows a
     "mic.part2.wav" beside it. `paths` lists the parts written so far, in order.
+
+    Locked internally because a device switch (Recorder.switch_mic_device/switch_system_device) hands the
+    same writer to a freshly spawned capture thread while the old one is still shutting down — if the old
+    thread's stream.read() is slow to notice its stop event, both threads could otherwise call write()/
+    close() on the same underlying wave.Wave_write object at once, which isn't itself thread-safe.
     """
 
     def __init__(
@@ -393,6 +398,7 @@ class _SegmentedWavWriter:
         self._paths: list[Path] = []
         self._wav_file: wave.Wave_write | None = None
         self._bytes_in_part = 0
+        self._lock = threading.Lock()
         self._open_next_part()
 
     @property
@@ -402,18 +408,20 @@ class _SegmentedWavWriter:
     def write(self, data: bytes) -> None:
         if not data:
             return
-        if self._wav_file is None:
-            raise ValueError("writer is already closed")
-        # The `self._bytes_in_part` check keeps a chunk that's somehow bigger than the cap from rolling
-        # over forever into empty parts — it goes into a part of its own instead.
-        if self._bytes_in_part and self._bytes_in_part + len(data) > self._max_data_bytes:
-            self._close_current_part()
-            self._open_next_part()
-        self._wav_file.writeframes(data)
-        self._bytes_in_part += len(data)
+        with self._lock:
+            if self._wav_file is None:
+                raise ValueError("writer is already closed")
+            # The `self._bytes_in_part` check keeps a chunk that's somehow bigger than the cap from
+            # rolling over forever into empty parts — it goes into a part of its own instead.
+            if self._bytes_in_part and self._bytes_in_part + len(data) > self._max_data_bytes:
+                self._close_current_part()
+                self._open_next_part()
+            self._wav_file.writeframes(data)
+            self._bytes_in_part += len(data)
 
     def close(self) -> None:
-        self._close_current_part()
+        with self._lock:
+            self._close_current_part()
 
     def start_new_part(self, channels: int, framerate: int) -> None:
         """Forces a rollover into a fresh part right now, rather than waiting for the current one to
@@ -422,10 +430,11 @@ class _SegmentedWavWriter:
         or sample rate that the current part's WAV header was already committed to and can't change
         mid-file. The old part is closed with whatever it has so far; a new one starts with the new
         device's parameters."""
-        self._close_current_part()
-        self._channels = channels
-        self._framerate = framerate
-        self._open_next_part()
+        with self._lock:
+            self._close_current_part()
+            self._channels = channels
+            self._framerate = framerate
+            self._open_next_part()
 
     def _part_path(self, number: int) -> Path:
         if number == 1:
@@ -686,8 +695,16 @@ class Recorder:
         # point of switching one device without restarting the meeting.
         stop_event.set()
         old_thread: threading.Thread | None = getattr(self, thread_attr)
-        if old_thread is not None:
-            old_thread.join(timeout=5)
+        if old_thread is not None and self._join_capture_thread(old_thread):
+            # Still running after the timeout — presumably blocked inside a native, uninterruptible
+            # stream.read() on the device being switched away from (a hung or disconnected driver). The
+            # switch still has to proceed (there's no way to interrupt a blocked native read from here),
+            # but the writer object it's still holding a reference to is the same one the freshly spawned
+            # thread below is about to write to — worth surfacing rather than silently racing.
+            self._record_notice(
+                f"{label} capture thread from before the switch didn't stop within 5s — it may still be "
+                "reading from the previous device in the background."
+            )
 
         device_info = resolve()
         setattr(self, device_name_attr, device_name)
@@ -762,12 +779,32 @@ class Recorder:
         with self._lifecycle_lock:
             self._mic_stop_event.set()
             self._system_stop_event.set()
-            for thread in (self._mic_thread, self._system_thread):
-                if thread is not None:
-                    thread.join(timeout=5)
+            stuck_labels = [
+                label
+                for thread, label in (
+                    (self._mic_thread, "Microphone"),
+                    (self._system_thread, "System audio"),
+                )
+                if thread is not None and self._join_capture_thread(thread)
+            ]
             if self._pyaudio is not None:
-                with _pyaudio_lifecycle_lock:
-                    self._pyaudio.terminate()
+                if stuck_labels:
+                    # A capture thread still running here is presumably blocked inside a native,
+                    # uninterruptible PortAudio stream.read() call (a hung or disconnected device).
+                    # Terminating PortAudio out from under a thread that might still be reading from it is
+                    # a use-after-free from that thread's point of view — exactly the kind of thing that
+                    # crashes the whole process natively rather than raising anything Python could catch,
+                    # here or anywhere else. Leaking this PyAudio instance instead is the safer trade:
+                    # Windows reclaims its handles when the process exits regardless.
+                    for label in stuck_labels:
+                        self._record_notice(
+                            f"{label} capture thread didn't stop within 5s — its device may be "
+                            "unresponsive. Its resources were left in place rather than risk crashing "
+                            "the app by tearing down audio while it might still be in use."
+                        )
+                else:
+                    with _pyaudio_lifecycle_lock:
+                        self._pyaudio.terminate()
         # The GUI may already have flagged these live; recording them here too is what puts them in
         # front of whoever reads the finished meeting, who wasn't necessarily watching at the time.
         for problem in self.input_problems():
@@ -862,6 +899,17 @@ class Recorder:
             f"No WASAPI loopback device found for default output {default_speakers['name']!r}. "
             "System-audio capture needs a WASAPI-capable output device."
         )
+
+    @staticmethod
+    def _join_capture_thread(thread: threading.Thread, timeout: float = 5.0) -> bool:
+        """Waits up to `timeout` seconds for a capture thread to notice its stop event and exit, and
+        returns whether it's still running afterward. A thread still alive here is presumably stuck
+        inside a native, uninterruptible PortAudio call (stream.read() on a hung or disconnected device)
+        rather than merely slow — the caller must not then tear down anything (the shared PyAudio
+        instance, the shared _SegmentedWavWriter) that thread might still be touching. See stop() and
+        _switch_stream()."""
+        thread.join(timeout=timeout)
+        return thread.is_alive()
 
     def _spawn_capture_thread(
         self,

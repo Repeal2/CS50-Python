@@ -407,6 +407,79 @@ def test_a_recorder_that_never_started_refuses_to_switch(tmp_path):
         recorder.switch_mic_device("USB Headset")
 
 
+def test_switch_records_a_notice_when_the_old_capture_thread_does_not_stop_in_time(tmp_path, monkeypatch):
+    # A capture thread still blocked inside a native stream.read() call after the join timeout is
+    # presumably reading from a hung or disconnected device — the switch still has to proceed (there's no
+    # way to interrupt a blocked native read from here), but this should be visible rather than silent,
+    # since the old thread may still be touching the writer the new thread is about to write to.
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    recorder._mic_writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
+    recorder._mic_thread = _finished_thread()
+
+    new_device = {"name": "USB Headset", "index": 1, "maxInputChannels": 1, "defaultSampleRate": 16000}
+    stream = _FakeStream([b"\x02\x00" * 5], stop_event=recorder._mic_stop_event)
+    recorder._pyaudio = _FakeAudioHost([new_device], default_input=new_device)
+    recorder._pyaudio.open = lambda **kwargs: stream
+    recorder._pyaudio_module = SimpleNamespace(paInt16=8)
+    monkeypatch.setattr(Recorder, "_join_capture_thread", staticmethod(lambda thread, timeout=5.0: True))
+
+    recorder.switch_mic_device("USB Headset")
+    recorder._mic_thread.join(timeout=5)
+
+    assert any("didn't stop within 5s" in notice for notice in recorder.capture_notices())
+
+
+# --- stop() and a capture thread that refuses to stop -----------------------------------------------
+
+
+def test_stop_does_not_terminate_pyaudio_when_a_capture_thread_is_stuck(tmp_path, monkeypatch):
+    # Regression test: terminating PortAudio while a capture thread might still be blocked inside a
+    # native stream.read() call on it is a use-after-free from that thread's point of view — exactly the
+    # kind of thing that crashes the whole process natively, with no Python exception for anything to
+    # catch. stop() must not do that just because a capture thread's 5-second join timed out.
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    recorder._mic_thread = _finished_thread()  # any non-None Thread; join() itself is monkeypatched away
+    terminated = []
+    recorder._pyaudio = SimpleNamespace(terminate=lambda: terminated.append(True))
+    monkeypatch.setattr(Recorder, "_join_capture_thread", staticmethod(lambda thread, timeout=5.0: True))
+
+    recorder.stop()
+
+    assert terminated == []
+    assert any("didn't stop within 5s" in notice for notice in recorder.capture_notices())
+
+
+def test_stop_still_terminates_pyaudio_when_capture_threads_stop_in_time(tmp_path, monkeypatch):
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    recorder._mic_thread = _finished_thread()
+    terminated = []
+    recorder._pyaudio = SimpleNamespace(terminate=lambda: terminated.append(True))
+    monkeypatch.setattr(Recorder, "_join_capture_thread", staticmethod(lambda thread, timeout=5.0: False))
+
+    recorder.stop()
+
+    assert terminated == [True]
+
+
+def test_join_capture_thread_returns_false_once_the_thread_has_actually_finished(tmp_path):
+    thread = _finished_thread()
+    assert Recorder._join_capture_thread(thread, timeout=1.0) is False
+
+
+def test_join_capture_thread_returns_true_for_a_thread_still_running_past_the_timeout(tmp_path):
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait, daemon=True)
+    thread.start()
+    try:
+        assert Recorder._join_capture_thread(thread, timeout=0.05) is True
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+
 # --- noticing a Windows default-device change on its own --------------------------------------------
 
 

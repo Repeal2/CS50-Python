@@ -689,12 +689,24 @@ class RecordTab(ttk.Frame):
     def _log(self, message: str) -> None:
         """Appends a timestamped line to the activity log and scrolls to it. This is a log of what the
         app is doing (started, stopped, transcribing, waiting on notes...), not a transcript preview —
-        the widget is otherwise kept disabled so it reads as a log rather than an editable text box."""
+        the widget is otherwise kept disabled so it reads as a log rather than an editable text box.
+
+        Also appended to a file next to the database: the Text widget alone only exists in memory, so a
+        process that dies for any reason — including the kind of native crash that bypasses every
+        try/except in this app, the one this line exists for — takes whatever it was logging right before
+        that (a low-memory warning, a recorder notice, "Transcription complete.") down with it, leaving
+        nothing to look at afterward. A file survives the crash even when the window doesn't."""
         timestamp = datetime.now().strftime("%b %d, %Y %I:%M:%S %p")
+        line = f"[{timestamp}] {message}"
         self.output["state"] = "normal"
-        self.output.insert("end", f"[{timestamp}] {message}\n")
+        self.output.insert("end", line + "\n")
         self.output["state"] = "disabled"
         self.output.see("end")
+        try:
+            with open(self.app.settings.data_dir / "activity.log", "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass  # logging shouldn't itself be able to take the app down
 
     def _start(self) -> None:
         project_name = self.project_var.get().strip()
@@ -856,6 +868,12 @@ class RecordTab(ttk.Frame):
             text = extract_text(path, tesseract_cmd=self.app.settings.tesseract_cmd)
         except UnsupportedDocumentError as exc:
             messagebox.showerror("Meeting Scribe", str(exc))
+            return
+        except Exception as exc:  # a corrupt/malformed file (bad PDF, bad DOCX, unreadable image,
+            # Tesseract missing) shouldn't fail with no visible feedback at all — extract_text only
+            # promises to raise UnsupportedDocumentError for a file type it doesn't recognize, not for
+            # one it recognizes but can't actually parse.
+            messagebox.showerror("Meeting Scribe", f"Couldn't read {path.name!r}: {exc}")
             return
         # Keeps a copy of the original bytes (under a synthetic name — see save_original_copy) so the
         # real file, not just its extracted text, is still around later for the Copilot push package,
@@ -1060,6 +1078,12 @@ class ProjectsTab(ttk.Frame):
             text = extract_text(path, tesseract_cmd=self.app.settings.tesseract_cmd)
         except UnsupportedDocumentError as exc:
             messagebox.showerror("Meeting Scribe", str(exc))
+            return
+        except Exception as exc:  # a corrupt/malformed file (bad PDF, bad DOCX, unreadable image,
+            # Tesseract missing) shouldn't fail with no visible feedback at all — extract_text only
+            # promises to raise UnsupportedDocumentError for a file type it doesn't recognize, not for
+            # one it recognizes but can't actually parse.
+            messagebox.showerror("Meeting Scribe", f"Couldn't read {path.name!r}: {exc}")
             return
         source_path = save_original_copy(path, self.app.settings.documents_dir)
 

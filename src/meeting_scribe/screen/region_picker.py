@@ -135,9 +135,13 @@ def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
     # overrideredirect (no title bar/borders) rather than "-fullscreen", which on Windows only ever
     # covers the primary monitor regardless of the geometry given below.
     overlay.overrideredirect(True)
+    # Tk geometry strings require exactly one sign character directly before each offset ("-1920", not
+    # "+-1920") — a bare f"+{value}" breaks the instant `value` is itself negative, which is exactly what
+    # mss reports for a monitor positioned above or to the left of the primary display (a routine
+    # multi-monitor setup). `:+d` supplies the correct sign either way instead of hardcoding "+".
     overlay.geometry(
         f"{virtual_screen['width']}x{virtual_screen['height']}"
-        f"+{virtual_screen['left']}+{virtual_screen['top']}"
+        f"{virtual_screen['left']:+d}{virtual_screen['top']:+d}"
     )
     overlay.attributes("-alpha", 0.25)
     overlay.attributes("-topmost", True)
@@ -200,13 +204,18 @@ def _frame_geometries(rect: dict, thickness: int) -> tuple[str, str, str, str]:
     `rect`'s bounds (an mss-style {left, top, width, height} dict — RegionTarget.mss_region or
     WindowRegionTarget.mss_region both produce one) — outside, not on top of it, so the border itself
     never ends up inside the captured region and doesn't contaminate the OCR frame. Order: top, bottom,
-    left, right."""
+    left, right.
+
+    Offsets use `:+d` rather than a hardcoded "+" so a coordinate that's itself negative (any rectangle on
+    a monitor positioned above or to the left of the primary display) still gets exactly one sign
+    character, as Tk's geometry parser requires — a literal "+{negative_number}" renders as "+-5", which
+    Tk rejects outright ("bad geometry specifier")."""
     left, top, width, height = rect["left"], rect["top"], rect["width"], rect["height"]
     outer_width = width + 2 * thickness
-    frame_top = f"{outer_width}x{thickness}+{left - thickness}+{top - thickness}"
-    bottom = f"{outer_width}x{thickness}+{left - thickness}+{top + height}"
-    frame_left = f"{thickness}x{height}+{left - thickness}+{top}"
-    right = f"{thickness}x{height}+{left + width}+{top}"
+    frame_top = f"{outer_width}x{thickness}{left - thickness:+d}{top - thickness:+d}"
+    bottom = f"{outer_width}x{thickness}{left - thickness:+d}{top + height:+d}"
+    frame_left = f"{thickness}x{height}{left - thickness:+d}{top:+d}"
+    right = f"{thickness}x{height}{left + width:+d}{top:+d}"
     return frame_top, bottom, frame_left, right
 
 

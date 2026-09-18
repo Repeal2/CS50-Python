@@ -44,6 +44,23 @@ def test_frame_geometries_form_a_hollow_frame_outside_the_target():
     assert right == "3x150+300+100"
 
 
+def test_frame_geometries_use_a_single_sign_character_for_negative_coordinates():
+    # Regression test: a monitor positioned above or to the left of the primary display (an ordinary
+    # multi-monitor setup) gives mss negative left/top coordinates. A geometry string built with a
+    # hardcoded "+" prefix would render a negative offset as "+-5", which Tk's parser rejects outright
+    # ("bad geometry specifier") instead of drawing the outline — this target sits at (-10, -20), just
+    # inside a monitor to the left of and above the primary.
+    target = RegionTarget(left=-10, top=-20, width=200, height=150)
+    top, bottom, left, right = _frame_geometries(target.mss_region, thickness=3)
+
+    assert top == "206x3-13-23"
+    assert bottom == "206x3-13+130"
+    assert left == "3x150-13-20"
+    assert right == "3x150+190-20"
+    for geometry in (top, bottom, left, right):
+        assert "+-" not in geometry and "-+" not in geometry
+
+
 def test_window_region_target_label_includes_window_title_and_picked_size():
     target = WindowRegionTarget(
         hwnd=42,
