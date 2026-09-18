@@ -19,10 +19,12 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
 from meeting_scribe.config import (
+    WHISPER_MODEL_SIZES,
     Settings,
     load_settings,
     update_audio_devices,
     update_copilot_settings,
+    update_whisper_model_size,
 )
 from meeting_scribe.screen.capture import ocr_region
 from meeting_scribe.screen.region_picker import (
@@ -1184,9 +1186,9 @@ class ProjectsTab(ttk.Frame):
 
 
 class SettingsTab(ttk.Frame):
-    """Copilot push folder and audio device selection — all editable without touching environment
-    variables. Saved settings are written to disk (see config.save_user_config) and take effect
-    immediately for this running session."""
+    """Copilot push folder, audio device selection, and transcription model size — all editable without
+    touching environment variables. Saved settings are written to disk (see config.save_user_config) and
+    take effect immediately for this running session."""
 
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
@@ -1221,6 +1223,17 @@ class SettingsTab(ttk.Frame):
         ttk.Button(form, text="Refresh devices", command=self._refresh_devices).grid(
             row=1, column=2, rowspan=2, padx=(6, 0)
         )
+
+        ttk.Label(form, text="Transcription model").grid(row=3, column=0, sticky="w")
+        self.whisper_model_var = tk.StringVar(value=self.app.settings.whisper_model_size)
+        self.whisper_model_combo = ttk.Combobox(
+            form,
+            textvariable=self.whisper_model_var,
+            values=WHISPER_MODEL_SIZES,
+            width=45,
+            state="readonly",
+        )
+        self.whisper_model_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
         form.columnconfigure(1, weight=1)
 
         ttk.Button(self, text="Save", command=self._save).pack(anchor="w", padx=12)
@@ -1241,7 +1254,14 @@ class SettingsTab(ttk.Frame):
             "Microphone / system audio pick which device gets recorded — useful if you have more than "
             "one mic, or the wrong one is the Windows default. \"System default\" always follows "
             "whatever Windows currently has set as default. Watch the level meters on the Record tab "
-            "to confirm a device is actually picking up audio."
+            "to confirm a device is actually picking up audio.\n\n"
+            "Transcription model trades accuracy for memory/CPU: smaller (tiny/base/small) is faster and "
+            "lighter but makes more mistakes, larger (medium/large) is more accurate but needs "
+            "meaningfully more RAM — a long meeting can fail to transcribe with an out-of-memory error "
+            "on a larger model where a smaller one would have finished fine. The first meeting after "
+            "switching to a size that hasn't been used before downloads it, which needs internet access "
+            "and can take a while for the larger sizes; only meetings started after Save pick up the "
+            "change, so anything currently recording or still finishing up keeps using the old size."
         )
         ttk.Label(self, text=note, wraplength=560, justify="left", foreground="#555").pack(
             anchor="w", padx=12, pady=(12, 0)
@@ -1296,6 +1316,9 @@ class SettingsTab(ttk.Frame):
         )
         self.app.settings = update_audio_devices(
             self.app.settings, mic_device_name=mic_name, system_device_name=system_name
+        )
+        self.app.settings = update_whisper_model_size(
+            self.app.settings, whisper_model_size=self.whisper_model_var.get()
         )
         self._refresh_status()
         self.app.sync_device_displays()

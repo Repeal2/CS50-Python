@@ -6,6 +6,7 @@ from meeting_scribe.config import (
     resolve_tesseract_cmd,
     update_audio_devices,
     update_copilot_settings,
+    update_whisper_model_size,
 )
 
 
@@ -122,3 +123,48 @@ def test_update_copilot_settings_does_not_clobber_audio_devices(tmp_path, monkey
     reloaded = load_settings()
     assert reloaded.mic_device_name == "USB Mic"
     assert reloaded.copilot_sync_dir == tmp_path / "Bridge"
+
+
+def test_load_settings_defaults_the_whisper_model_to_small(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("MEETING_SCRIBE_WHISPER_MODEL", raising=False)
+
+    assert load_settings().whisper_model_size == "small"
+
+
+def test_load_settings_uses_the_whisper_model_env_var(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEETING_SCRIBE_WHISPER_MODEL", "medium")
+
+    assert load_settings().whisper_model_size == "medium"
+
+
+def test_update_whisper_model_size_persists_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_whisper_model_size(load_settings(), whisper_model_size="large-v3")
+
+    assert load_settings().whisper_model_size == "large-v3"
+
+
+def test_update_whisper_model_size_persisted_choice_wins_over_the_env_var(tmp_path, monkeypatch):
+    # Once saved from the Settings tab, the persisted choice is the source of truth — otherwise a leftover
+    # MEETING_SCRIBE_WHISPER_MODEL from an old launch shortcut would keep overriding a change made in the
+    # GUI on every subsequent restart.
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEETING_SCRIBE_WHISPER_MODEL", "tiny")
+
+    update_whisper_model_size(load_settings(), whisper_model_size="medium")
+
+    assert load_settings().whisper_model_size == "medium"
+
+
+def test_update_whisper_model_size_does_not_clobber_other_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_whisper_model_size(settings, whisper_model_size="medium")
+
+    reloaded = load_settings()
+    assert reloaded.mic_device_name == "USB Mic"
+    assert reloaded.whisper_model_size == "medium"

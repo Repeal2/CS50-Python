@@ -13,6 +13,14 @@ from pathlib import Path
 
 USER_CONFIG_FILENAME = "settings.json"
 
+# The sizes offered in the Settings tab's model dropdown, smallest/fastest first. faster-whisper also
+# supports .en (English-only) and distil-* (distilled, English-only) variants, but those are left out
+# here to keep the dropdown to one choice per accuracy/memory tradeoff rather than a long list most users
+# won't need — MEETING_SCRIBE_WHISPER_MODEL can still be set to any faster-whisper model name directly for
+# anyone who wants one of those. Larger sizes transcribe more accurately but need proportionally more
+# memory and CPU time; see transcription.engine.WhisperTranscriber for how this is used.
+WHISPER_MODEL_SIZES = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo")
+
 
 def _default_data_dir() -> Path:
     override = os.environ.get("MEETING_SCRIBE_DATA_DIR")
@@ -107,15 +115,16 @@ def _load_user_config(data_dir: Path) -> dict:
 
 
 def save_user_config(settings: Settings) -> None:
-    """Persists the user-editable settings (Copilot sync folder, chosen audio devices) so they survive
-    a restart without the user needing to set environment variables — the GUI's Settings tab calls this
-    after Save."""
+    """Persists the user-editable settings (Copilot sync folder, chosen audio devices, Whisper model
+    size) so they survive a restart without the user needing to set environment variables — the GUI's
+    Settings tab calls this after Save."""
     path = _user_config_path(settings.data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "mic_device_name": settings.mic_device_name,
         "system_device_name": settings.system_device_name,
         "copilot_sync_dir": str(settings.copilot_sync_dir) if settings.copilot_sync_dir else None,
+        "whisper_model_size": settings.whisper_model_size,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -138,16 +147,29 @@ def update_audio_devices(
     return updated
 
 
+def update_whisper_model_size(settings: Settings, *, whisper_model_size: str) -> Settings:
+    """Applies and persists the Settings tab's Whisper model-size choice. Only affects meetings started
+    after this is saved — a MeetingSession builds its own WhisperTranscriber once, at construction time
+    (see session.py), so one already recording or finishing up keeps using whatever size was in effect
+    when it started."""
+    updated = replace(settings, whisper_model_size=whisper_model_size)
+    save_user_config(updated)
+    return updated
+
+
 def load_settings() -> Settings:
     data_dir = _default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     user_config = _load_user_config(data_dir)
 
     copilot_sync_dir = user_config.get("copilot_sync_dir") or os.environ.get("MEETING_SCRIBE_COPILOT_SYNC_DIR")
+    whisper_model_size = user_config.get("whisper_model_size") or os.environ.get(
+        "MEETING_SCRIBE_WHISPER_MODEL", "small"
+    )
 
     return Settings(
         data_dir=data_dir,
-        whisper_model_size=os.environ.get("MEETING_SCRIBE_WHISPER_MODEL", "small"),
+        whisper_model_size=whisper_model_size,
         tesseract_cmd=resolve_tesseract_cmd(os.environ.get("MEETING_SCRIBE_TESSERACT_PATH")),
         screen_capture_interval_seconds=float(
             os.environ.get("MEETING_SCRIBE_SCREEN_INTERVAL", "3.0")
