@@ -4,6 +4,8 @@ import pytest
 
 from meeting_scribe.screen.window_picker import (
     WindowTarget,
+    _meeting_name_from_title,
+    find_teams_meeting_name,
     get_window_region,
     list_capturable_windows,
     window_exists,
@@ -29,6 +31,46 @@ def test_get_window_region_requires_windows():
 def test_window_exists_requires_windows():
     with pytest.raises(RuntimeError):
         window_exists(12345)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the platform guard only triggers off Windows")
+def test_find_teams_meeting_name_requires_windows():
+    with pytest.raises(RuntimeError):
+        find_teams_meeting_name()
+
+
+def test_meeting_name_from_title_strips_the_pipe_suffix():
+    assert _meeting_name_from_title("Weekly Sync | Microsoft Teams") == "Weekly Sync"
+
+
+def test_meeting_name_from_title_strips_a_dash_suffix():
+    assert _meeting_name_from_title("Weekly Sync - Microsoft Teams") == "Weekly Sync"
+    assert _meeting_name_from_title("Weekly Sync – Microsoft Teams") == "Weekly Sync"
+
+
+def test_meeting_name_from_title_accepts_a_bare_title_with_no_suffix():
+    # Some Teams versions/configurations open a window dedicated to the active call, titled with
+    # nothing else — no "| Microsoft Teams" suffix at all.
+    assert _meeting_name_from_title("Weekly Sync") == "Weekly Sync"
+
+
+def test_meeting_name_from_title_rejects_the_bare_app_name():
+    assert _meeting_name_from_title("Microsoft Teams") is None
+    assert _meeting_name_from_title("Teams") is None
+
+
+def test_meeting_name_from_title_rejects_generic_non_call_tabs():
+    for title in ("Chat | Microsoft Teams", "Calendar | Microsoft Teams", "Activity | Microsoft Teams"):
+        assert _meeting_name_from_title(title) is None
+
+
+def test_meeting_name_from_title_rejects_a_blank_title():
+    assert _meeting_name_from_title("") is None
+    assert _meeting_name_from_title("   | Microsoft Teams") is None
+
+
+def test_meeting_name_from_title_is_case_insensitive_for_the_generic_check():
+    assert _meeting_name_from_title("chat | microsoft teams") is None
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="exercises real win32gui calls")

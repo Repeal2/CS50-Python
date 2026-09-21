@@ -59,6 +59,11 @@ SYSTEM_DEFAULT_LABEL = "System default"
 # before the meeting ends, the same way its title can be renamed from "Untitled meeting".
 DEFAULT_PROJECT_NAME = "Unfiled"
 
+# The title field's starting value — also what marks it as "not customized yet" for Start's Teams-name
+# autofill (see RecordTab._detect_meeting_title): a title still exactly this gets a chance to be replaced
+# by a detected Teams meeting name, same as a blank one would.
+DEFAULT_MEETING_TITLE = "Untitled meeting"
+
 # Manual-notes editor: matches leading whitespace plus an optional bullet marker ("-", "*", or "•")
 # followed by a space, so Enter can continue the same bullet/indent on the next line. A plain line (no
 # bullet) just matches its leading whitespace, so it stays plain rather than getting a bullet forced on.
@@ -351,7 +356,7 @@ class RecordTab(ttk.Frame):
         )
 
         ttk.Label(form, text="Meeting title").grid(row=1, column=0, sticky="w")
-        self.title_var = tk.StringVar(value="Untitled meeting")
+        self.title_var = tk.StringVar(value=DEFAULT_MEETING_TITLE)
         # Editable (not state="readonly"), so it still doubles as a free-typed title field — the
         # dropdown values are just suggestions of titles already used in this project, for quick repeat
         # meetings ("Weekly Client Meeting") rather than retyping the same title every time.
@@ -782,6 +787,20 @@ class RecordTab(ttk.Frame):
             return self._region_target
         return next((w for w in self._window_targets if w.title == selected), None)
 
+    def _detect_meeting_title(self) -> str | None:
+        """Best-effort autofill for a still-default meeting title, from whichever Teams window looks
+        like the active call — see window_picker.find_teams_meeting_name. Never blocks or errors the
+        meeting from starting: a detection failure (Teams isn't running, isn't in a call, or this isn't
+        Windows — e.g. a dev machine) just leaves the title at its default, exactly as if this didn't
+        exist. Independent of the "Screen source" dropdown — Teams doesn't need to be the OCR target for
+        its meeting name to be worth picking up."""
+        from meeting_scribe.screen.window_picker import find_teams_meeting_name
+
+        try:
+            return find_teams_meeting_name()
+        except RuntimeError:
+            return None
+
     def _refresh_devices(self) -> None:
         """Repopulates the microphone/system-audio dropdowns with currently available devices — the
         same picker as the Settings tab, surfaced here too so switching devices doesn't require leaving
@@ -847,7 +866,9 @@ class RecordTab(ttk.Frame):
 
     def _start(self) -> None:
         project_name = self.project_var.get().strip() or DEFAULT_PROJECT_NAME
-        meeting_title = self.title_var.get()
+        meeting_title = self.title_var.get().strip() or DEFAULT_MEETING_TITLE
+        if meeting_title == DEFAULT_MEETING_TITLE:
+            meeting_title = self._detect_meeting_title() or DEFAULT_MEETING_TITLE
         screen_target = self._selected_screen_target()
         try:
             session = MeetingSession(
@@ -863,10 +884,11 @@ class RecordTab(ttk.Frame):
             return
 
         self.app._session = session
-        # Reflects the DEFAULT_PROJECT_NAME fallback back into the field when it was left blank, so what's
-        # shown always matches what the meeting is actually recording under — same reasoning as the title
-        # field always showing the real title rather than a placeholder that isn't actually saved anywhere.
+        # Reflects the DEFAULT_PROJECT_NAME/detected-title fallbacks back into their fields, so what's
+        # shown always matches what the meeting is actually recording under — same reasoning either way:
+        # a placeholder that isn't reflected in the field it stands in for isn't actually saved anywhere.
         self.project_var.set(project_name)
+        self.title_var.set(meeting_title)
         # Only takes effect if the screen source has a window to watch in the first place — see
         # _hwnd_to_watch_for_auto_stop — and only for this meeting: unchecking the box or changing the
         # screen source afterwards doesn't retroactively stop watching (or start watching) anything.
