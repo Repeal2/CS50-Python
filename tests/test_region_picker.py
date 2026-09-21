@@ -1,7 +1,7 @@
 from meeting_scribe.screen.region_picker import (
     RegionTarget,
     WindowRegionTarget,
-    _frame_geometries,
+    _frame_rects,
     _outline_color,
     _region_from_drag,
     pin_region_to_window,
@@ -33,32 +33,32 @@ def test_region_target_mss_region_matches_mss_dict_shape():
     assert target.mss_region == {"left": 10, "top": 20, "width": 300, "height": 200}
 
 
-def test_frame_geometries_form_a_hollow_frame_outside_the_target():
+def test_frame_rects_form_a_hollow_frame_outside_the_target():
     target = RegionTarget(left=100, top=100, width=200, height=150)
-    top, bottom, left, right = _frame_geometries(target.mss_region, thickness=3)
+    top, bottom, left, right = _frame_rects(target.mss_region, thickness=3)
 
     # None of the four strips overlap the target's own interior — they sit just outside its bounds.
-    assert top == "206x3+97+97"
-    assert bottom == "206x3+97+250"
-    assert left == "3x150+97+100"
-    assert right == "3x150+300+100"
+    assert top == {"left": 97, "top": 97, "width": 206, "height": 3}
+    assert bottom == {"left": 97, "top": 250, "width": 206, "height": 3}
+    assert left == {"left": 97, "top": 100, "width": 3, "height": 150}
+    assert right == {"left": 300, "top": 100, "width": 3, "height": 150}
 
 
-def test_frame_geometries_use_a_single_sign_character_for_negative_coordinates():
+def test_frame_rects_keep_negative_coordinates_as_plain_ints():
     # Regression test: a monitor positioned above or to the left of the primary display (an ordinary
-    # multi-monitor setup) gives mss negative left/top coordinates. A geometry string built with a
-    # hardcoded "+" prefix would render a negative offset as "+-5", which Tk's parser rejects outright
-    # ("bad geometry specifier") instead of drawing the outline — this target sits at (-10, -20), just
-    # inside a monitor to the left of and above the primary.
+    # multi-monitor setup) gives mss negative left/top coordinates. These used to be baked into Tk
+    # geometry strings ("206x3-13-23"), where a "-" offset doesn't mean "negative coordinate" at all —
+    # inherited from X11, it means "measured from the opposite edge of the screen" — silently
+    # misplacing the outline instead of drawing it in the wrong place outright. Returning plain rects
+    # instead (positioned via _position_window, a direct Win32 call) sidesteps that parser entirely; this
+    # target sits at (-10, -20), just inside a monitor to the left of and above the primary.
     target = RegionTarget(left=-10, top=-20, width=200, height=150)
-    top, bottom, left, right = _frame_geometries(target.mss_region, thickness=3)
+    top, bottom, left, right = _frame_rects(target.mss_region, thickness=3)
 
-    assert top == "206x3-13-23"
-    assert bottom == "206x3-13+130"
-    assert left == "3x150-13-20"
-    assert right == "3x150+190-20"
-    for geometry in (top, bottom, left, right):
-        assert "+-" not in geometry and "-+" not in geometry
+    assert top == {"left": -13, "top": -23, "width": 206, "height": 3}
+    assert bottom == {"left": -13, "top": 130, "width": 206, "height": 3}
+    assert left == {"left": -13, "top": -20, "width": 3, "height": 150}
+    assert right == {"left": 190, "top": -20, "width": 3, "height": 150}
 
 
 def test_window_region_target_label_includes_window_title_and_picked_size():

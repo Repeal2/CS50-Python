@@ -112,6 +112,28 @@ def _region_from_drag(x1: int, y1: int, x2: int, y2: int) -> RegionTarget | None
     return RegionTarget(left=left, top=top, width=right - left, height=bottom - top)
 
 
+def _position_window(window: "tk.Misc", left: int, top: int, width: int, height: int) -> None:
+    """Moves a Tk window to an absolute virtual-desktop pixel position via a direct Win32 call, instead
+    of Tk's own geometry-string offset syntax ("WxH+X+Y"/"WxH-X-Y") — that syntax's leading "-" doesn't
+    mean "this coordinate is negative". Inherited from X11's XParseGeometry, it means "measured from the
+    opposite (right/bottom) edge of the screen", and on Windows "the screen" Tk measures that against is
+    the *primary* monitor (the same single-monitor blind spot this module's other multi-monitor
+    workarounds already exist for — see pick_region_interactively). So a geometry string built with a
+    correctly-signed but negative offset doesn't crash (a bare "+{negative}" does, with "bad geometry
+    specifier" — the bug this replaced), but it does silently land the window somewhere relative to the
+    primary monitor's edge instead of at the intended negative coordinate — exactly the multi-monitor
+    case (a display above or left of the primary) this exists to get right. Going through MoveWindow
+    instead sidesteps that parser entirely: the coordinates it takes are always literal.
+
+    update_idletasks() first guarantees the window has a real platform handle to move — Tk creates one
+    immediately when a Toplevel is constructed, but forcing a pending-event flush before reading
+    winfo_id() is the safe way to depend on that rather than an implementation detail."""
+    window.update_idletasks()
+    import ctypes
+
+    ctypes.windll.user32.MoveWindow(window.winfo_id(), left, top, width, height, True)
+
+
 def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
     """Opens a mostly-transparent overlay spanning every connected monitor (not just the primary one)
     the user drags a rectangle onto, showing the selection live as they drag. Blocks (via wait_window)
@@ -123,7 +145,8 @@ def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
     greyed-out selection area smaller than the actual screen, and unusable on secondary monitors
     entirely. mss's monitor 0 is the real union of every display, negative coordinates and all (a monitor
     positioned above/left of the primary has a negative left/top), so the overlay is explicitly
-    positioned and sized from that instead of relying on Tk's single-monitor notion of "the screen".
+    positioned and sized from that instead of relying on Tk's single-monitor notion of "the screen" — see
+    _position_window for why that positioning goes through Win32 rather than Tk's own geometry string.
     """
     import mss
     import tkinter as tk
@@ -135,13 +158,10 @@ def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
     # overrideredirect (no title bar/borders) rather than "-fullscreen", which on Windows only ever
     # covers the primary monitor regardless of the geometry given below.
     overlay.overrideredirect(True)
-    # Tk geometry strings require exactly one sign character directly before each offset ("-1920", not
-    # "+-1920") — a bare f"+{value}" breaks the instant `value` is itself negative, which is exactly what
-    # mss reports for a monitor positioned above or to the left of the primary display (a routine
-    # multi-monitor setup). `:+d` supplies the correct sign either way instead of hardcoding "+".
-    overlay.geometry(
-        f"{virtual_screen['width']}x{virtual_screen['height']}"
-        f"{virtual_screen['left']:+d}{virtual_screen['top']:+d}"
+    overlay.geometry(f"{virtual_screen['width']}x{virtual_screen['height']}")
+    _position_window(
+        overlay, virtual_screen["left"], virtual_screen["top"],
+        virtual_screen["width"], virtual_screen["height"],
     )
     overlay.attributes("-alpha", 0.25)
     overlay.attributes("-topmost", True)
@@ -199,24 +219,24 @@ def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
     return state["result"]
 
 
-def _frame_geometries(rect: dict, thickness: int) -> tuple[str, str, str, str]:
-    """Tk geometry strings ("WxH+X+Y") for four thin strips forming a hollow frame just *outside*
-    `rect`'s bounds (an mss-style {left, top, width, height} dict — RegionTarget.mss_region or
-    WindowRegionTarget.mss_region both produce one) — outside, not on top of it, so the border itself
-    never ends up inside the captured region and doesn't contaminate the OCR frame. Order: top, bottom,
-    left, right.
+def _frame_rects(rect: dict, thickness: int) -> tuple[dict, dict, dict, dict]:
+    """mss-style {left, top, width, height} rects for four thin strips forming a hollow frame just
+    *outside* `rect`'s bounds (an mss-style dict — RegionTarget.mss_region or WindowRegionTarget.mss_region
+    both produce one) — outside, not on top of it, so the border itself never ends up inside the captured
+    region and doesn't contaminate the OCR frame. Order: top, bottom, left, right.
 
-    Offsets use `:+d` rather than a hardcoded "+" so a coordinate that's itself negative (any rectangle on
-    a monitor positioned above or to the left of the primary display) still gets exactly one sign
-    character, as Tk's geometry parser requires — a literal "+{negative_number}" renders as "+-5", which
-    Tk rejects outright ("bad geometry specifier")."""
+    Returned as plain rects rather than Tk geometry strings — a geometry string's offset portion doesn't
+    mean "this coordinate", full stop, once it's negative (see _position_window, which is how
+    RegionOutline.reposition actually places these), so there's no correct geometry string to build for
+    a strip on a monitor above or left of the primary display in the first place."""
     left, top, width, height = rect["left"], rect["top"], rect["width"], rect["height"]
     outer_width = width + 2 * thickness
-    frame_top = f"{outer_width}x{thickness}{left - thickness:+d}{top - thickness:+d}"
-    bottom = f"{outer_width}x{thickness}{left - thickness:+d}{top + height:+d}"
-    frame_left = f"{thickness}x{height}{left - thickness:+d}{top:+d}"
-    right = f"{thickness}x{height}{left + width:+d}{top:+d}"
-    return frame_top, bottom, frame_left, right
+    return (
+        {"left": left - thickness, "top": top - thickness, "width": outer_width, "height": thickness},
+        {"left": left - thickness, "top": top + height, "width": outer_width, "height": thickness},
+        {"left": left - thickness, "top": top, "width": thickness, "height": height},
+        {"left": left + width, "top": top, "width": thickness, "height": height},
+    )
 
 
 def _outline_color(normal_color: str, alert_color: str, *, alerting: bool, flash_on: bool) -> str:
@@ -262,8 +282,9 @@ class RegionOutline:
         self._flash_after_id: str | None = None
 
     def reposition(self, rect: dict) -> None:
-        for part, geometry in zip(self._parts, _frame_geometries(rect, self.THICKNESS)):
-            part.geometry(geometry)
+        for part, frame in zip(self._parts, _frame_rects(rect, self.THICKNESS)):
+            part.geometry(f"{frame['width']}x{frame['height']}")
+            _position_window(part, frame["left"], frame["top"], frame["width"], frame["height"])
 
     def set_alert(self, active: bool) -> None:
         """Starts or stops the red flash. Safe to call every poll tick with the current condition —
