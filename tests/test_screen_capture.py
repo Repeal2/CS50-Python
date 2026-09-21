@@ -4,6 +4,7 @@ from meeting_scribe.screen.capture import (
     _looks_like_ui_noise,
     _new_lines,
     _ocr_region_once,
+    _speaker_badge_lines,
 )
 from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
 
@@ -68,6 +69,31 @@ def test_dedup_skips_unchanged_frames_and_repeated_text():
 
     assert events == []
     assert watcher._pending_lines == ["Slide 1"]
+
+
+def test_capture_once_reports_a_speaker_badge_separately_from_the_caption_text():
+    """The name badge next to a caption line should reach on_speaker_name even though _new_lines still
+    filters it out of on_text — the two streams see different things from the same OCR capture."""
+    text_events = []
+    name_events = []
+    watcher = _watcher(on_text=text_events.append, on_speaker_name=name_events.append)
+
+    sct = FakeSct([b"frame-a"] * 2)
+    tess = FakePytesseract(["Jonathan Arnold @\nTesting."])
+
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
+
+    assert [e.name for e in name_events] == ["Jonathan Arnold @"]
+    assert watcher._pending_lines == ["Testing."]  # caption text still pending, badge filtered out of it
+
+
+def test_capture_once_without_on_speaker_name_does_not_report_badges():
+    watcher = _watcher(on_text=lambda e: None)  # on_speaker_name left at its default (None)
+
+    sct = FakeSct([b"frame-a"] * 2)
+    tess = FakePytesseract(["Jonathan Arnold @\nTesting."])
+
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)  # must not raise
 
 
 def test_a_line_is_emitted_once_a_later_capture_confirms_it_stopped_growing():
@@ -297,6 +323,21 @@ def test_new_lines_can_keep_speaker_badges_when_asked_to():
     text = "John Smith\nTesting."
 
     assert _new_lines(text, set(), filter_speaker_badges=False) == ["John Smith", "Testing."]
+
+
+def test_speaker_badge_lines_extracts_names_and_drops_noise_and_dialogue():
+    text = "MB\nJonathan Arnold @\nWhich we are happy with and we are now onboarding them.\nJohn Smith"
+
+    assert _speaker_badge_lines(text) == ["Jonathan Arnold @", "John Smith"]
+
+
+def test_speaker_badge_lines_does_not_dedup_a_name_repeated_across_calls():
+    """Unlike _new_lines, repeats matter here: the same name showing up capture after capture is the
+    timestamped "still talking" signal a later speaker-identification pass would rely on."""
+    text = "John Smith\nTesting."
+
+    assert _speaker_badge_lines(text) == ["John Smith"]
+    assert _speaker_badge_lines(text) == ["John Smith"]
 
 
 def test_ocr_region_once_keeps_names_but_still_drops_ui_noise():

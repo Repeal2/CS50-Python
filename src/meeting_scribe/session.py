@@ -17,7 +17,7 @@ from typing import Callable
 from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
 from meeting_scribe.audio.recorder import Recorder, discover_wav_parts
 from meeting_scribe.config import Settings
-from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
+from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher, SpeakerNameEvent
 from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
 from meeting_scribe.screen.window_picker import WindowTarget
 from meeting_scribe.storage.database import Database
@@ -63,8 +63,13 @@ class MeetingSession:
             system_device_name=settings.system_device_name,
         )
         self._screen_events: list[ScreenTextEvent] = []
+        # Timestamped speaker-name-badge sightings, kept alongside the caption stream — not used for
+        # anything yet, but this is the raw material a future system-audio diarization pass would line up
+        # against WhisperX speaker clusters to turn "SPEAKER_00" into a real name.
+        self._speaker_name_events: list[SpeakerNameEvent] = []
         self._screen_watcher = ScreenWatcher(
             on_text=self._screen_events.append,
+            on_speaker_name=self._speaker_name_events.append,
             interval_seconds=settings.screen_capture_interval_seconds,
             tesseract_cmd=settings.tesseract_cmd,
             target=screen_target,

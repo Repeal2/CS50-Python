@@ -6,7 +6,7 @@ import pytest
 
 from meeting_scribe.audio.recorder import RecordedAudio
 from meeting_scribe.config import Settings
-from meeting_scribe.screen.capture import ScreenTextEvent
+from meeting_scribe.screen.capture import ScreenTextEvent, SpeakerNameEvent
 from meeting_scribe.storage.database import Database
 from meeting_scribe.transcription.engine import TranscriptLine
 
@@ -86,6 +86,27 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
             assert meeting.transcript_text == result
             segments = db.get_segments(session.meeting_id)
             assert len(segments) == 3
+
+
+def test_session_wires_the_screen_watcher_to_collect_speaker_name_events(tmp_path):
+    """ScreenWatcher is constructed with on_speaker_name pointed at _speaker_name_events, the same way
+    on_text is pointed at _screen_events — so a badge sighting the watcher reports actually gets kept."""
+    with (
+        patch("meeting_scribe.session.Recorder"),
+        patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+
+            on_speaker_name = MockScreenWatcher.call_args.kwargs["on_speaker_name"]
+            on_speaker_name(SpeakerNameEvent(timestamp_seconds=1.5, name="Jonathan Arnold"))
+
+            assert session._speaker_name_events == [
+                SpeakerNameEvent(timestamp_seconds=1.5, name="Jonathan Arnold")
+            ]
 
 
 def test_session_passes_chosen_devices_to_recorder(tmp_path):
