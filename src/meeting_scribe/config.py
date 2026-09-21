@@ -11,6 +11,8 @@ import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from meeting_scribe.hotkeys import HotkeyCombo
+
 USER_CONFIG_FILENAME = "settings.json"
 
 # The sizes offered in the Settings tab's model dropdown, smallest/fastest first. faster-whisper also
@@ -70,6 +72,12 @@ class Settings:
     # ai/copilot_push.py). None means nothing gets pushed anywhere: the meeting is still recorded and
     # saved locally, just not handed off.
     copilot_sync_dir: Path | None = None
+    # Global (system-wide) keyboard shortcuts for starting/stopping a meeting without switching focus to
+    # this app — see hotkeys.py. Either can be None to leave that action mouse-only, which is the default:
+    # a hotkey that fires on every launch with no setup could collide with a combo already in use
+    # elsewhere, so this is opt-in from the Settings tab rather than assigned automatically.
+    start_meeting_hotkey: HotkeyCombo | None = None
+    stop_meeting_hotkey: HotkeyCombo | None = None
 
     @property
     def db_path(self) -> Path:
@@ -114,10 +122,23 @@ def _load_user_config(data_dir: Path) -> dict:
         return {}
 
 
+def _hotkey_to_json(combo: HotkeyCombo | None) -> dict | None:
+    return {"modifiers": combo.modifiers, "vk": combo.vk} if combo is not None else None
+
+
+def _hotkey_from_json(data: object) -> HotkeyCombo | None:
+    if not isinstance(data, dict):
+        return None
+    try:
+        return HotkeyCombo(modifiers=int(data["modifiers"]), vk=int(data["vk"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def save_user_config(settings: Settings) -> None:
     """Persists the user-editable settings (Copilot sync folder, chosen audio devices, Whisper model
-    size) so they survive a restart without the user needing to set environment variables — the GUI's
-    Settings tab calls this after Save."""
+    size, meeting shortcuts) so they survive a restart without the user needing to set environment
+    variables — the GUI's Settings tab calls this after Save."""
     path = _user_config_path(settings.data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -125,6 +146,8 @@ def save_user_config(settings: Settings) -> None:
         "system_device_name": settings.system_device_name,
         "copilot_sync_dir": str(settings.copilot_sync_dir) if settings.copilot_sync_dir else None,
         "whisper_model_size": settings.whisper_model_size,
+        "start_meeting_hotkey": _hotkey_to_json(settings.start_meeting_hotkey),
+        "stop_meeting_hotkey": _hotkey_to_json(settings.stop_meeting_hotkey),
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -157,6 +180,16 @@ def update_whisper_model_size(settings: Settings, *, whisper_model_size: str) ->
     return updated
 
 
+def update_meeting_hotkeys(
+    settings: Settings, *, start: HotkeyCombo | None, stop: HotkeyCombo | None
+) -> Settings:
+    """Applies and persists the Settings tab's Start/Stop meeting shortcut choices. Either can be None to
+    leave that action mouse-only."""
+    updated = replace(settings, start_meeting_hotkey=start, stop_meeting_hotkey=stop)
+    save_user_config(updated)
+    return updated
+
+
 def load_settings() -> Settings:
     data_dir = _default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -177,4 +210,6 @@ def load_settings() -> Settings:
         mic_device_name=user_config.get("mic_device_name"),
         system_device_name=user_config.get("system_device_name"),
         copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None,
+        start_meeting_hotkey=_hotkey_from_json(user_config.get("start_meeting_hotkey")),
+        stop_meeting_hotkey=_hotkey_from_json(user_config.get("stop_meeting_hotkey")),
     )

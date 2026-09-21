@@ -106,3 +106,16 @@ def test_hwnd_to_watch_for_auto_stop_is_none_for_a_fixed_position_area():
 
     target = RegionTarget(left=10, top=10, width=200, height=150)
     assert gui_app._hwnd_to_watch_for_auto_stop(target) is None
+
+
+def test_hotkey_label_shows_not_set_for_none():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._hotkey_label(None) == "Not set"
+
+
+def test_hotkey_label_shows_the_combo():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    from meeting_scribe.hotkeys import MOD_CONTROL, MOD_SHIFT, HotkeyCombo
+
+    combo = HotkeyCombo(modifiers=MOD_CONTROL | MOD_SHIFT, vk=0x53)
+    assert gui_app._hotkey_label(combo) == "Ctrl+Shift+S"

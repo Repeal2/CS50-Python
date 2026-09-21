@@ -6,8 +6,10 @@ from meeting_scribe.config import (
     resolve_tesseract_cmd,
     update_audio_devices,
     update_copilot_settings,
+    update_meeting_hotkeys,
     update_whisper_model_size,
 )
+from meeting_scribe.hotkeys import MOD_ALT, MOD_CONTROL, MOD_SHIFT, HotkeyCombo
 
 
 def test_explicit_path_wins(monkeypatch):
@@ -168,3 +170,63 @@ def test_update_whisper_model_size_does_not_clobber_other_settings(tmp_path, mon
     reloaded = load_settings()
     assert reloaded.mic_device_name == "USB Mic"
     assert reloaded.whisper_model_size == "medium"
+
+
+def test_load_settings_defaults_meeting_hotkeys_to_unset(tmp_path, monkeypatch):
+    # Off by default: a global hotkey that fires on every launch with no setup could collide with a
+    # combo already claimed elsewhere on the user's PC, so this is opt-in from the Settings tab.
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = load_settings()
+
+    assert settings.start_meeting_hotkey is None
+    assert settings.stop_meeting_hotkey is None
+
+
+def test_update_meeting_hotkeys_persists_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    start = HotkeyCombo(modifiers=MOD_CONTROL | MOD_ALT, vk=0x53)  # Ctrl+Alt+S
+    stop = HotkeyCombo(modifiers=MOD_CONTROL | MOD_ALT | MOD_SHIFT, vk=0x53)  # Ctrl+Alt+Shift+S
+
+    update_meeting_hotkeys(load_settings(), start=start, stop=stop)
+
+    reloaded = load_settings()
+    assert reloaded.start_meeting_hotkey == start
+    assert reloaded.stop_meeting_hotkey == stop
+
+
+def test_update_meeting_hotkeys_can_clear_either_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    start = HotkeyCombo(modifiers=MOD_CONTROL, vk=0x53)
+
+    update_meeting_hotkeys(load_settings(), start=start, stop=start)
+    cleared = update_meeting_hotkeys(load_settings(), start=start, stop=None)
+
+    assert cleared.start_meeting_hotkey == start
+    assert cleared.stop_meeting_hotkey is None
+    assert load_settings().stop_meeting_hotkey is None
+
+
+def test_update_meeting_hotkeys_does_not_clobber_other_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    start = HotkeyCombo(modifiers=MOD_CONTROL, vk=0x53)
+
+    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_meeting_hotkeys(settings, start=start, stop=None)
+
+    reloaded = load_settings()
+    assert reloaded.mic_device_name == "USB Mic"
+    assert reloaded.start_meeting_hotkey == start
+
+
+def test_load_settings_ignores_a_corrupt_hotkey_entry(tmp_path, monkeypatch):
+    # A hand-edited or otherwise malformed settings.json shouldn't crash startup over one bad field —
+    # same "soft preference" tolerance _load_user_config already documents for the whole file.
+    import json
+
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"start_meeting_hotkey": {"modifiers": "not-a-number"}}), encoding="utf-8"
+    )
+
+    assert load_settings().start_meeting_hotkey is None

@@ -24,7 +24,15 @@ from meeting_scribe.config import (
     load_settings,
     update_audio_devices,
     update_copilot_settings,
+    update_meeting_hotkeys,
     update_whisper_model_size,
+)
+from meeting_scribe.hotkeys import (
+    GlobalHotkeyListener,
+    HotkeyCombo,
+    current_modifiers,
+    is_modifier_keysym,
+    key_name,
 )
 from meeting_scribe.screen.capture import ocr_region
 from meeting_scribe.screen.region_picker import (
@@ -77,6 +85,10 @@ def _has_no_mic_signal(problems: "tuple[str, ...]") -> bool:
     silence" — see its own "digital silence" test) rather than re-deriving the condition from scratch, so
     this stays in lockstep with whatever counts as that warning there."""
     return any(problem.startswith("Microphone:") and "digital silence" in problem for problem in problems)
+
+
+def _hotkey_label(combo: HotkeyCombo | None) -> str:
+    return combo.label if combo is not None else "Not set"
 
 
 def _hwnd_to_watch_for_auto_stop(
@@ -159,6 +171,47 @@ class MeetingScribeApp(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._hotkey_listener: GlobalHotkeyListener | None = None
+        self.apply_hotkeys()
+
+    def apply_hotkeys(self) -> None:
+        """(Re)starts the global-hotkey listener from self.settings' current start/stop combos — called
+        once at startup and again from the Settings tab's Save button whenever either combo changes.
+        Tearing down and rebuilding the whole listener rather than patching a live one is simplest and
+        cheap, since this only ever runs right after startup or an explicit Save, never in a hot path."""
+        if self._hotkey_listener is not None:
+            self._hotkey_listener.stop()
+            self._hotkey_listener = None
+
+        bindings = {}
+        if self.settings.start_meeting_hotkey is not None:
+            bindings[1] = (self.settings.start_meeting_hotkey, lambda: self.after(0, self._handle_start_hotkey))
+        if self.settings.stop_meeting_hotkey is not None:
+            bindings[2] = (self.settings.stop_meeting_hotkey, lambda: self.after(0, self._record_tab._stop))
+        if not bindings:
+            return
+
+        listener = GlobalHotkeyListener(bindings)
+        try:
+            failed = listener.start()
+        except RuntimeError:
+            return  # not on Windows (e.g. a dev machine) — hotkeys just aren't available there
+        self._hotkey_listener = listener
+        if failed:
+            labels = ", ".join(combo.label for combo in failed)
+            messagebox.showwarning(
+                "Meeting Scribe",
+                "Couldn't register this shortcut — it's likely already used by another application: "
+                f"{labels}",
+            )
+
+    def _handle_start_hotkey(self) -> None:
+        # The Start button is already disabled while a meeting is recording, which is what normally
+        # prevents this — but a global hotkey bypasses button state entirely, so it needs its own guard
+        # against starting a second meeting on top of one already running.
+        if self._session is None:
+            self._record_tab._start()
+
     def refresh_project_lists(self) -> None:
         self._record_tab.refresh_projects()
         self._projects_tab.refresh_projects()
@@ -229,6 +282,8 @@ class MeetingScribeApp(tk.Tk):
         self._projects_tab.select_project(project.name)
 
     def _on_close(self) -> None:
+        if self._hotkey_listener is not None:
+            self._hotkey_listener.stop()
         self._record_tab.close_region_outline()
         self.db.close()
         self.destroy()
@@ -1283,15 +1338,21 @@ class ProjectsTab(ttk.Frame):
 
 
 class SettingsTab(ttk.Frame):
-    """Copilot push folder, audio device selection, and transcription model size — all editable without
-    touching environment variables. Saved settings are written to disk (see config.save_user_config) and
-    take effect immediately for this running session."""
+    """Copilot push folder, audio device selection, transcription model size, and global meeting
+    shortcuts — all editable without touching environment variables. Saved settings are written to disk
+    (see config.save_user_config) and take effect immediately for this running session."""
 
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
         self.app = app
         self._input_devices: list = []
         self._loopback_devices: list = []
+        # Staged, not applied until Save — mirrors every other field on this tab. None means "mouse
+        # only" for that action. Which one (if either) is currently being (re)captured; see
+        # _begin_hotkey_capture.
+        self._pending_start_hotkey: HotkeyCombo | None = self.app.settings.start_meeting_hotkey
+        self._pending_stop_hotkey: HotkeyCombo | None = self.app.settings.stop_meeting_hotkey
+        self._capturing_hotkey: str | None = None
 
         form = ttk.Frame(self)
         form.pack(fill="x", padx=12, pady=12, anchor="n")
@@ -1331,6 +1392,34 @@ class SettingsTab(ttk.Frame):
             state="readonly",
         )
         self.whisper_model_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
+
+        # Global (system-wide) shortcuts — work even while focused in Teams, not just this app. Off
+        # ("Not set") until explicitly captured here; see hotkeys.py and MeetingScribeApp.apply_hotkeys.
+        ttk.Label(form, text="Start meeting shortcut").grid(row=4, column=0, sticky="w")
+        self.start_hotkey_var = tk.StringVar(value=_hotkey_label(self._pending_start_hotkey))
+        ttk.Label(form, textvariable=self.start_hotkey_var).grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        start_hotkey_buttons = ttk.Frame(form)
+        start_hotkey_buttons.grid(row=4, column=2, padx=(6, 0))
+        self.start_hotkey_button = ttk.Button(
+            start_hotkey_buttons, text="Change…", command=lambda: self._begin_hotkey_capture("start")
+        )
+        self.start_hotkey_button.pack(side="left")
+        ttk.Button(start_hotkey_buttons, text="Clear", command=lambda: self._clear_hotkey("start")).pack(
+            side="left", padx=(4, 0)
+        )
+
+        ttk.Label(form, text="Stop meeting shortcut").grid(row=5, column=0, sticky="w")
+        self.stop_hotkey_var = tk.StringVar(value=_hotkey_label(self._pending_stop_hotkey))
+        ttk.Label(form, textvariable=self.stop_hotkey_var).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+        stop_hotkey_buttons = ttk.Frame(form)
+        stop_hotkey_buttons.grid(row=5, column=2, padx=(6, 0))
+        self.stop_hotkey_button = ttk.Button(
+            stop_hotkey_buttons, text="Change…", command=lambda: self._begin_hotkey_capture("stop")
+        )
+        self.stop_hotkey_button.pack(side="left")
+        ttk.Button(stop_hotkey_buttons, text="Clear", command=lambda: self._clear_hotkey("stop")).pack(
+            side="left", padx=(4, 0)
+        )
         form.columnconfigure(1, weight=1)
 
         ttk.Button(self, text="Save", command=self._save).pack(anchor="w", padx=12)
@@ -1358,7 +1447,14 @@ class SettingsTab(ttk.Frame):
             "on a larger model where a smaller one would have finished fine. The first meeting after "
             "switching to a size that hasn't been used before downloads it, which needs internet access "
             "and can take a while for the larger sizes; only meetings started after Save pick up the "
-            "change, so anything currently recording or still finishing up keeps using the old size."
+            "change, so anything currently recording or still finishing up keeps using the old size.\n\n"
+            "Meeting shortcuts work system-wide — from inside Teams, not just this app — so a meeting can "
+            "be started or stopped without switching windows first. Click Change…, then press the combo "
+            "you want (needs at least one of Ctrl/Alt/Shift/Win); Esc cancels. Starting reuses whichever "
+            "project and title are currently filled in on the Record tab, exactly like clicking Start "
+            "Meeting there. Left \"Not set\", that action stays mouse-only. A shortcut already claimed by "
+            "another application on this PC will fail to register — you'll see a warning naming which "
+            "one, and it just won't fire until changed to something else."
         )
         ttk.Label(self, text=note, wraplength=560, justify="left", foreground="#555").pack(
             anchor="w", padx=12, pady=(12, 0)
@@ -1400,7 +1496,65 @@ class SettingsTab(ttk.Frame):
         if self.system_var.get() not in system_values:
             self.system_var.set(SYSTEM_DEFAULT_LABEL)
 
+    def _begin_hotkey_capture(self, which: str) -> None:
+        """Starts listening for the next real key combo pressed anywhere in the app, to assign as the
+        Start or Stop meeting shortcut. Only listens in-app (bind_all, not a global hook) — capturing
+        what to register is a one-off interaction with this tab, unlike triggering the shortcut itself
+        afterward, which is exactly the point of registering it globally in the first place."""
+        if self._capturing_hotkey is not None:
+            return  # already capturing the other one; ignore a second click until that one finishes
+        self._capturing_hotkey = which
+        var = self.start_hotkey_var if which == "start" else self.stop_hotkey_var
+        button = self.start_hotkey_button if which == "start" else self.stop_hotkey_button
+        var.set("Press keys… (Esc to cancel)")
+        button["state"] = "disabled"
+        self.bind_all("<KeyPress>", self._on_hotkey_capture_keypress)
+
+    def _on_hotkey_capture_keypress(self, event: "tk.Event") -> None:
+        if event.keysym == "Escape":
+            self._end_hotkey_capture(new_combo=None, cancelled=True)
+            return
+        if is_modifier_keysym(event.keysym):
+            return  # just a modifier on its own so far; keep listening for the "main" key
+        if key_name(event.keycode) is None:
+            return  # not one of the keys this capture UI supports (letters/digits/F-keys); keep waiting
+        modifiers = current_modifiers()
+        if modifiers == 0:
+            return  # a global shortcut needs at least one modifier held; keep waiting
+        self._end_hotkey_capture(new_combo=HotkeyCombo(modifiers=modifiers, vk=event.keycode), cancelled=False)
+
+    def _end_hotkey_capture(self, *, new_combo: HotkeyCombo | None, cancelled: bool) -> None:
+        which, self._capturing_hotkey = self._capturing_hotkey, None
+        self.unbind_all("<KeyPress>")
+        if which is None:
+            return
+        if not cancelled:
+            if which == "start":
+                self._pending_start_hotkey = new_combo
+            else:
+                self._pending_stop_hotkey = new_combo
+        var = self.start_hotkey_var if which == "start" else self.stop_hotkey_var
+        button = self.start_hotkey_button if which == "start" else self.stop_hotkey_button
+        combo = self._pending_start_hotkey if which == "start" else self._pending_stop_hotkey
+        var.set(_hotkey_label(combo))
+        button["state"] = "normal"
+
+    def _clear_hotkey(self, which: str) -> None:
+        if which == "start":
+            self._pending_start_hotkey = None
+            self.start_hotkey_var.set(_hotkey_label(None))
+        else:
+            self._pending_stop_hotkey = None
+            self.stop_hotkey_var.set(_hotkey_label(None))
+
     def _save(self) -> None:
+        if (
+            self._pending_start_hotkey is not None
+            and self._pending_start_hotkey == self._pending_stop_hotkey
+        ):
+            messagebox.showerror("Meeting Scribe", "Start and Stop shortcuts can't be the same combo.")
+            return
+
         mic_name = None if self.mic_var.get() == SYSTEM_DEFAULT_LABEL else self.mic_var.get()
         system_name = (
             None if self.system_var.get() == SYSTEM_DEFAULT_LABEL else self.system_var.get()
@@ -1417,6 +1571,10 @@ class SettingsTab(ttk.Frame):
         self.app.settings = update_whisper_model_size(
             self.app.settings, whisper_model_size=self.whisper_model_var.get()
         )
+        self.app.settings = update_meeting_hotkeys(
+            self.app.settings, start=self._pending_start_hotkey, stop=self._pending_stop_hotkey
+        )
+        self.app.apply_hotkeys()
         self._refresh_status()
         self.app.sync_device_displays()
         # If a meeting is actively recording, move it onto the newly chosen device(s) now rather than
