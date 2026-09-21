@@ -6,6 +6,7 @@ from meeting_scribe.config import (
     resolve_tesseract_cmd,
     update_audio_devices,
     update_copilot_settings,
+    update_diarize_system_audio,
     update_meeting_hotkeys,
     update_whisper_model_size,
 )
@@ -230,6 +231,33 @@ def test_load_settings_ignores_a_corrupt_hotkey_entry(tmp_path, monkeypatch):
     )
 
     assert load_settings().start_meeting_hotkey is None
+
+
+def test_load_settings_defaults_diarize_system_audio_to_off(tmp_path, monkeypatch):
+    # Off by default: turning this on sends meeting audio to third parties, so — like the meeting
+    # hotkeys — it shouldn't happen without the user explicitly opting in from the Settings tab.
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    assert load_settings().diarize_system_audio is False
+
+
+def test_update_diarize_system_audio_persists_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_diarize_system_audio(load_settings(), diarize_system_audio=True)
+
+    assert load_settings().diarize_system_audio is True
+
+
+def test_update_diarize_system_audio_does_not_clobber_other_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_diarize_system_audio(settings, diarize_system_audio=True)
+
+    reloaded = load_settings()
+    assert reloaded.mic_device_name == "USB Mic"
+    assert reloaded.diarize_system_audio is True
 
 
 def test_meeting_dir_is_keyed_by_meeting_id_alone(tmp_path, monkeypatch):

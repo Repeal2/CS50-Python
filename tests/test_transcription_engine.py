@@ -106,6 +106,22 @@ def test_render_transcript_formats_timestamps_and_labels():
     )
 
 
+def test_render_transcript_prefers_a_diarized_speaker_label_over_the_source_label():
+    lines = [
+        TranscriptLine(0.0, "system", "hi there", speaker="SPEAKER_00"),
+        TranscriptLine(1.0, "system", "hey", speaker="SPEAKER_01"),
+        TranscriptLine(2.0, "system", "no diarization here"),
+    ]
+
+    text = render_transcript(lines)
+
+    assert text == (
+        "[00:00] SPEAKER_00: hi there\n"
+        "[00:01] SPEAKER_01: hey\n"
+        "[00:02] Others: no diarization here"
+    )
+
+
 def _write_wav(path, seconds, framerate=16000):
     with contextlib.closing(wave.open(str(path), "wb")) as wav_file:
         wav_file.setnchannels(1)

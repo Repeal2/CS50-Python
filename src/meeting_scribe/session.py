@@ -12,7 +12,7 @@ doesn't wait for the previous one to finish transcribing/saving.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
 from meeting_scribe.audio.recorder import Recorder, discover_wav_parts
@@ -29,6 +29,29 @@ from meeting_scribe.transcription.engine import (
     merge_transcript_lines,
     render_transcript,
 )
+
+
+def _transcribe_system_track(
+    settings: Settings,
+    local_transcriber: WhisperTranscriber,
+    system_paths: Sequence[Path],
+    report: Callable[[str], None],
+) -> list[TranscriptLine]:
+    """Transcribes the system-audio track — everyone but the meeting owner — using cloud speaker
+    diarization when opted into (Settings.diarize_system_audio), local transcription otherwise. Cloud
+    diarization falling back to local on any failure, rather than raising, is deliberate: a third-party
+    outage or a missing API key shouldn't cost a meeting its transcript, just the per-speaker labels."""
+    if settings.diarize_system_audio:
+        try:
+            from meeting_scribe.transcription.runpod_whisperx import (
+                RunpodWhisperXError,
+                RunpodWhisperXTranscriber,
+            )
+
+            return RunpodWhisperXTranscriber().transcribe_parts(system_paths, source="system")
+        except RunpodWhisperXError as error:
+            report(f"Cloud speaker diarization failed ({error}) — falling back to local transcription.")
+    return local_transcriber.transcribe_parts(system_paths, source="system")
 
 
 class MeetingSession:
@@ -152,7 +175,9 @@ class MeetingSession:
             report(warning)
 
         mic_lines = self._transcriber.transcribe_parts(recorded.mic_paths, source="mic")
-        system_lines = self._transcriber.transcribe_parts(recorded.system_paths, source="system")
+        system_lines = _transcribe_system_track(
+            self._settings, self._transcriber, recorded.system_paths, report
+        )
         screen_lines = [
             TranscriptLine(event.timestamp_seconds, "screen_ocr", event.text)
             for event in self._screen_events
@@ -259,7 +284,7 @@ def retry_meeting_transcription(
 
     transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
     mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")
-    system_lines = transcriber.transcribe_parts(system_paths, source="system")
+    system_lines = _transcribe_system_track(settings, transcriber, system_paths, report)
     report("Transcription complete.")
 
     audio_lines = merge_transcript_lines(mic_lines, system_lines)

@@ -78,6 +78,13 @@ class Settings:
     # elsewhere, so this is opt-in from the Settings tab rather than assigned automatically.
     start_meeting_hotkey: HotkeyCombo | None = None
     stop_meeting_hotkey: HotkeyCombo | None = None
+    # Opt-in: sends the system-audio track to a Runpod-hosted WhisperX endpoint for speaker diarization
+    # instead of transcribing it locally — see transcription.runpod_whisperx. Off by default, same
+    # reasoning as the meeting hotkeys above: turning this on sends meeting audio to third parties, so it
+    # shouldn't happen without the user explicitly choosing it. The Runpod/HuggingFace credentials this
+    # needs are read from the environment only (see runpod_whisperx._API_KEY_ENV etc.), never stored here
+    # or in settings.json — this flag just says whether to try.
+    diarize_system_audio: bool = False
 
     @property
     def db_path(self) -> Path:
@@ -146,6 +153,7 @@ def save_user_config(settings: Settings) -> None:
         "whisper_model_size": settings.whisper_model_size,
         "start_meeting_hotkey": _hotkey_to_json(settings.start_meeting_hotkey),
         "stop_meeting_hotkey": _hotkey_to_json(settings.stop_meeting_hotkey),
+        "diarize_system_audio": settings.diarize_system_audio,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -164,6 +172,15 @@ def update_audio_devices(
     """Applies and persists a microphone / system-audio device choice from the Settings tab. None means
     "use whatever Windows currently considers the default" for that device."""
     updated = replace(settings, mic_device_name=mic_device_name, system_device_name=system_device_name)
+    save_user_config(updated)
+    return updated
+
+
+def update_diarize_system_audio(settings: Settings, *, diarize_system_audio: bool) -> Settings:
+    """Applies and persists the Settings tab's cloud-speaker-diarization opt-in checkbox. Only affects
+    meetings whose transcription hasn't started yet — like whisper_model_size, a MeetingSession reads this
+    once at construction time (see session.py)."""
+    updated = replace(settings, diarize_system_audio=diarize_system_audio)
     save_user_config(updated)
     return updated
 
@@ -210,4 +227,5 @@ def load_settings() -> Settings:
         copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None,
         start_meeting_hotkey=_hotkey_from_json(user_config.get("start_meeting_hotkey")),
         stop_meeting_hotkey=_hotkey_from_json(user_config.get("stop_meeting_hotkey")),
+        diarize_system_audio=bool(user_config.get("diarize_system_audio", False)),
     )
