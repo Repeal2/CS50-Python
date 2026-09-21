@@ -54,7 +54,7 @@ class MeetingSession:
         # database row id — assigned once at creation and never changes, unlike the title.
         self.meeting_code = db.get_meeting(self.meeting_id).meeting_code
 
-        meeting_dir = settings.meeting_dir(self.project.slug, self.meeting_id)
+        meeting_dir = settings.meeting_dir(self.meeting_id)
         meeting_dir.mkdir(parents=True, exist_ok=True)
 
         self._recorder = Recorder(
@@ -85,6 +85,18 @@ class MeetingSession:
     def switch_system_device(self, device_name: str | None) -> None:
         """Moves the system-audio recording to a different device mid-meeting. See switch_mic_device."""
         self._recorder.switch_system_device(device_name)
+
+    def set_project(self, project_name: str) -> None:
+        """Moves this meeting to a different project, any time before it's finished — a reassignment,
+        not a copy: the meeting keeps its id, title, and transcript-in-progress. Creates the project if
+        `project_name` hasn't been used before, exactly like starting a meeting under one does.
+
+        A pure database update with nothing to move on disk: recording storage is keyed by meeting id
+        alone, not by project (see Settings.meeting_dir), specifically so this stays safe to call while
+        the Recorder is still actively writing to those files."""
+        new_project = self._db.get_or_create_project(project_name)
+        self._db.move_meeting_to_project(self.meeting_id, new_project.id)
+        self.project = new_project
 
     def audio_levels(self) -> tuple[float, float]:
         """Current (mic, system) input levels, roughly 0..1 — lets the GUI show a live "is this actually
@@ -228,7 +240,7 @@ def retry_meeting_transcription(
     if project is None:
         raise ValueError(f"Meeting {meeting_id}'s project no longer exists")
 
-    meeting_dir = settings.meeting_dir(project.slug, meeting_id)
+    meeting_dir = settings.meeting_dir(meeting_id)
     mic_paths = discover_wav_parts(meeting_dir / "mic.wav")
     system_paths = discover_wav_parts(meeting_dir / "system.wav")
     if not mic_paths and not system_paths:

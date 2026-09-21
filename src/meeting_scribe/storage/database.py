@@ -262,6 +262,17 @@ class Database:
             self._conn.execute("UPDATE meetings SET title = ? WHERE id = ?", (title, meeting_id))
             self._conn.commit()
 
+    def move_meeting_to_project(self, meeting_id: int, project_id: int) -> None:
+        """Reassigns which project a meeting belongs to — like update_meeting_title, editable any time up
+        until the meeting ends, not just fixed at Start (see session.MeetingSession.set_project). A pure
+        metadata change: the meeting's recording files are keyed by meeting id, not project (see
+        Settings.meeting_dir), so nothing on disk needs to move."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE meetings SET project_id = ? WHERE id = ?", (project_id, meeting_id)
+            )
+            self._conn.commit()
+
     def list_recent_meeting_titles(self, project_id: int) -> list[str]:
         """Distinct meeting titles used in this project, most recently used first — powers the Record
         tab's meeting-title suggestions for quick repeat meetings (e.g. "Weekly Client Meeting")."""

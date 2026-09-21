@@ -52,6 +52,13 @@ from meeting_scribe.transcription.engine import TranscriptLine, render_transcrip
 # considers the default" rather than a specific device — used on both the Record tab and Settings tab.
 SYSTEM_DEFAULT_LABEL = "System default"
 
+# Used when Start is clicked (or a Start hotkey fires — see MeetingScribeApp._handle_start_hotkey) with
+# the project field left blank, so a meeting never fails to start for lack of a project name. The
+# project field stays editable for the meeting's whole life (see RecordTab._on_project_field_committed),
+# so recording under this placeholder is never a dead end — it can be moved to a real project any time
+# before the meeting ends, the same way its title can be renamed from "Untitled meeting".
+DEFAULT_PROJECT_NAME = "Unfiled"
+
 # Manual-notes editor: matches leading whitespace plus an optional bullet marker ("-", "*", or "•")
 # followed by a space, so Enter can continue the same bullet/indent on the next line. A plain line (no
 # bullet) just matches its leading whitespace, so it stays plain rather than getting a bullet forced on.
@@ -336,8 +343,9 @@ class RecordTab(ttk.Frame):
         self.project_var = tk.StringVar()
         self.project_combo = ttk.Combobox(form, textvariable=self.project_var, width=40)
         self.project_combo.grid(row=0, column=1, sticky="we", padx=6, pady=4)
-        self.project_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_title_suggestions())
-        self.project_combo.bind("<FocusOut>", lambda _e: self._refresh_title_suggestions())
+        self.project_combo.bind("<<ComboboxSelected>>", self._on_project_field_committed)
+        self.project_combo.bind("<FocusOut>", self._on_project_field_committed)
+        self.project_combo.bind("<Return>", self._on_project_field_committed)
         ttk.Button(form, text="Add Project", command=self.app.prompt_new_project).grid(
             row=0, column=2, padx=(6, 0)
         )
@@ -523,6 +531,26 @@ class RecordTab(ttk.Frame):
         self.title_combo["values"] = (
             self.app.db.list_recent_meeting_titles(project.id) if project is not None else []
         )
+
+    def _on_project_field_committed(self, _event=None) -> None:
+        """Fires when the project field's value is "committed" — tabbed/clicked away from, Enter
+        pressed, or an existing project picked from the dropdown — rather than on every keystroke the
+        way the title field is. Committing a project change calls get_or_create_project, which would
+        otherwise leave a throwaway row behind for every partially-typed character if it ran that
+        eagerly.
+
+        Refreshes the title-suggestions dropdown for whatever project is now entered (existing
+        behavior), and — if a meeting is actively recording under a *different* project name — moves it
+        to this one, the project-field counterpart to _on_title_changed."""
+        self._refresh_title_suggestions()
+        session = self.app._session
+        if session is None:
+            return
+        project_name = self.project_var.get().strip()
+        if not project_name or project_name == session.project.name:
+            return
+        session.set_project(project_name)
+        self._log(f'[{session.title}] Moved to project "{project_name}".')
 
     def _on_title_changed(self, *_args) -> None:
         """Keeps the meeting title editable for the whole life of a meeting, not just fixed at Start —
@@ -818,10 +846,7 @@ class RecordTab(ttk.Frame):
             pass  # logging shouldn't itself be able to take the app down
 
     def _start(self) -> None:
-        project_name = self.project_var.get().strip()
-        if not project_name:
-            messagebox.showerror("Meeting Scribe", "Enter a project name first.")
-            return
+        project_name = self.project_var.get().strip() or DEFAULT_PROJECT_NAME
         meeting_title = self.title_var.get()
         screen_target = self._selected_screen_target()
         try:
@@ -838,6 +863,10 @@ class RecordTab(ttk.Frame):
             return
 
         self.app._session = session
+        # Reflects the DEFAULT_PROJECT_NAME fallback back into the field when it was left blank, so what's
+        # shown always matches what the meeting is actually recording under — same reasoning as the title
+        # field always showing the real title rather than a placeholder that isn't actually saved anywhere.
+        self.project_var.set(project_name)
         # Only takes effect if the screen source has a window to watch in the first place — see
         # _hwnd_to_watch_for_auto_stop — and only for this meeting: unchecking the box or changing the
         # screen source afterwards doesn't retroactively stop watching (or start watching) anything.

@@ -230,3 +230,18 @@ def test_load_settings_ignores_a_corrupt_hotkey_entry(tmp_path, monkeypatch):
     )
 
     assert load_settings().start_meeting_hotkey is None
+
+
+def test_meeting_dir_is_keyed_by_meeting_id_alone(tmp_path, monkeypatch):
+    # Regression test: meeting_dir used to take a project slug too (storage nested under
+    # projects/<slug>/meetings/<id>) — moving a meeting to a different project would have meant moving
+    # its recording files on disk, including possibly while the Recorder still had them open for
+    # writing. Keying storage by meeting id alone makes a project reassignment a pure database update
+    # (see Database.move_meeting_to_project) with nothing to move, at any time.
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = load_settings()
+
+    assert settings.meeting_dir(42) == tmp_path / "meetings" / "42"
+    # No dependency on any project at all — the same meeting id always resolves to the same path.
+    assert settings.meeting_dir(42) == settings.meeting_dir(42)

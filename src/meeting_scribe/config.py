@@ -84,10 +84,6 @@ class Settings:
         return self.data_dir / "meeting_scribe.db"
 
     @property
-    def projects_dir(self) -> Path:
-        return self.data_dir / "projects"
-
-    @property
     def documents_dir(self) -> Path:
         """Where uploaded documents' original bytes are kept (under a synthetic, collision-free name —
         see storage.documents.save_original_copy), separate from the DB's extracted-text copy, so the
@@ -99,11 +95,13 @@ class Settings:
     def copilot_inbox_dir(self) -> Path:
         return self.copilot_sync_dir / "Inbox"
 
-    def project_dir(self, project_slug: str) -> Path:
-        return self.projects_dir / project_slug
-
-    def meeting_dir(self, project_slug: str, meeting_id: int) -> Path:
-        return self.project_dir(project_slug) / "meetings" / str(meeting_id)
+    def meeting_dir(self, meeting_id: int) -> Path:
+        """Where one meeting's recorded audio and screen-capture state live during and immediately after
+        it. Keyed by meeting id alone, not by project — moving a meeting to a different project (see
+        storage.database.Database.move_meeting_to_project) is a pure database update with nothing to move
+        on disk, which matters because it needs to stay safe to do even while a Recorder still has these
+        files open for writing."""
+        return self.data_dir / "meetings" / str(meeting_id)
 
 
 def _user_config_path(data_dir: Path) -> Path:

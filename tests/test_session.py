@@ -433,6 +433,66 @@ def test_session_exposes_its_title(tmp_path):
             assert session.title == "Daily Standup"
 
 
+def test_session_set_project_moves_the_meeting_to_an_existing_project(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder"),
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            other_project = db.create_project("Other Project")
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Daily Standup")
+
+            session.set_project("Other Project")
+
+            assert session.project.id == other_project.id
+            assert db.get_meeting(session.meeting_id).project_id == other_project.id
+
+
+def test_session_set_project_creates_a_new_project_if_the_name_is_new(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder"),
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Unfiled", "Daily Standup")
+
+            session.set_project("Real Project Name")
+
+            assert session.project.name == "Real Project Name"
+            reloaded = db.get_project_by_name("Real Project Name")
+            assert reloaded is not None
+            assert db.get_meeting(session.meeting_id).project_id == reloaded.id
+
+
+def test_session_set_project_does_not_move_the_meetings_recording_directory(tmp_path):
+    # The whole point of keying meeting storage by meeting id rather than project (see
+    # config.Settings.meeting_dir) — moving projects is a pure database update, safe to call even while
+    # a real Recorder still has these files open for writing, which this test can't exercise directly
+    # (Recorder is mocked here) but the settled meeting_dir path not depending on the project at all is
+    # exactly what makes that safe.
+    with (
+        patch("meeting_scribe.session.Recorder"),
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        settings = _settings(tmp_path)
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(settings, db, "Test Project", "Daily Standup")
+            before = settings.meeting_dir(session.meeting_id)
+
+            session.set_project("A Different Project")
+
+            assert settings.meeting_dir(session.meeting_id) == before
+
+
 def test_two_sessions_can_be_active_at_once_without_interfering(tmp_path):
     # Regression test for back-to-back meetings: starting a new MeetingSession while a previous one's
     # stop() is still running (transcribing, pushing to Copilot Studio) must not share any mutable state
@@ -534,7 +594,7 @@ def _stuck_meeting(settings: Settings, db: Database, project_name="Test Project"
     behind."""
     project = db.get_or_create_project(project_name)
     meeting_id = db.create_meeting(project.id, title)
-    meeting_dir = settings.meeting_dir(project.slug, meeting_id)
+    meeting_dir = settings.meeting_dir(meeting_id)
     meeting_dir.mkdir(parents=True, exist_ok=True)
     (meeting_dir / "mic.wav").write_bytes(b"fake mic audio")
     (meeting_dir / "system.wav").write_bytes(b"fake system audio")
@@ -612,7 +672,7 @@ def test_retry_transcribes_every_recorded_part(tmp_path):
         with Database(tmp_path / "test.db") as db:
             settings = _settings(tmp_path)
             project, meeting_id = _stuck_meeting(settings, db)
-            meeting_dir = settings.meeting_dir(project.slug, meeting_id)
+            meeting_dir = settings.meeting_dir(meeting_id)
             (meeting_dir / "mic.part2.wav").write_bytes(b"more fake mic audio")
 
             retry_meeting_transcription(settings, db, meeting_id)

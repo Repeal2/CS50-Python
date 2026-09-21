@@ -104,6 +104,19 @@ def test_clear_transcript_segments_removes_only_that_meetings_rows(tmp_path):
         assert [row["text"] for row in db.get_segments(second)] == ["from the second meeting"]
 
 
+def test_move_meeting_to_project_reassigns_it(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        old_project = db.create_project("Old Project")
+        new_project = db.create_project("New Project")
+        meeting_id = db.create_meeting(old_project.id, "Kickoff")
+
+        db.move_meeting_to_project(meeting_id, new_project.id)
+
+        assert db.get_meeting(meeting_id).project_id == new_project.id
+        assert [m.id for m in db.list_meetings(new_project.id)] == [meeting_id]
+        assert db.list_meetings(old_project.id) == []
+
+
 def test_set_manual_notes_persists_and_can_be_overwritten(tmp_path):
     with Database(tmp_path / "test.db") as db:
         project = db.create_project("Manual Notes")
