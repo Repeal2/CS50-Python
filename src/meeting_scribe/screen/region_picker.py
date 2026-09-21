@@ -125,6 +125,14 @@ def _position_window(window: "tk.Misc", left: int, top: int, width: int, height:
     case (a display above or left of the primary) this exists to get right. Going through MoveWindow
     instead sidesteps that parser entirely: the coordinates it takes are always literal.
 
+    Sets *both* size and position, and is meant to be the only thing that ever does either for a window
+    it's used on — never call .geometry() on the same window afterward. Tk keeps its own notion of where
+    a window is, independent of the OS; mixing the two means Tk doesn't know this call happened, and the
+    next .geometry() call (even a size-only "WxH" one, which is supposed to leave position alone) can
+    reassert Tk's stale idea of the position, or otherwise disagree with the OS about the window's actual
+    geometry. That's what silently broke the always-visible capture-area outline, which recomputes and
+    reapplies its position on every poll tick.
+
     update_idletasks() first guarantees the window has a real platform handle to move — Tk creates one
     immediately when a Toplevel is constructed, but forcing a pending-event flush before reading
     winfo_id() is the safe way to depend on that rather than an implementation detail."""
@@ -156,9 +164,9 @@ def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:
 
     overlay = tk.Toplevel(parent)
     # overrideredirect (no title bar/borders) rather than "-fullscreen", which on Windows only ever
-    # covers the primary monitor regardless of the geometry given below.
+    # covers the primary monitor regardless of the geometry given below. Sized and positioned entirely
+    # through _position_window (never .geometry()) — see its docstring for why mixing the two is unsafe.
     overlay.overrideredirect(True)
-    overlay.geometry(f"{virtual_screen['width']}x{virtual_screen['height']}")
     _position_window(
         overlay, virtual_screen["left"], virtual_screen["top"],
         virtual_screen["width"], virtual_screen["height"],
@@ -282,8 +290,10 @@ class RegionOutline:
         self._flash_after_id: str | None = None
 
     def reposition(self, rect: dict) -> None:
+        # Never .geometry() on these — see _position_window's docstring for why mixing it with this call
+        # is what silently broke the outline in the first place (this runs on every poll tick to keep a
+        # window-pinned area's outline glued to the window as it moves, so the two would keep fighting).
         for part, frame in zip(self._parts, _frame_rects(rect, self.THICKNESS)):
-            part.geometry(f"{frame['width']}x{frame['height']}")
             _position_window(part, frame["left"], frame["top"], frame["width"], frame["height"])
 
     def set_alert(self, active: bool) -> None:
