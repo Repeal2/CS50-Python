@@ -85,8 +85,9 @@ def test_constructor_raises_without_configuration(monkeypatch):
 def test_build_payload_includes_huggingface_token_when_given():
     payload = _build_payload("https://example.com/a.wav", huggingface_token="hf_abc")
     assert payload["input"]["huggingface_access_token"] == "hf_abc"
-    assert payload["input"]["audio"] == "https://example.com/a.wav"
+    assert payload["input"]["audio_file"] == "https://example.com/a.wav"
     assert payload["input"]["diarization"] is True
+    assert "model" not in payload["input"]  # not a recognized field on this worker's schema
 
 
 def test_build_payload_omits_huggingface_token_when_not_given():
