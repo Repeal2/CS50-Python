@@ -8,10 +8,11 @@ for the system track: the mic track is already just one person, so diarizing it 
 Needs a Runpod API key and the id of a deployed WhisperX-with-diarization serverless endpoint before it'll
 do anything (see is_configured); a HuggingFace access token that has accepted pyannote's gated model terms
 is also needed for diarization itself to work, though the underlying worker may fail with its own error
-rather than this module catching that case specifically. None of these are secrets this app should ever
-write to disk (unlike the rest of Settings), so — unlike whisper_model_size or the Copilot sync folder —
-they're read from the environment only, never offered as a Settings-tab field or persisted to
-settings.json.
+rather than this module catching that case specifically. These come from config.Settings
+(runpod_api_key/runpod_endpoint_id/runpod_huggingface_token, entered on the Settings tab and persisted to
+settings.json like the app's other preferences) — the environment variables below are a fallback for
+anyone who'd rather set them that way instead (or not set a HuggingFace token here at all, if HF_TOKEN was
+set directly as an environment variable on the Runpod endpoint itself).
 
 _build_payload and _parse_segments are written against kodxana/whisperx-worker_v2's verified schema
 (github.com/kodxana/whisperx-worker_v2, checked directly against its rp_handler.py/rp_schema.py, not just
@@ -50,11 +51,14 @@ class RunpodWhisperXError(Exception):
     session._transcribe_system_track."""
 
 
-def is_configured() -> bool:
-    """Whether enough environment variables are set to even attempt a cloud diarization call. Checked
-    up front so a meeting that opted into cloud diarization without finishing setup fails with one clear
-    message instead of partway through a job submission."""
-    return bool(os.environ.get(_API_KEY_ENV)) and bool(os.environ.get(_ENDPOINT_ID_ENV))
+def is_configured(*, api_key: str | None = None, endpoint_id: str | None = None) -> bool:
+    """Whether enough is set — explicitly (e.g. from Settings) or via the environment variable fallback —
+    to even attempt a cloud diarization call. Checked up front so a meeting that opted into cloud
+    diarization without finishing setup fails with one clear message instead of partway through a job
+    submission."""
+    return bool(api_key or os.environ.get(_API_KEY_ENV)) and bool(
+        endpoint_id or os.environ.get(_ENDPOINT_ID_ENV)
+    )
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,9 @@ def _settings(
     system_device_name=None,
     copilot_sync_dir=None,
     diarize_system_audio=False,
+    runpod_api_key=None,
+    runpod_endpoint_id=None,
+    runpod_huggingface_token=None,
 ) -> Settings:
     return Settings(
         data_dir=tmp_path,
@@ -27,6 +30,9 @@ def _settings(
         system_device_name=system_device_name,
         copilot_sync_dir=copilot_sync_dir,
         diarize_system_audio=diarize_system_audio,
+        runpod_api_key=runpod_api_key,
+        runpod_endpoint_id=runpod_endpoint_id,
+        runpod_huggingface_token=runpod_huggingface_token,
     )
 
 
@@ -137,10 +143,25 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
         from meeting_scribe.session import MeetingSession
 
         with Database(tmp_path / "test.db") as db:
-            session = MeetingSession(_settings(tmp_path, diarize_system_audio=True), db, "Test Project", "Kickoff")
+            session = MeetingSession(
+                _settings(
+                    tmp_path,
+                    diarize_system_audio=True,
+                    runpod_api_key="rp-key",
+                    runpod_endpoint_id="rp-endpoint",
+                    runpod_huggingface_token="hf-token",
+                ),
+                db,
+                "Test Project",
+                "Kickoff",
+            )
             session.start()
             result = session.stop()
 
+        # Credentials come from Settings, not environment variables.
+        MockRunpod.assert_called_once_with(
+            api_key="rp-key", endpoint_id="rp-endpoint", huggingface_token="hf-token"
+        )
         MockRunpod.return_value.transcribe_parts.assert_called_once_with(
             recorder_instance.stop.return_value.system_paths, source="system"
         )

@@ -74,6 +74,18 @@ def test_is_configured_true_once_both_are_set(monkeypatch):
     assert is_configured()
 
 
+def test_is_configured_true_from_explicit_args_with_no_env_vars_set(monkeypatch):
+    monkeypatch.delenv("MEETING_SCRIBE_RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("MEETING_SCRIBE_RUNPOD_ENDPOINT_ID", raising=False)
+    assert is_configured(api_key="key", endpoint_id="endpoint")
+
+
+def test_is_configured_false_when_explicit_args_are_none_and_no_env_vars_set(monkeypatch):
+    monkeypatch.delenv("MEETING_SCRIBE_RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("MEETING_SCRIBE_RUNPOD_ENDPOINT_ID", raising=False)
+    assert not is_configured(api_key=None, endpoint_id=None)
+
+
 def test_constructor_raises_without_configuration(monkeypatch):
     monkeypatch.delenv("MEETING_SCRIBE_RUNPOD_API_KEY", raising=False)
     monkeypatch.delenv("MEETING_SCRIBE_RUNPOD_ENDPOINT_ID", raising=False)

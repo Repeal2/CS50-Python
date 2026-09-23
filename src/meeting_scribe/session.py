@@ -48,7 +48,12 @@ def _transcribe_system_track(
                 RunpodWhisperXTranscriber,
             )
 
-            return RunpodWhisperXTranscriber().transcribe_parts(system_paths, source="system")
+            transcriber = RunpodWhisperXTranscriber(
+                api_key=settings.runpod_api_key,
+                endpoint_id=settings.runpod_endpoint_id,
+                huggingface_token=settings.runpod_huggingface_token,
+            )
+            return transcriber.transcribe_parts(system_paths, source="system")
         except RunpodWhisperXError as error:
             report(f"Cloud speaker diarization failed ({error}) — falling back to local transcription.")
     return local_transcriber.transcribe_parts(system_paths, source="system")

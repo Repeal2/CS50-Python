@@ -8,6 +8,7 @@ from meeting_scribe.config import (
     update_copilot_settings,
     update_diarize_system_audio,
     update_meeting_hotkeys,
+    update_runpod_settings,
     update_whisper_model_size,
 )
 from meeting_scribe.hotkeys import MOD_ALT, MOD_CONTROL, MOD_SHIFT, HotkeyCombo
@@ -258,6 +259,58 @@ def test_update_diarize_system_audio_does_not_clobber_other_settings(tmp_path, m
     reloaded = load_settings()
     assert reloaded.mic_device_name == "USB Mic"
     assert reloaded.diarize_system_audio is True
+
+
+def test_load_settings_defaults_runpod_settings_to_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = load_settings()
+
+    assert settings.runpod_api_key is None
+    assert settings.runpod_endpoint_id is None
+    assert settings.runpod_huggingface_token is None
+
+
+def test_update_runpod_settings_persists_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_runpod_settings(
+        load_settings(),
+        runpod_api_key="rp-key",
+        runpod_endpoint_id="rp-endpoint",
+        runpod_huggingface_token="hf-token",
+    )
+
+    reloaded = load_settings()
+    assert reloaded.runpod_api_key == "rp-key"
+    assert reloaded.runpod_endpoint_id == "rp-endpoint"
+    assert reloaded.runpod_huggingface_token == "hf-token"
+
+
+def test_update_runpod_settings_treats_blank_strings_as_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_runpod_settings(
+        load_settings(), runpod_api_key="", runpod_endpoint_id="", runpod_huggingface_token=""
+    )
+
+    reloaded = load_settings()
+    assert reloaded.runpod_api_key is None
+    assert reloaded.runpod_endpoint_id is None
+    assert reloaded.runpod_huggingface_token is None
+
+
+def test_update_runpod_settings_does_not_clobber_other_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_runpod_settings(
+        settings, runpod_api_key="rp-key", runpod_endpoint_id="rp-endpoint", runpod_huggingface_token=None
+    )
+
+    reloaded = load_settings()
+    assert reloaded.mic_device_name == "USB Mic"
+    assert reloaded.runpod_api_key == "rp-key"
 
 
 def test_meeting_dir_is_keyed_by_meeting_id_alone(tmp_path, monkeypatch):
