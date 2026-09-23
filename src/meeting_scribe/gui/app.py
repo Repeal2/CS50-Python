@@ -27,6 +27,7 @@ from meeting_scribe.config import (
     update_meeting_hotkeys,
     update_whisper_model_size,
 )
+from meeting_scribe.audio.device_watch import device_signature
 from meeting_scribe.hotkeys import (
     GlobalHotkeyListener,
     HotkeyCombo,
@@ -99,8 +100,32 @@ def _has_no_mic_signal(problems: "tuple[str, ...]") -> bool:
     return any(problem.startswith("Microphone:") and "digital silence" in problem for problem in problems)
 
 
+def _device_choices(device_names: "list[str]", selected: str) -> "list[str]":
+    """Dropdown values for a mic/system-audio picker: "System default" plus every device currently
+    present — and the currently selected device even if it isn't present right now (unplugged). Keeping
+    it rather than resetting the selection to "System default" matters now that the lists refresh on
+    their own whenever a device comes or goes: a reset would silently become the saved setting on the
+    next Settings save, and the choice would be lost for when the device is plugged back in (the
+    recorder already falls back to the default, with a notice, while it's missing)."""
+    values = [SYSTEM_DEFAULT_LABEL] + [name for name in device_names if name != SYSTEM_DEFAULT_LABEL]
+    if selected and selected not in values:
+        values.append(selected)
+    return values
+
+
 def _hotkey_label(combo: HotkeyCombo | None) -> str:
     return combo.label if combo is not None else "Not set"
+
+
+def _enumerate_devices() -> tuple[list, list]:
+    """A fresh (input devices, loopback devices) enumeration — current only while no meeting is
+    recording (see MeetingScribeApp.refresh_device_lists). Empty lists off Windows (e.g. a dev machine)."""
+    from meeting_scribe.audio.device_picker import list_input_devices, list_loopback_devices
+
+    try:
+        return list_input_devices(), list_loopback_devices()
+    except RuntimeError:
+        return [], []
 
 
 def _hwnd_to_watch_for_auto_stop(
@@ -156,6 +181,9 @@ def _enable_per_monitor_dpi_awareness() -> None:
 
 
 class MeetingScribeApp(tk.Tk):
+    # How often the mic/system-audio dropdowns check for devices being connected or disconnected.
+    _DEVICE_POLL_MS = 2000
+
     def __init__(self, settings: Settings | None = None):
         _enable_per_monitor_dpi_awareness()
         super().__init__()
@@ -188,6 +216,12 @@ class MeetingScribeApp(tk.Tk):
 
         self._hotkey_listener: GlobalHotkeyListener | None = None
         self.apply_hotkeys()
+
+        # State for _poll_devices: the last device signature seen while idle, and the last recorder
+        # device-list version seen while recording (paired with the session it came from).
+        self._idle_device_signature = device_signature()
+        self._seen_device_list: tuple[MeetingSession | None, int] = (None, 0)
+        self.after(self._DEVICE_POLL_MS, self._poll_devices)
 
     def apply_hotkeys(self) -> None:
         """(Re)starts the global-hotkey listener from self.settings' current start/stop combos — called
@@ -226,6 +260,59 @@ class MeetingScribeApp(tk.Tk):
         # against starting a second meeting on top of one already running.
         if self._session is None:
             self._record_tab._start()
+
+    def refresh_device_lists(self) -> None:
+        """Repopulates the mic/system-audio dropdowns on both tabs with the current device list. While a
+        meeting records, that list has to come from its recorder — a fresh enumeration would only see
+        the snapshot PortAudio took when the meeting started (see audio.device_watch)."""
+        session = self._session
+        if session is not None:
+            inputs, loopbacks = session.available_devices()
+        else:
+            inputs, loopbacks = _enumerate_devices()
+        self._record_tab.apply_device_lists(inputs, loopbacks)
+        self._settings_tab.apply_device_lists(inputs, loopbacks)
+
+    def request_device_refresh(self) -> None:
+        """The "Refresh devices" buttons. Idle, that's just a fresh enumeration. While recording, the
+        recorder has to restart its audio to see anything new (see Recorder.reload_devices), which
+        blocks briefly — so that runs in the background, and _poll_devices updates the dropdowns once
+        the recorder's device list version changes."""
+        session = self._session
+        if session is None:
+            self.refresh_device_lists()
+            return
+
+        def worker() -> None:
+            try:
+                session.reload_devices()
+            except Exception as exc:
+                self.after(0, self._record_tab._log, f"[{session.title}] Couldn't refresh devices: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _poll_devices(self) -> None:
+        """Keeps the device dropdowns current as devices come and go, without anyone pressing Refresh.
+        Recording: the recorder's own watcher reloads its device list on a change, and this just
+        notices the version bump. Idle: a cheap winmm signature (audio.device_watch) says whether a
+        fresh enumeration is worth doing at all."""
+        try:
+            session = self._session
+            if session is not None:
+                version = session.device_list_version
+                if self._seen_device_list != (session, version):
+                    first_look = self._seen_device_list[0] is not session
+                    self._seen_device_list = (session, version)
+                    if not first_look:
+                        self.refresh_device_lists()
+            else:
+                signature = device_signature()
+                if signature is not None and signature != self._idle_device_signature:
+                    if self._idle_device_signature is not None:
+                        self.refresh_device_lists()
+                    self._idle_device_signature = signature
+        finally:
+            self.after(self._DEVICE_POLL_MS, self._poll_devices)
 
     def refresh_project_lists(self) -> None:
         self._record_tab.refresh_projects()
@@ -461,7 +548,9 @@ class RecordTab(ttk.Frame):
 
         device_buttons = ttk.Frame(form)
         device_buttons.grid(row=5, column=2, rowspan=2, padx=(6, 0))
-        ttk.Button(device_buttons, text="Refresh devices", command=self._refresh_devices).pack(fill="x")
+        ttk.Button(device_buttons, text="Refresh devices", command=self.app.request_device_refresh).pack(
+            fill="x"
+        )
         # Before a meeting is the only moment when a quiet microphone is unambiguous — the user knows
         # they're supposed to be making noise — and the moment when fixing it costs nothing.
         self.test_mic_button = ttk.Button(
@@ -842,28 +931,18 @@ class RecordTab(ttk.Frame):
             return None
 
     def _refresh_devices(self) -> None:
-        """Repopulates the microphone/system-audio dropdowns with currently available devices — the
-        same picker as the Settings tab, surfaced here too so switching devices doesn't require leaving
-        the Record tab."""
-        from meeting_scribe.audio.device_picker import list_input_devices, list_loopback_devices
+        """Fills the microphone/system-audio dropdowns at startup — the same picker as the Settings tab,
+        surfaced here too so switching devices doesn't require leaving the Record tab. Later refreshes go
+        through MeetingScribeApp.refresh_device_lists, which knows where a current list comes from."""
+        self.apply_device_lists(*_enumerate_devices())
 
-        try:
-            self._input_devices = list_input_devices()
-        except RuntimeError:
-            self._input_devices = []  # not on Windows (e.g. dev machine)
-        try:
-            self._loopback_devices = list_loopback_devices()
-        except RuntimeError:
-            self._loopback_devices = []
-
-        mic_values = [SYSTEM_DEFAULT_LABEL] + [d.name for d in self._input_devices]
-        system_values = [SYSTEM_DEFAULT_LABEL] + [d.name for d in self._loopback_devices]
-        self.mic_combo["values"] = mic_values
-        self.system_combo["values"] = system_values
-        if self.mic_var.get() not in mic_values:
-            self.mic_var.set(SYSTEM_DEFAULT_LABEL)
-        if self.system_var.get() not in system_values:
-            self.system_var.set(SYSTEM_DEFAULT_LABEL)
+    def apply_device_lists(self, input_devices, loopback_devices) -> None:
+        self._input_devices = input_devices
+        self._loopback_devices = loopback_devices
+        self.mic_combo["values"] = _device_choices([d.name for d in input_devices], self.mic_var.get())
+        self.system_combo["values"] = _device_choices(
+            [d.name for d in loopback_devices], self.system_var.get()
+        )
 
     def _on_devices_changed(self, _event=None) -> None:
         """Persists the mic/system choice immediately (rather than waiting for a Settings-tab Save) so
@@ -1476,7 +1555,7 @@ class SettingsTab(ttk.Frame):
         self.system_combo = ttk.Combobox(form, textvariable=self.system_var, width=45, state="readonly")
         self.system_combo.grid(row=2, column=1, sticky="we", padx=6, pady=4)
 
-        ttk.Button(form, text="Refresh devices", command=self._refresh_devices).grid(
+        ttk.Button(form, text="Refresh devices", command=self.app.request_device_refresh).grid(
             row=1, column=2, rowspan=2, padx=(6, 0)
         )
 
@@ -1573,26 +1652,16 @@ class SettingsTab(ttk.Frame):
             self.status_var.set("No Copilot sync folder set — meetings are recorded but not pushed.")
 
     def _refresh_devices(self) -> None:
-        """Repopulates the microphone/system-audio dropdowns with currently available devices."""
-        from meeting_scribe.audio.device_picker import list_input_devices, list_loopback_devices
+        """Fills the mic/system-audio dropdowns at startup; see RecordTab._refresh_devices."""
+        self.apply_device_lists(*_enumerate_devices())
 
-        try:
-            self._input_devices = list_input_devices()
-        except RuntimeError:
-            self._input_devices = []  # not on Windows (e.g. dev machine)
-        try:
-            self._loopback_devices = list_loopback_devices()
-        except RuntimeError:
-            self._loopback_devices = []
-
-        mic_values = [SYSTEM_DEFAULT_LABEL] + [d.name for d in self._input_devices]
-        system_values = [SYSTEM_DEFAULT_LABEL] + [d.name for d in self._loopback_devices]
-        self.mic_combo["values"] = mic_values
-        self.system_combo["values"] = system_values
-        if self.mic_var.get() not in mic_values:
-            self.mic_var.set(SYSTEM_DEFAULT_LABEL)
-        if self.system_var.get() not in system_values:
-            self.system_var.set(SYSTEM_DEFAULT_LABEL)
+    def apply_device_lists(self, input_devices, loopback_devices) -> None:
+        self._input_devices = input_devices
+        self._loopback_devices = loopback_devices
+        self.mic_combo["values"] = _device_choices([d.name for d in input_devices], self.mic_var.get())
+        self.system_combo["values"] = _device_choices(
+            [d.name for d in loopback_devices], self.system_var.get()
+        )
 
     def _begin_hotkey_capture(self, which: str) -> None:
         """Starts listening for the next real key combo pressed anywhere in the app, to assign as the

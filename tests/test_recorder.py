@@ -635,11 +635,11 @@ def test_join_capture_thread_returns_true_for_a_thread_still_running_past_the_ti
 
 
 def _run_watcher_until(recorder, condition, timeout=2.0) -> None:
-    """Starts the default-device watcher, waits (briefly) for `condition` to become true, then always
-    stops it again — a real meeting's watcher would otherwise poll for the rest of the process."""
-    recorder._DEFAULT_DEVICE_POLL_SECONDS = 0.01
+    """Starts the device watcher, waits (briefly) for `condition` to become true, then always stops it
+    again — a real meeting's watcher would otherwise poll for the rest of the process."""
+    recorder._DEVICE_POLL_SECONDS = 0.01
     recorder._watch_stop_event.clear()
-    recorder._watcher_thread = threading.Thread(target=recorder._watch_default_devices, daemon=True)
+    recorder._watcher_thread = threading.Thread(target=recorder._watch_devices, daemon=True)
     recorder._watcher_thread.start()
     try:
         deadline = time.monotonic() + timeout
@@ -648,63 +648,6 @@ def _run_watcher_until(recorder, condition, timeout=2.0) -> None:
     finally:
         recorder._watch_stop_event.set()
         recorder._watcher_thread.join(timeout=5)
-
-
-def test_the_watcher_switches_to_a_new_default_microphone_it_notices(tmp_path):
-    # The gap live-switching alone doesn't cover: Windows' default mic changing (Sound settings, a
-    # headset that was default getting unplugged) without the user ever touching this app's own
-    # dropdowns. A stream that's following "system default" (device name None) should notice that on its
-    # own rather than keep reading from whatever used to be default.
-    recorder = Recorder(tmp_path)
-    recorder._started_at = 0.0
-    recorder._mic_device_name = None
-    recorder._mic_active_device_name = "Old Mic"
-    recorder._mic_writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
-    recorder._mic_writer.write(b"\x01\x00" * 10)
-    recorder._mic_thread = _finished_thread()
-
-    new_default = {"name": "New Mic", "index": 0, "maxInputChannels": 1, "defaultSampleRate": 16000}
-    stream = _FakeStream([b"\x02\x00" * 5], stop_event=recorder._mic_stop_event)
-    recorder._pyaudio = _FakeAudioHost([new_default], default_input=new_default)
-    recorder._pyaudio.open = lambda **kwargs: stream
-    recorder._pyaudio_module = SimpleNamespace(paInt16=8)
-
-    _run_watcher_until(recorder, lambda: recorder._mic_active_device_name == "New Mic")
-
-    assert recorder._mic_active_device_name == "New Mic"
-    assert [path.name for path in recorder._mic_writer.paths] == ["mic.wav", "mic.part2.wav"]
-    assert recorder.capture_notices() == (
-        "Microphone switched to 'New Mic' — the Windows default microphone changed.",
-    )
-
-
-def test_the_watcher_leaves_an_explicitly_chosen_microphone_alone(tmp_path):
-    recorder = Recorder(tmp_path, mic_device_name="Jabra Evolve")
-    recorder._started_at = 0.0
-    recorder._mic_active_device_name = "Jabra Evolve"
-    recorder._mic_writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
-    recorder._mic_thread = _finished_thread()
-
-    # No .open() is wired up on this fake host — if the watcher ever tried to switch despite the
-    # explicit device choice, that would surface as an AttributeError notice instead of silently passing.
-    other_default = {"name": "Built-in Mic", "index": 0, "maxInputChannels": 1, "defaultSampleRate": 16000}
-    recorder._pyaudio = _FakeAudioHost([other_default], default_input=other_default)
-    recorder._pyaudio_module = SimpleNamespace(paInt16=8)
-
-    _run_watcher_until(recorder, lambda: False, timeout=0.15)
-
-    assert recorder._mic_active_device_name == "Jabra Evolve"
-    assert recorder.capture_notices() == ()
-
-
-def test_current_default_name_helpers_swallow_enumeration_errors(tmp_path):
-    # A background poll shouldn't ever be able to take the meeting down over a transient enumeration
-    # hiccup — it just tries again next tick.
-    recorder = Recorder(tmp_path)
-    recorder._pyaudio = SimpleNamespace(
-        get_default_input_device_info=lambda: (_ for _ in ()).throw(OSError("no default")),
-    )
-    assert recorder._current_default_input_name() is None
 
 
 def _pcm16(*values, repeat=1):
@@ -1072,3 +1015,200 @@ def test_a_test_of_the_windows_default_is_never_a_substitution():
 def test_checking_an_input_device_requires_windows():
     with pytest.raises(RuntimeError):
         check_input_device("Jabra Evolve")
+
+
+# --- reloading the device list mid-meeting ----------------------------------------------------------
+
+
+class _ReloadableAudio:
+    """A stand-in for the pyaudiowpatch module whose PyAudio() returns whatever `hosts` says the device
+    list looks like *now* — PortAudio's real behavior being that only a fresh init sees changes."""
+
+    paInt16 = 8
+    paWASAPI = 13
+
+    def __init__(self, host):
+        self.host = host
+        self.created = 0
+
+    def PyAudio(self):
+        self.created += 1
+        return self.host
+
+
+def _reload_ready_recorder(tmp_path, host, *, mic_device_name=None, system_device_name=None):
+    """A Recorder mid-meeting on `host`: both writers open, both "previous" capture threads finished,
+    and PortAudio re-inits returning `host` (mutate it to change the device list)."""
+    recorder = Recorder(tmp_path, mic_device_name=mic_device_name, system_device_name=system_device_name)
+    recorder._started_at = 0.0
+    recorder._mic_writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
+    recorder._system_writer = _SegmentedWavWriter(tmp_path / "system.wav", 2, SAMPLE_WIDTH_BYTES, 48000)
+    recorder._mic_thread = _finished_thread()
+    recorder._system_thread = _finished_thread()
+    recorder._mic_active_device_name = "Built-in Mic"
+    recorder._system_active_device_name = "Speakers [Loopback]"
+    recorder._pyaudio = host
+    recorder._pyaudio_module = _ReloadableAudio(host)
+    return recorder
+
+
+class _ReloadHost(_FakeAudioHost):
+    """_FakeAudioHost plus open()/terminate(); every opened stream stops its thread straight away."""
+
+    def __init__(self, devices, default_input, loopbacks, default_output_index):
+        super().__init__(devices, default_input, loopbacks, default_output_index)
+        self.terminated = 0
+        self.recorder = None
+
+    def open(self, **kwargs):
+        index = kwargs["input_device_index"]
+        event = (
+            self.recorder._mic_stop_event
+            if any(d["index"] == index for d in self._devices if not d.get("isLoopbackDevice"))
+            else self.recorder._system_stop_event
+        )
+        return _FakeStream([], stop_event=event)
+
+    def terminate(self):
+        self.terminated += 1
+
+
+def _loopback(name, index):
+    return {"name": name, "index": index, "maxInputChannels": 2, "defaultSampleRate": 48000,
+            "isLoopbackDevice": True}
+
+
+def _mic(name, index):
+    return {"name": name, "index": index, "maxInputChannels": 1, "defaultSampleRate": 16000}
+
+
+def test_reload_devices_picks_up_a_newly_connected_default_output(tmp_path):
+    # The case this exists for: headphones plugged in mid-meeting become the Windows default. PortAudio's
+    # device list from when the meeting started has never heard of them; only a re-init does.
+    built_in = _mic("Built-in Mic", 0)
+    speakers = {"name": "Speakers", "index": 1, "maxInputChannels": 0, "defaultSampleRate": 48000}
+    host = _ReloadHost([built_in, speakers], built_in, [_loopback("Speakers [Loopback]", 3)], 1)
+    recorder = _reload_ready_recorder(tmp_path, host)
+    host.recorder = recorder
+
+    headphones = {"name": "Headphones", "index": 2, "maxInputChannels": 0, "defaultSampleRate": 44100}
+    host._devices.append(headphones)
+    host._loopbacks.append({**_loopback("Headphones [Loopback]", 4), "defaultSampleRate": 44100})
+    host._default_output_index = 2
+
+    recorder.reload_devices(reason="audio devices changed")
+    recorder._mic_thread.join(timeout=5)
+    recorder._system_thread.join(timeout=5)
+
+    assert host.terminated == 1 and recorder._pyaudio_module.created == 1
+    assert recorder._system_active_device_name == "Headphones [Loopback]"
+    assert recorder.capture_notices() == (
+        "System audio switched to 'Headphones [Loopback]' — audio devices changed.",
+    )
+    # Both streams restarted into new parts; the system one at the new device's sample rate.
+    assert [p.name for p in recorder._system_writer.paths] == ["system.wav", "system.part2.wav"]
+    with contextlib.closing(wave.open(str(tmp_path / "system.part2.wav"), "rb")) as part:
+        assert part.getframerate() == 44100
+    assert recorder.device_list_version == 1
+    assert [d.name for d in recorder.available_devices()[1]] == [
+        "Speakers [Loopback]", "Headphones [Loopback]",
+    ]
+
+
+def test_reload_devices_returns_to_an_explicitly_chosen_device_once_it_is_back(tmp_path):
+    built_in = _mic("Built-in Mic", 0)
+    speakers = {"name": "Speakers", "index": 1, "maxInputChannels": 0, "defaultSampleRate": 48000}
+    host = _ReloadHost([built_in, speakers], built_in, [_loopback("Speakers [Loopback]", 3)], 1)
+    recorder = _reload_ready_recorder(tmp_path, host, mic_device_name="Jabra Evolve")
+    host.recorder = recorder
+
+    host._devices.append(_mic("Jabra Evolve", 2))
+    recorder.reload_devices()
+    recorder._mic_thread.join(timeout=5)
+    recorder._system_thread.join(timeout=5)
+
+    assert recorder._mic_active_device_name == "Jabra Evolve"
+    assert recorder._system_active_device_name == "Speakers [Loopback]"  # unchanged, so no notice for it
+    assert recorder.capture_notices() == (
+        "Microphone switched to 'Jabra Evolve' — the device list was refreshed.",
+    )
+
+
+def test_reload_devices_keeps_portaudio_when_a_capture_thread_is_stuck(tmp_path, monkeypatch):
+    # Same rule as stop(): never terminate PortAudio under a thread still inside a native read.
+    built_in = _mic("Built-in Mic", 0)
+    speakers = {"name": "Speakers", "index": 1, "maxInputChannels": 0, "defaultSampleRate": 48000}
+    host = _ReloadHost([built_in, speakers], built_in, [_loopback("Speakers [Loopback]", 3)], 1)
+    recorder = _reload_ready_recorder(tmp_path, host)
+    host.recorder = recorder
+    monkeypatch.setattr(Recorder, "_join_capture_thread", staticmethod(lambda thread, timeout=5.0: True))
+
+    recorder.reload_devices()
+    recorder._mic_thread.join(timeout=5)
+    recorder._system_thread.join(timeout=5)
+
+    assert host.terminated == 0 and recorder._pyaudio_module.created == 0
+    assert any("Couldn't reload the audio device list" in n for n in recorder.capture_notices())
+
+
+def test_the_watcher_reloads_devices_when_the_device_signature_changes(tmp_path):
+    built_in = _mic("Built-in Mic", 0)
+    speakers = {"name": "Speakers", "index": 1, "maxInputChannels": 0, "defaultSampleRate": 48000}
+    host = _ReloadHost([built_in, speakers], built_in, [_loopback("Speakers [Loopback]", 3)], 1)
+    recorder = _reload_ready_recorder(tmp_path, host)
+    host.recorder = recorder
+    signatures = iter([("before",), ("before",), ("after",)])
+    recorder._device_signature = lambda: next(signatures, ("after",))
+
+    _run_watcher_until(recorder, lambda: recorder.device_list_version >= 1)
+
+    assert recorder.device_list_version == 1  # reloaded once for the one change, not on every tick
+
+
+def test_the_watcher_does_nothing_while_devices_are_unchanged_or_unknown(tmp_path):
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    signatures = iter([("same",), None, ("same",), None])
+    recorder._device_signature = lambda: next(signatures, ("same",))
+    # No PortAudio is wired up at all — any reload attempt would surface as a failure notice.
+
+    _run_watcher_until(recorder, lambda: False, timeout=0.15)
+
+    assert recorder.device_list_version == 0
+    assert recorder.capture_notices() == ()
+
+
+def test_the_watcher_survives_a_signature_check_that_raises(tmp_path):
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+
+    def boom():
+        raise OSError("winmm unavailable")
+
+    recorder._device_signature = boom
+    _run_watcher_until(recorder, lambda: False, timeout=0.1)
+    assert recorder.capture_notices() == ()
+
+
+def test_reload_devices_reports_portaudio_failing_to_restart_and_can_try_again(tmp_path):
+    built_in = _mic("Built-in Mic", 0)
+    speakers = {"name": "Speakers", "index": 1, "maxInputChannels": 0, "defaultSampleRate": 48000}
+    host = _ReloadHost([built_in, speakers], built_in, [_loopback("Speakers [Loopback]", 3)], 1)
+    recorder = _reload_ready_recorder(tmp_path, host)
+    host.recorder = recorder
+    working_pyaudio = recorder._pyaudio_module.PyAudio
+
+    def broken():
+        raise OSError("PortAudio init failed")
+
+    recorder._pyaudio_module.PyAudio = broken
+    recorder.reload_devices()
+    assert recorder._pyaudio is None
+    assert any("Couldn't restart audio" in n and "OSError" in n for n in recorder.capture_notices())
+
+    recorder._pyaudio_module.PyAudio = working_pyaudio
+    recorder.reload_devices()
+    recorder._mic_thread.join(timeout=5)
+    recorder._system_thread.join(timeout=5)
+    assert recorder._pyaudio is host
+    assert recorder.device_list_version == 1

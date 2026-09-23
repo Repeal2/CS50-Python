@@ -101,6 +101,21 @@ class MeetingSession:
         self._db.move_meeting_to_project(self.meeting_id, new_project.id)
         self.project = new_project
 
+    def reload_devices(self) -> None:
+        """Re-reads the audio device list mid-meeting so newly connected devices become selectable — see
+        Recorder.reload_devices. Blocks briefly while both streams restart; call off the GUI thread."""
+        self._recorder.reload_devices()
+
+    def available_devices(self) -> tuple[list, list]:
+        """(input devices, loopback devices) as currently seen by this meeting's recorder — see
+        Recorder.available_devices for why this, not a fresh enumeration, is the current list."""
+        return self._recorder.available_devices()
+
+    @property
+    def device_list_version(self) -> int:
+        """Changes whenever the recorder has reloaded its device list (see Recorder.reload_devices)."""
+        return self._recorder.device_list_version
+
     def audio_levels(self) -> tuple[float, float]:
         """Current (mic, system) input levels, roughly 0..1 — lets the GUI show a live "is this actually
         picking up audio" meter while recording. Both are 0.0 before start() or after stop()."""

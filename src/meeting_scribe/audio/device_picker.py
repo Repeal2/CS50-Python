@@ -44,11 +44,7 @@ def list_input_devices() -> list[AudioDevice]:
 
     p = _open_pyaudio(pyaudio)
     try:
-        return [
-            AudioDevice(index=info["index"], name=info["name"])
-            for info in (p.get_device_info_by_index(i) for i in range(p.get_device_count()))
-            if info.get("maxInputChannels", 0) > 0 and not info.get("isLoopbackDevice")
-        ]
+        return input_devices_from(p)
     finally:
         _close_pyaudio(p)
 
@@ -61,9 +57,28 @@ def list_loopback_devices() -> list[AudioDevice]:
 
     p = _open_pyaudio(pyaudio)
     try:
-        return [
-            AudioDevice(index=info["index"], name=info["name"])
-            for info in p.get_loopback_device_info_generator()
-        ]
+        return loopback_devices_from(p)
     finally:
         _close_pyaudio(p)
+
+
+def input_devices_from(pyaudio_instance) -> list[AudioDevice]:
+    """list_input_devices' enumeration on an already-open PyAudio instance — which is the only way to
+    see a current list while a meeting is recording: a fresh PyAudio() then just shares the Recorder's
+    snapshot (see audio.device_watch), so the list has to come from the Recorder itself after it
+    reloads (see Recorder.available_devices)."""
+    return [
+        AudioDevice(index=info["index"], name=info["name"])
+        for info in (
+            pyaudio_instance.get_device_info_by_index(i) for i in range(pyaudio_instance.get_device_count())
+        )
+        if info.get("maxInputChannels", 0) > 0 and not info.get("isLoopbackDevice")
+    ]
+
+
+def loopback_devices_from(pyaudio_instance) -> list[AudioDevice]:
+    """list_loopback_devices' enumeration on an already-open PyAudio instance — see input_devices_from."""
+    return [
+        AudioDevice(index=info["index"], name=info["name"])
+        for info in pyaudio_instance.get_loopback_device_info_generator()
+    ]

@@ -119,3 +119,24 @@ def test_hotkey_label_shows_the_combo():
 
     combo = HotkeyCombo(modifiers=MOD_CONTROL | MOD_SHIFT, vk=0x53)
     assert gui_app._hotkey_label(combo) == "Ctrl+Shift+S"
+
+
+def test_device_choices_lists_system_default_first_then_every_present_device():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._device_choices(["Headset", "Speakers"], "Headset") == [
+        gui_app.SYSTEM_DEFAULT_LABEL, "Headset", "Speakers",
+    ]
+
+
+def test_device_choices_keeps_a_selected_device_that_is_currently_unplugged():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    # The lists now refresh on their own as devices come and go. Resetting an unplugged selection to
+    # "System default" would silently become the saved setting on the next Settings save.
+    assert gui_app._device_choices(["Speakers"], "Jabra Evolve") == [
+        gui_app.SYSTEM_DEFAULT_LABEL, "Speakers", "Jabra Evolve",
+    ]
+
+
+def test_device_choices_does_not_duplicate_system_default():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._device_choices([], gui_app.SYSTEM_DEFAULT_LABEL) == [gui_app.SYSTEM_DEFAULT_LABEL]
