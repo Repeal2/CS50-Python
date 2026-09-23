@@ -121,6 +121,12 @@ class TranscriptLine:
     timestamp_seconds: float
     source: str  # "mic" | "system" | "screen_ocr"
     text: str
+    # Set only for a diarized system-track line (see transcription.runpod_whisperx) — a per-line speaker
+    # id ("SPEAKER_00", or eventually a real name once something resolves it against screen.capture's
+    # SpeakerNameEvents) that render_transcript prefers over the flat per-source SOURCE_LABELS lookup.
+    # None for every other line, including a system-track line transcribed locally, where there's no
+    # per-speaker distinction to carry.
+    speaker: str | None = None
 
 
 class WhisperTranscriber:
@@ -200,6 +206,6 @@ def render_transcript(lines: list[TranscriptLine]) -> str:
     rows = []
     for line in lines:
         minutes, seconds = divmod(max(0, int(line.timestamp_seconds)), 60)
-        label = SOURCE_LABELS.get(line.source, line.source)
+        label = line.speaker or SOURCE_LABELS.get(line.source, line.source)
         rows.append(f"[{minutes:02d}:{seconds:02d}] {label}: {line.text}")
     return "\n".join(rows)

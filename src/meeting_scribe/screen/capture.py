@@ -15,6 +15,11 @@ trolley choice we're" / the finished sentence, all three kept). `_pending_lines`
 not-yet-settled lines and only turns one into a `ScreenTextEvent` once a later capture shows it's stopped
 growing — see `_reconcile_lines`. Events are timestamped relative to when watching started so they can be
 interleaved with the audio transcript by `transcription.engine`.
+
+The speaker name badge Teams renders alongside each caption line (see `_looks_like_speaker_badge`) is
+filtered out of that caption text as chrome, but it's independently useful: unlike the caption sentence
+next to it, a name badge is short and doesn't need to "settle" across captures, so it's reported as its own
+`SpeakerNameEvent` as soon as it's read rather than going through the pending/growth machinery above.
 """
 
 from __future__ import annotations
@@ -67,6 +72,17 @@ def _looks_like_speaker_badge(line: str) -> bool:
     return bool(_NAME_BADGE_RE.match(line))
 
 
+def _speaker_badge_lines(text: str) -> list[str]:
+    """Every line in one OCR capture that looks like a Teams-style speaker name badge. Deliberately not
+    deduped against anything already seen, unlike `_new_lines` — the same name reappearing capture after
+    capture while someone keeps talking is the point, not noise to filter out."""
+    return [
+        line
+        for raw_line in text.splitlines()
+        if (line := raw_line.strip()) and not _looks_like_ui_noise(line) and _looks_like_speaker_badge(line)
+    ]
+
+
 def _new_lines(text: str, already_seen: set[str], *, filter_speaker_badges: bool = True) -> list[str]:
     """Splits one capture's OCR text into lines and returns only the ones that are new: not blank, not
     UI noise, not (when `filter_speaker_badges`) a speaker name badge, and not in `already_seen` (or
@@ -112,6 +128,12 @@ class ScreenTextEvent:
     text: str
 
 
+@dataclass(frozen=True)
+class SpeakerNameEvent:
+    timestamp_seconds: float
+    name: str
+
+
 class ScreenWatcher:
     def __init__(
         self,
@@ -120,8 +142,10 @@ class ScreenWatcher:
         tesseract_cmd: str | None = None,
         target: WindowTarget | RegionTarget | WindowRegionTarget | None = None,
         settle_seconds: float = 0.15,
+        on_speaker_name: Callable[[SpeakerNameEvent], None] | None = None,
     ):
         self._on_text = on_text
+        self._on_speaker_name = on_speaker_name
         self._interval = interval_seconds
         self._tesseract_cmd = tesseract_cmd
         self._target = target
@@ -207,6 +231,17 @@ class ScreenWatcher:
 
         text = pytesseract.image_to_string(image)
         self._reconcile_lines(text)
+        self._emit_speaker_names(text)
+
+    def _emit_speaker_names(self, text: str) -> None:
+        """Reports every speaker name badge found in one capture's OCR text, if anyone wants them (see
+        `on_speaker_name`) — a name recurs for as long as its badge stays on screen, which is what lets a
+        caller later line these timestamped sightings up against a diarized transcript's speaker turns."""
+        if self._on_speaker_name is None:
+            return
+        elapsed = time.monotonic() - self._started_at
+        for name in _speaker_badge_lines(text):
+            self._on_speaker_name(SpeakerNameEvent(timestamp_seconds=elapsed, name=name))
 
     def _reconcile_lines(self, text: str) -> None:
         """Folds one capture's OCR text into `_pending_lines`. A candidate that looks like a previous

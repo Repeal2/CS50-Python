@@ -24,7 +24,9 @@ from meeting_scribe.config import (
     load_settings,
     update_audio_devices,
     update_copilot_settings,
+    update_diarize_system_audio,
     update_meeting_hotkeys,
+    update_runpod_settings,
     update_whisper_model_size,
 )
 from meeting_scribe.audio.device_watch import device_signature
@@ -1570,13 +1572,45 @@ class SettingsTab(ttk.Frame):
         )
         self.whisper_model_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
 
+        # Off by default — see config.Settings.diarize_system_audio. Only takes effect once the Runpod/
+        # HuggingFace environment variables it needs are also set (see transcription.runpod_whisperx);
+        # left unconfigured, opting in here just falls back to local transcription with a status message.
+        self.diarize_system_audio_var = tk.BooleanVar(value=self.app.settings.diarize_system_audio)
+        ttk.Checkbutton(
+            form,
+            text="Identify speakers in the system-audio track (sends audio to Runpod + HuggingFace)",
+            variable=self.diarize_system_audio_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
+
+        # Credentials for the diarization endpoint above — plaintext in settings.json either way, so this
+        # isn't meaningfully less secure than an environment variable would have been for a single-user
+        # desktop app; it's just easier to set. runpod_huggingface_token can be left blank if HF_TOKEN was
+        # instead set directly as an environment variable on the Runpod endpoint itself.
+        ttk.Label(form, text="Runpod API key").grid(row=5, column=0, sticky="w")
+        self.runpod_api_key_var = tk.StringVar(value=self.app.settings.runpod_api_key or "")
+        ttk.Entry(form, textvariable=self.runpod_api_key_var, width=48, show="*").grid(
+            row=5, column=1, sticky="we", padx=6, pady=4
+        )
+
+        ttk.Label(form, text="Runpod endpoint ID").grid(row=6, column=0, sticky="w")
+        self.runpod_endpoint_id_var = tk.StringVar(value=self.app.settings.runpod_endpoint_id or "")
+        ttk.Entry(form, textvariable=self.runpod_endpoint_id_var, width=48).grid(
+            row=6, column=1, sticky="we", padx=6, pady=4
+        )
+
+        ttk.Label(form, text="HuggingFace token").grid(row=7, column=0, sticky="w")
+        self.runpod_hf_token_var = tk.StringVar(value=self.app.settings.runpod_huggingface_token or "")
+        ttk.Entry(form, textvariable=self.runpod_hf_token_var, width=48, show="*").grid(
+            row=7, column=1, sticky="we", padx=6, pady=4
+        )
+
         # Global (system-wide) shortcuts — work even while focused in Teams, not just this app. Off
         # ("Not set") until explicitly captured here; see hotkeys.py and MeetingScribeApp.apply_hotkeys.
-        ttk.Label(form, text="Start meeting shortcut").grid(row=4, column=0, sticky="w")
+        ttk.Label(form, text="Start meeting shortcut").grid(row=8, column=0, sticky="w")
         self.start_hotkey_var = tk.StringVar(value=_hotkey_label(self._pending_start_hotkey))
-        ttk.Label(form, textvariable=self.start_hotkey_var).grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(form, textvariable=self.start_hotkey_var).grid(row=8, column=1, sticky="w", padx=6, pady=4)
         start_hotkey_buttons = ttk.Frame(form)
-        start_hotkey_buttons.grid(row=4, column=2, padx=(6, 0))
+        start_hotkey_buttons.grid(row=8, column=2, padx=(6, 0))
         self.start_hotkey_button = ttk.Button(
             start_hotkey_buttons, text="Change…", command=lambda: self._begin_hotkey_capture("start")
         )
@@ -1585,11 +1619,11 @@ class SettingsTab(ttk.Frame):
             side="left", padx=(4, 0)
         )
 
-        ttk.Label(form, text="Stop meeting shortcut").grid(row=5, column=0, sticky="w")
+        ttk.Label(form, text="Stop meeting shortcut").grid(row=9, column=0, sticky="w")
         self.stop_hotkey_var = tk.StringVar(value=_hotkey_label(self._pending_stop_hotkey))
-        ttk.Label(form, textvariable=self.stop_hotkey_var).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(form, textvariable=self.stop_hotkey_var).grid(row=9, column=1, sticky="w", padx=6, pady=4)
         stop_hotkey_buttons = ttk.Frame(form)
-        stop_hotkey_buttons.grid(row=5, column=2, padx=(6, 0))
+        stop_hotkey_buttons.grid(row=9, column=2, padx=(6, 0))
         self.stop_hotkey_button = ttk.Button(
             stop_hotkey_buttons, text="Change…", command=lambda: self._begin_hotkey_capture("stop")
         )
@@ -1625,6 +1659,14 @@ class SettingsTab(ttk.Frame):
             "switching to a size that hasn't been used before downloads it, which needs internet access "
             "and can take a while for the larger sizes; only meetings started after Save pick up the "
             "change, so anything currently recording or still finishing up keeps using the old size.\n\n"
+            "Identify speakers sends the system-audio track (everyone but you) to a cloud WhisperX "
+            "endpoint on Runpod for transcription with speaker diarization, instead of transcribing it "
+            "locally like everything else in this app — the tradeoff for telling who said what is that "
+            "meeting audio leaves this machine. It needs a Runpod API key and endpoint ID (from your "
+            "Runpod account's Serverless dashboard) entered below; a HuggingFace token is only needed "
+            "here if one wasn't already set directly on the Runpod endpoint itself. Checking this box "
+            "without finishing that setup just falls back to local transcription with a status message, "
+            "not an error.\n\n"
             "Meeting shortcuts work system-wide — from inside Teams, not just this app — so a meeting can "
             "be started or stopped without switching windows first. Click Change…, then press the combo "
             "you want (needs at least one of Ctrl/Alt/Shift/Win); Esc cancels. Starting reuses whichever "
@@ -1737,6 +1779,15 @@ class SettingsTab(ttk.Frame):
         )
         self.app.settings = update_whisper_model_size(
             self.app.settings, whisper_model_size=self.whisper_model_var.get()
+        )
+        self.app.settings = update_diarize_system_audio(
+            self.app.settings, diarize_system_audio=self.diarize_system_audio_var.get()
+        )
+        self.app.settings = update_runpod_settings(
+            self.app.settings,
+            runpod_api_key=self.runpod_api_key_var.get().strip(),
+            runpod_endpoint_id=self.runpod_endpoint_id_var.get().strip(),
+            runpod_huggingface_token=self.runpod_hf_token_var.get().strip(),
         )
         self.app.settings = update_meeting_hotkeys(
             self.app.settings, start=self._pending_start_hotkey, stop=self._pending_stop_hotkey

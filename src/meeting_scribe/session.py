@@ -12,12 +12,12 @@ doesn't wait for the previous one to finish transcribing/saving.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
 from meeting_scribe.audio.recorder import Recorder, discover_wav_parts
 from meeting_scribe.config import Settings
-from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
+from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher, SpeakerNameEvent
 from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
 from meeting_scribe.screen.window_picker import WindowTarget
 from meeting_scribe.storage.database import Database
@@ -32,6 +32,34 @@ from meeting_scribe.transcription.engine import (
 )
 
 _WAITING_FOR_TRANSCRIPTION_MESSAGE = "Waiting for another meeting's transcription to finish first…"
+
+
+def _transcribe_system_track(
+    settings: Settings,
+    local_transcriber: WhisperTranscriber,
+    system_paths: Sequence[Path],
+    report: Callable[[str], None],
+) -> list[TranscriptLine]:
+    """Transcribes the system-audio track — everyone but the meeting owner — using cloud speaker
+    diarization when opted into (Settings.diarize_system_audio), local transcription otherwise. Cloud
+    diarization falling back to local on any failure, rather than raising, is deliberate: a third-party
+    outage or a missing API key shouldn't cost a meeting its transcript, just the per-speaker labels."""
+    if settings.diarize_system_audio:
+        try:
+            from meeting_scribe.transcription.runpod_whisperx import (
+                RunpodWhisperXError,
+                RunpodWhisperXTranscriber,
+            )
+
+            transcriber = RunpodWhisperXTranscriber(
+                api_key=settings.runpod_api_key,
+                endpoint_id=settings.runpod_endpoint_id,
+                huggingface_token=settings.runpod_huggingface_token,
+            )
+            return transcriber.transcribe_parts(system_paths, source="system")
+        except RunpodWhisperXError as error:
+            report(f"Cloud speaker diarization failed ({error}) — falling back to local transcription.")
+    return local_transcriber.transcribe_parts(system_paths, source="system")
 
 
 class MeetingSession:
@@ -66,8 +94,13 @@ class MeetingSession:
             system_device_name=settings.system_device_name,
         )
         self._screen_events: list[ScreenTextEvent] = []
+        # Timestamped speaker-name-badge sightings, kept alongside the caption stream — not used for
+        # anything yet, but this is the raw material a future system-audio diarization pass would line up
+        # against WhisperX speaker clusters to turn "SPEAKER_00" into a real name.
+        self._speaker_name_events: list[SpeakerNameEvent] = []
         self._screen_watcher = ScreenWatcher(
             on_text=self._screen_events.append,
+            on_speaker_name=self._speaker_name_events.append,
             interval_seconds=settings.screen_capture_interval_seconds,
             tesseract_cmd=settings.tesseract_cmd,
             target=screen_target,
@@ -175,7 +208,9 @@ class MeetingSession:
 
             try:
                 mic_lines = self._transcriber.transcribe_parts(recorded.mic_paths, source="mic")
-                system_lines = self._transcriber.transcribe_parts(recorded.system_paths, source="system")
+                system_lines = _transcribe_system_track(
+                    self._settings, self._transcriber, recorded.system_paths, report
+                )
             finally:
                 self._transcriber.unload()
         screen_lines = [
@@ -286,7 +321,7 @@ def retry_meeting_transcription(
         transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
         try:
             mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")
-            system_lines = transcriber.transcribe_parts(system_paths, source="system")
+            system_lines = _transcribe_system_track(settings, transcriber, system_paths, report)
         finally:
             transcriber.unload()
     report("Transcription complete.")
