@@ -2,7 +2,20 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import faulthandler
+import threading
+
+import pytest
+
 from meeting_scribe import main as main_module
+
+
+@pytest.fixture(autouse=True)
+def _no_real_crash_logging(request, monkeypatch):
+    # _run_gui installs process-wide hooks (faulthandler, threading.excepthook) pointing at the real
+    # data folder — not something a test run should do. The test for the hook itself opts back in.
+    if "real_crash_logging" not in request.keywords:
+        monkeypatch.setattr(main_module, "_install_crash_logging", lambda log_dir: None)
 
 
 def test_fallback_log_dir_uses_appdata(monkeypatch):
@@ -91,3 +104,40 @@ def test_main_defaults_to_gui_with_no_command_given(monkeypatch):
 
     assert main_module.main([]) == 0
     assert called == [True]
+
+
+@pytest.mark.real_crash_logging
+def test_install_crash_logging_enables_faulthandler_and_logs_background_thread_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    was_enabled = faulthandler.is_enabled()
+    try:
+        main_module._install_crash_logging(tmp_path)
+        assert faulthandler.is_enabled()
+        assert (tmp_path / "crash.log").exists()
+
+        def boom():
+            raise ValueError("background thread blew up")
+
+        thread = threading.Thread(target=boom, name="screen-watcher")
+        thread.start()
+        thread.join()
+
+        logged = (tmp_path / "error.log").read_text(encoding="utf-8")
+        assert "background thread blew up" in logged
+        assert "screen-watcher" in logged
+    finally:
+        faulthandler.disable()
+        if was_enabled:
+            faulthandler.enable()
+        if main_module._crash_log_file is not None:
+            main_module._crash_log_file.close()
+            main_module._crash_log_file = None
+
+
+@pytest.mark.real_crash_logging
+def test_install_crash_logging_never_raises_when_the_folder_is_unusable(tmp_path, monkeypatch):
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+
+    main_module._install_crash_logging(blocked)  # must not raise

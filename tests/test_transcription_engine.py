@@ -162,3 +162,60 @@ def test_transcribe_parts_of_a_single_file_leaves_timestamps_alone(tmp_path, mon
     lines = WhisperTranscriber(model_size="tiny").transcribe_parts([only], source="mic")
 
     assert [(line.timestamp_seconds, line.text) for line in lines] == [(3.0, "hello")]
+
+
+def test_transcription_slot_runs_one_transcription_at_a_time():
+    # Two meetings transcribing at once each load their own Whisper model — double the memory, and the
+    # native `mkl_malloc` abort that comes with running out. The second has to wait for the first.
+    import threading
+
+    from meeting_scribe.transcription.engine import transcription_slot
+
+    first_inside = threading.Event()
+    release_first = threading.Event()
+    waited = []
+    order = []
+
+    def first():
+        with transcription_slot():
+            order.append("first-start")
+            first_inside.set()
+            release_first.wait(timeout=5)
+            order.append("first-end")
+
+    def second():
+        first_inside.wait(timeout=5)
+        with transcription_slot(on_wait=lambda: waited.append(True)):
+            order.append("second-start")
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for thread in threads:
+        thread.start()
+    first_inside.wait(timeout=5)
+    # Give the second thread a moment to reach the slot and block on it.
+    for _ in range(100):
+        if waited:
+            break
+        threading.Event().wait(0.01)
+    release_first.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert waited == [True]
+    assert order == ["first-start", "first-end", "second-start"]
+
+
+def test_transcription_slot_does_not_report_waiting_when_it_is_free():
+    from meeting_scribe.transcription.engine import transcription_slot
+
+    waited = []
+    with transcription_slot(on_wait=lambda: waited.append(True)):
+        pass
+    assert waited == []
+
+
+def test_unload_drops_the_loaded_model():
+    transcriber = WhisperTranscriber(model_size="tiny")
+    transcriber._model = object()
+    transcriber.unload()
+    assert transcriber._model is None

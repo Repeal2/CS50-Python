@@ -20,6 +20,8 @@ from typing import Callable
 
 import numpy as np
 
+from meeting_scribe.audio.device_watch import device_signature
+
 CHUNK_FRAMES = 1024
 SAMPLE_WIDTH_BYTES = 2  # 16-bit PCM
 
@@ -515,15 +517,18 @@ class Recorder:
     when a user changed their mic mid-meeting, producing a full-length recording of an idle device
     instead of an error.
 
-    That still left one gap: leaving a device as None ("whatever Windows currently considers the
-    default") only resolves the *actual* default once, at `start()` — same as an explicit name, it isn't
-    re-checked while the meeting runs. If the user changes the Windows default mic/speaker outside the
-    app (Sound settings, unplugging a headset that was the default) without ever touching this app's
-    dropdowns, the recording would otherwise keep reading from whatever device *used to be* default. A
-    background thread — started in `start()`, stopped in `stop()` — polls Windows' current default input/
-    loopback device every `_DEFAULT_DEVICE_POLL_SECONDS` and calls switch_mic_device(None)/
-    switch_system_device(None) itself when it changes, but only for a stream whose device is still None
-    (an explicitly-chosen device is never second-guessed by this).
+    Devices plugged in, unplugged, or made the Windows default mid-meeting are a harder problem than
+    they look: PortAudio snapshots the device list (defaults included) when it's initialized and never
+    updates it while any instance is open — so for as long as this Recorder holds it, neither a new
+    headset nor a new default is visible through it at all. A background thread — started in `start()`,
+    stopped in `stop()` — polls a cheap winmm-based signature of the device set (see audio.device_watch)
+    every `_DEVICE_POLL_SECONDS`, and when it changes calls `reload_devices()`: both capture threads are
+    stopped, PortAudio is terminated and re-initialized to get a fresh list, and both streams are
+    reopened by *name* (indices don't survive a re-init) into new WAV parts. A stream following "system
+    default" (name None) lands on whatever the default is now; an explicitly chosen device that has
+    disappeared falls back to the default with a notice, and is picked up again by name once it's back.
+    The cost is a gap of a fraction of a second in both recordings, only when devices actually change.
+    `device_list_version` is bumped on every reload so the GUI knows to re-read `available_devices()`.
 
     While running, `mic_level` and `system_level` hold each stream's current input level (roughly 0..1,
     see `_pcm16_level`), updated every chunk by the capture threads — a GUI can poll these to show a
@@ -540,11 +545,10 @@ class Recorder:
     being captured looks like a working input at all — see StreamHealth and describe_input_problems.
     """
 
-    # How often the background thread checks whether Windows' current default input/loopback device has
-    # changed out from under a stream that's following "system default" (device name None). Frequent
-    # enough that a mid-meeting default change is caught within a few seconds; infrequent enough that
-    # it's not worth its own thread waking up more than that.
-    _DEFAULT_DEVICE_POLL_SECONDS = 3.0
+    # How often the background thread checks whether the set of audio devices, or the Windows default,
+    # has changed (see reload_devices). Frequent enough that a headset plugged in mid-meeting shows up
+    # within a few seconds; each check is a handful of cheap winmm queries.
+    _DEVICE_POLL_SECONDS = 3.0
 
     def __init__(
         self,
@@ -573,6 +577,10 @@ class Recorder:
         self._system_stop_event = threading.Event()
         self._watch_stop_event = threading.Event()
         self._watcher_thread: threading.Thread | None = None
+        # Capture threads a device switch gave up waiting for (see _switch_stream) — still blocked in a
+        # native stream.read() on the device switched away from. stop() must not terminate PortAudio
+        # while any of these is alive, same as for the current threads.
+        self._orphaned_threads: list[tuple[threading.Thread, str]] = []
         # Serializes stop() against switch_mic_device()/switch_system_device(), and switches against
         # each other. Without this, a switch racing stop() could still be opening a new stream on
         # self._pyaudio in one thread while stop() is terminating that same PyAudio instance in
@@ -587,6 +595,10 @@ class Recorder:
         self._notices_lock = threading.Lock()
         self.mic_level = 0.0
         self.system_level = 0.0
+        # Bumped each time reload_devices() gives PortAudio a fresh device list — see available_devices.
+        self.device_list_version = 0
+        # Injectable for tests; see audio.device_watch.
+        self._device_signature: Callable[[], object | None] = device_signature
 
     def start(self) -> None:
         if sys.platform != "win32":
@@ -628,7 +640,7 @@ class Recorder:
 
         self._watch_stop_event.clear()
         self._watcher_thread = threading.Thread(
-            target=self._watch_default_devices, daemon=True, name="recorder-default-device-watch"
+            target=self._watch_devices, daemon=True, name="recorder-device-watch"
         )
         self._watcher_thread.start()
 
@@ -636,8 +648,7 @@ class Recorder:
         """Moves the microphone stream to a different device without stopping the meeting. The system-
         audio stream is untouched. `device_name` follows the same convention as the constructor: None
         means "whatever Windows currently considers the default". `reason`, if given, replaces the
-        generic wording in the notice this records (see _watch_default_devices, which switches on its
-        own when the *actual* Windows default changes out from under a None-device stream)."""
+        generic wording in the notice this records."""
         with self._lifecycle_lock:
             self._switch_stream(
                 stop_event=self._mic_stop_event,
@@ -693,9 +704,18 @@ class Recorder:
 
         # Stop only this stream's capture thread — the other one is left running, which is the whole
         # point of switching one device without restarting the meeting.
-        stop_event.set()
         old_thread: threading.Thread | None = getattr(self, thread_attr)
+        # Retired *before* the stop event is set, and for good: stop_event is shared with the thread
+        # spawned below and gets cleared for it, so on its own it can't keep a stuck old thread stopped —
+        # one that unblocked later used to see the cleared event and carry on reading the old device into
+        # the new part alongside its replacement, then close the writer out from under it when it finally
+        # did stop. A retired thread never writes again and leaves the writer to start_new_part below.
+        retired = getattr(old_thread, "retired", None)
+        if retired is not None:
+            retired.set()
+        stop_event.set()
         if old_thread is not None and self._join_capture_thread(old_thread):
+            self._orphaned_threads.append((old_thread, label))
             # Still running after the timeout — presumably blocked inside a native, uninterruptible
             # stream.read() on the device being switched away from (a hung or disconnected driver). The
             # switch still has to proceed (there's no way to interrupt a blocked native read from here),
@@ -726,45 +746,125 @@ class Recorder:
         else:
             self._record_switch(f"{label} switched to {device_info['name']!r} — {reason}.")
 
-    def _watch_default_devices(self) -> None:
-        """Runs on its own thread for the life of the meeting, noticing when Windows' actual default
-        input/loopback device changes out from under a stream that's following it (device name None —
-        see the class docstring) and switching that stream onto the new default itself. An explicitly
-        chosen device is never touched here, since _mic_device_name/_system_device_name being non-None
-        is exactly what "not following the default" means.
+    def _watch_devices(self) -> None:
+        """Runs on its own thread for the life of the meeting, reloading the device list whenever the
+        set of devices or the Windows default changes — see the class docstring.
 
         `Event.wait(timeout)` both sleeps between checks and returns True the instant stop() sets
         _watch_stop_event, so this exits promptly on stop rather than finishing out a long poll interval.
         """
-        while not self._watch_stop_event.wait(self._DEFAULT_DEVICE_POLL_SECONDS):
-            if self._mic_device_name is None:
-                current = self._current_default_input_name()
-                if current is not None and current != self._mic_active_device_name:
-                    try:
-                        self.switch_mic_device(None, reason="the Windows default microphone changed")
-                    except Exception as exc:
-                        self._record_capture_failure("Microphone", exc)
-            if self._system_device_name is None:
-                current = self._current_default_loopback_name()
-                if current is not None and current != self._system_active_device_name:
-                    try:
-                        self.switch_system_device(None, reason="the Windows default output device changed")
-                    except Exception as exc:
-                        self._record_capture_failure("System audio", exc)
+        last = self._safe_device_signature()
+        while not self._watch_stop_event.wait(self._DEVICE_POLL_SECONDS):
+            current = self._safe_device_signature()
+            if current is None:
+                continue  # can't tell right now; compare against the last good reading next time
+            if last is not None and current != last:
+                try:
+                    self.reload_devices(reason="audio devices changed")
+                except Exception as exc:
+                    self._record_capture_failure("Audio devices", exc)
+            last = current
 
-    def _current_default_input_name(self) -> str | None:
+    def _safe_device_signature(self):
         # Swallows everything: this is a background poll, not something a transient enumeration hiccup
         # should ever be allowed to take the meeting down over. It just tries again next tick.
         try:
-            return self._pyaudio.get_default_input_device_info().get("name")
+            return self._device_signature()
         except Exception:
             return None
 
-    def _current_default_loopback_name(self) -> str | None:
-        try:
-            return self._get_default_loopback_device(self._pyaudio_module).get("name")
-        except Exception:
-            return None
+    def reload_devices(self, *, reason: str = "the device list was refreshed") -> None:
+        """Re-initializes PortAudio so devices added, removed, or made default since the meeting started
+        become visible, and reopens both streams on it — see the class docstring. Called by the device
+        watcher, and by the GUI's "Refresh devices" button while a meeting is recording (the only way
+        that button can show a current list then — see available_devices).
+
+        Never terminates PortAudio under a capture thread that won't stop (same rule as stop()): if
+        either thread is stuck, the streams are reopened on the existing, stale list instead and a
+        notice says why."""
+        with self._lifecycle_lock:
+            if self._started_at is None:
+                raise RuntimeError("Recorder.start() was never called")
+            streams = (
+                ("Microphone", "_mic_thread", "_mic_stop_event", "_mic_writer", "mic_level",
+                 self._mic_monitor, "_mic_device_name", "_mic_active_device_name",
+                 lambda name: self._resolve_input_device(name)),
+                ("System audio", "_system_thread", "_system_stop_event", "_system_writer", "system_level",
+                 self._system_monitor, "_system_device_name", "_system_active_device_name",
+                 lambda name: self._resolve_loopback_device(self._pyaudio_module, name)),
+            )
+
+            old_threads = [getattr(self, stream[1]) for stream in streams]
+            for thread, stream in zip(old_threads, streams):
+                retired = getattr(thread, "retired", None)
+                if retired is not None:
+                    retired.set()
+                getattr(self, stream[2]).set()
+            stuck = False
+            for thread, stream in zip(old_threads, streams):
+                if thread is not None and self._join_capture_thread(thread):
+                    self._orphaned_threads.append((thread, stream[0]))
+                    stuck = True
+
+            if stuck:
+                self._record_notice(
+                    "Couldn't reload the audio device list — a capture thread is still stuck on its "
+                    "previous device, and restarting audio under it could crash the app. Newly connected "
+                    "devices won't be available until the next meeting."
+                )
+            else:
+                try:
+                    with _pyaudio_lifecycle_lock:
+                        if self._pyaudio is not None:
+                            self._pyaudio.terminate()
+                        self._pyaudio = None
+                        self._pyaudio = self._pyaudio_module.PyAudio()
+                except Exception as exc:
+                    # Nothing can be opened without PortAudio; say so. The next device change (or
+                    # Refresh devices) tries again from here, since _pyaudio is left as None.
+                    self._record_switch(
+                        f"Couldn't restart audio to reload the device list ({type(exc).__name__}: {exc}) "
+                        "— recording is paused until the next device change or Refresh devices."
+                    )
+                    return
+
+            for stream in streams:
+                (label, thread_attr, event_attr, writer_attr, level_attr, monitor, name_attr, active_attr,
+                 resolve) = stream
+                writer: _SegmentedWavWriter | None = getattr(self, writer_attr)
+                if writer is None:
+                    continue
+                setattr(self, thread_attr, None)
+                try:
+                    device_info = resolve(getattr(self, name_attr))
+                except Exception as exc:  # e.g. every output device unplugged: nothing to loop back from
+                    self._record_capture_failure(label, exc)
+                    continue
+                previous = getattr(self, active_attr)
+                setattr(self, active_attr, device_info["name"])
+                writer.start_new_part(
+                    int(device_info["maxInputChannels"]), int(device_info["defaultSampleRate"])
+                )
+                stop_event: threading.Event = getattr(self, event_attr)
+                stop_event.clear()
+                setattr(self, thread_attr, self._spawn_capture_thread(
+                    self._pyaudio_module, device_info, writer, level_attr, monitor, label, stop_event
+                ))
+                if device_info["name"] != previous:
+                    self._record_switch(f"{label} switched to {device_info['name']!r} — {reason}.")
+            self.device_list_version += 1
+
+    def available_devices(self) -> tuple[list, list]:
+        """(input devices, loopback devices) as this Recorder's PortAudio currently sees them — the
+        current list, including anything plugged in mid-meeting once reload_devices() has run. While a
+        meeting records, a fresh device_picker enumeration would only return the stale snapshot from
+        when the meeting started (see audio.device_watch)."""
+        from meeting_scribe.audio.device_picker import input_devices_from, loopback_devices_from
+
+        with self._lifecycle_lock:
+            if self._pyaudio is None:
+                return [], []
+            return input_devices_from(self._pyaudio), loopback_devices_from(self._pyaudio)
 
     def stop(self) -> RecordedAudio:
         if self._started_at is None:
@@ -787,6 +887,7 @@ class Recorder:
                 )
                 if thread is not None and self._join_capture_thread(thread)
             ]
+            stuck_labels += [label for thread, label in self._orphaned_threads if thread.is_alive()]
             if self._pyaudio is not None:
                 if stuck_labels:
                     # A capture thread still running here is presumably blocked inside a native,
@@ -930,6 +1031,8 @@ class Recorder:
         switch."""
         channels = int(device_info["maxInputChannels"])
         rate = int(device_info["defaultSampleRate"])
+        # Set by _switch_stream when this thread is being replaced — see there.
+        retired = threading.Event()
 
         def run() -> None:
             stream = None
@@ -942,8 +1045,10 @@ class Recorder:
                     input_device_index=device_info["index"],
                     frames_per_buffer=CHUNK_FRAMES,
                 )
-                while not stop_event.is_set():
+                while not (stop_event.is_set() or retired.is_set()):
                     data = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
+                    if retired.is_set():
+                        break  # replaced while blocked in read(); the writer belongs to the new thread now
                     writer.write(data)
                     stats = _analyze_pcm16(data)
                     setattr(self, level_attr, stats.level)
@@ -956,15 +1061,17 @@ class Recorder:
                 for close in (
                     getattr(stream, "stop_stream", None),
                     getattr(stream, "close", None),
-                    writer.close,
+                    None if retired.is_set() else writer.close,
                 ):
                     try:
                         if close is not None:
                             close()
                     except Exception as exc:  # one failed teardown step shouldn't skip the rest
                         self._record_capture_failure(label, exc)
-                setattr(self, level_attr, 0.0)
+                if not retired.is_set():
+                    setattr(self, level_attr, 0.0)
 
         thread = threading.Thread(target=run, daemon=True, name=f"recorder-{label.lower().replace(' ', '-')}")
+        thread.retired = retired
         thread.start()
         return thread

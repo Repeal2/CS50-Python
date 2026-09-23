@@ -5,8 +5,10 @@ desktop session.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import os
 import sys
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -57,10 +59,56 @@ def _show_fatal_startup_error(detail: str) -> None:
             pass
 
 
+# Kept open for the life of the process: faulthandler writes to this file descriptor from inside a crash
+# handler, where nothing can be opened anymore.
+_crash_log_file = None
+
+
+def _install_crash_logging(log_dir: Path) -> None:
+    """Leaves evidence behind for the two kinds of failure nothing else in the app can report.
+
+    A *native* crash (an access violation inside PortAudio, CTranslate2, Tk, ...) kills the process
+    before any Python except/finally runs — the window just vanishes. faulthandler hooks the OS-level
+    fault itself and writes every thread's Python stack to crash.log first, which is exactly what's
+    needed to tell which subsystem was in flight (a capture thread mid-read, the transcriber, a Tk
+    callback) when it happened.
+
+    An exception escaping a *background thread* doesn't crash anything, but it silently ends whatever
+    that thread was doing (a hotkey listener, the screen watcher) — Tk's report_callback_exception only
+    covers the GUI thread. threading.excepthook sends those to error.log alongside Tk's.
+
+    Never raises: failing to set up logging must not be what stops the app from starting."""
+    global _crash_log_file
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        _crash_log_file = open(log_dir / "crash.log", "a", encoding="utf-8")
+        _crash_log_file.write(f"\n--- process {os.getpid()} started {datetime.now().isoformat()} ---\n")
+        _crash_log_file.flush()
+        faulthandler.enable(file=_crash_log_file, all_threads=True)
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    error_log = log_dir / "error.log"
+
+    def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
+        if args.exc_type is SystemExit:
+            return
+        try:
+            thread_name = args.thread.name if args.thread is not None else "unknown"
+            with open(error_log, "a", encoding="utf-8") as f:
+                f.write(f"\n--- {datetime.now().isoformat()} (thread {thread_name}) ---\n")
+                traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback, file=f)
+        except OSError:
+            pass
+
+    threading.excepthook = _log_thread_exception
+
+
 def _run_gui() -> int:
     """Launches the desktop app with a safety net around everything up to and including mainloop() —
     see _show_fatal_startup_error for why this needs its own handling rather than relying on
     MeetingScribeApp.report_callback_exception."""
+    _install_crash_logging(_fallback_log_dir())
     try:
         settings = load_settings()
         from meeting_scribe.gui.app import MeetingScribeApp
