@@ -505,6 +505,62 @@ def test_a_capture_thread_that_unblocks_after_being_switched_away_from_stays_sto
     assert not any("capture stopped early" in notice for notice in recorder.capture_notices())
 
 
+
+def test_switching_system_audio_away_from_a_silent_loopback_device_does_not_leave_it_running(tmp_path, monkeypatch):
+    # The system-audio case of the test above, and the likeliest way to hit it: a WASAPI loopback stream
+    # delivers nothing while its output device is silent, so read() on the old device blocks as soon as
+    # playback moves to the new one — the old thread is all but guaranteed to still be stuck when the
+    # switch gives up waiting on it. It must stay stopped once it unblocks, and stop() must not tear
+    # PortAudio down while it's still blocked.
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    writer = _SegmentedWavWriter(tmp_path / "system.wav", 2, SAMPLE_WIDTH_BYTES, 48000)
+    recorder._system_writer = writer
+
+    hung = _HungStream(b"\x09\x00\x09\x00" * 5)
+    recorder._pyaudio = _FakePyAudio(hung)
+    old_device = {"name": "Speakers [Loopback]", "index": 5, "maxInputChannels": 2, "defaultSampleRate": 48000}
+    recorder._system_thread = recorder._spawn_capture_thread(
+        SimpleNamespace(paInt16=8), old_device, writer, "system_level", recorder._system_monitor,
+        "System audio", recorder._system_stop_event,
+    )
+    assert hung.entered_read.wait(timeout=5)
+    old_thread = recorder._system_thread
+
+    new_device = {
+        "name": "Headphones [Loopback]", "index": 6, "maxInputChannels": 2, "defaultSampleRate": 44100,
+        "isLoopbackDevice": True,
+    }
+    new_stream = _FakeStream([b"\x02\x00\x03\x00" * 5] * 2, stop_event=recorder._system_stop_event)
+    terminated = []
+    host = _FakeAudioHost([], default_input=None, loopbacks=[new_device])
+    host.open = lambda **kwargs: new_stream
+    host.terminate = lambda: terminated.append(True)
+    recorder._pyaudio = host
+    recorder._pyaudio_module = SimpleNamespace(paInt16=8)
+    monkeypatch.setattr(
+        Recorder, "_join_capture_thread", staticmethod(lambda thread, timeout=5.0: thread.is_alive())
+    )
+
+    recorder.switch_system_device("Headphones [Loopback]")
+    recorder._system_thread.join(timeout=5)
+
+    # The old loopback thread is still blocked — stop() must leave PortAudio alone.
+    assert old_thread.is_alive()
+    recorder.stop()
+    assert terminated == []
+    assert any("System audio capture thread didn't stop" in n for n in recorder.capture_notices())
+
+    # Playback resumes on the old device later: its thread must not write into the new part.
+    hung.release.set()
+    old_thread.join(timeout=5)
+    assert not old_thread.is_alive()
+    with contextlib.closing(wave.open(str(tmp_path / "system.part2.wav"), "rb")) as second_part:
+        assert second_part.getframerate() == 44100
+        assert second_part.readframes(second_part.getnframes()) == b"\x02\x00\x03\x00" * 10
+    assert not any("capture stopped early" in n for n in recorder.capture_notices())
+
+
 def test_stop_does_not_terminate_pyaudio_while_a_switched_away_thread_is_still_stuck(tmp_path, monkeypatch):
     # The old thread from a switch that timed out is still inside a native read on PortAudio — stop()
     # terminating PortAudio under it is the same use-after-free as for a current thread.
