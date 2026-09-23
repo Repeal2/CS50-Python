@@ -573,6 +573,10 @@ class Recorder:
         self._system_stop_event = threading.Event()
         self._watch_stop_event = threading.Event()
         self._watcher_thread: threading.Thread | None = None
+        # Capture threads a device switch gave up waiting for (see _switch_stream) — still blocked in a
+        # native stream.read() on the device switched away from. stop() must not terminate PortAudio
+        # while any of these is alive, same as for the current threads.
+        self._orphaned_threads: list[tuple[threading.Thread, str]] = []
         # Serializes stop() against switch_mic_device()/switch_system_device(), and switches against
         # each other. Without this, a switch racing stop() could still be opening a new stream on
         # self._pyaudio in one thread while stop() is terminating that same PyAudio instance in
@@ -693,9 +697,18 @@ class Recorder:
 
         # Stop only this stream's capture thread — the other one is left running, which is the whole
         # point of switching one device without restarting the meeting.
-        stop_event.set()
         old_thread: threading.Thread | None = getattr(self, thread_attr)
+        # Retired *before* the stop event is set, and for good: stop_event is shared with the thread
+        # spawned below and gets cleared for it, so on its own it can't keep a stuck old thread stopped —
+        # one that unblocked later used to see the cleared event and carry on reading the old device into
+        # the new part alongside its replacement, then close the writer out from under it when it finally
+        # did stop. A retired thread never writes again and leaves the writer to start_new_part below.
+        retired = getattr(old_thread, "retired", None)
+        if retired is not None:
+            retired.set()
+        stop_event.set()
         if old_thread is not None and self._join_capture_thread(old_thread):
+            self._orphaned_threads.append((old_thread, label))
             # Still running after the timeout — presumably blocked inside a native, uninterruptible
             # stream.read() on the device being switched away from (a hung or disconnected driver). The
             # switch still has to proceed (there's no way to interrupt a blocked native read from here),
@@ -787,6 +800,7 @@ class Recorder:
                 )
                 if thread is not None and self._join_capture_thread(thread)
             ]
+            stuck_labels += [label for thread, label in self._orphaned_threads if thread.is_alive()]
             if self._pyaudio is not None:
                 if stuck_labels:
                     # A capture thread still running here is presumably blocked inside a native,
@@ -930,6 +944,8 @@ class Recorder:
         switch."""
         channels = int(device_info["maxInputChannels"])
         rate = int(device_info["defaultSampleRate"])
+        # Set by _switch_stream when this thread is being replaced — see there.
+        retired = threading.Event()
 
         def run() -> None:
             stream = None
@@ -942,8 +958,10 @@ class Recorder:
                     input_device_index=device_info["index"],
                     frames_per_buffer=CHUNK_FRAMES,
                 )
-                while not stop_event.is_set():
+                while not (stop_event.is_set() or retired.is_set()):
                     data = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
+                    if retired.is_set():
+                        break  # replaced while blocked in read(); the writer belongs to the new thread now
                     writer.write(data)
                     stats = _analyze_pcm16(data)
                     setattr(self, level_attr, stats.level)
@@ -956,15 +974,17 @@ class Recorder:
                 for close in (
                     getattr(stream, "stop_stream", None),
                     getattr(stream, "close", None),
-                    writer.close,
+                    None if retired.is_set() else writer.close,
                 ):
                     try:
                         if close is not None:
                             close()
                     except Exception as exc:  # one failed teardown step shouldn't skip the rest
                         self._record_capture_failure(label, exc)
-                setattr(self, level_attr, 0.0)
+                if not retired.is_set():
+                    setattr(self, level_attr, 0.0)
 
         thread = threading.Thread(target=run, daemon=True, name=f"recorder-{label.lower().replace(' ', '-')}")
+        thread.retired = retired
         thread.start()
         return thread

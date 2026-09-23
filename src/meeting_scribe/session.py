@@ -28,7 +28,10 @@ from meeting_scribe.transcription.engine import (
     low_memory_warning,
     merge_transcript_lines,
     render_transcript,
+    transcription_slot,
 )
+
+_WAITING_FOR_TRANSCRIPTION_MESSAGE = "Waiting for another meeting's transcription to finish first…"
 
 
 class MeetingSession:
@@ -116,6 +119,14 @@ class MeetingSession:
         Empty while both inputs look healthy; recomputed per call, so it clears if the input recovers."""
         return self._recorder.input_problems()
 
+    def abandon(self) -> None:
+        """Stops capturing without transcribing — for the app closing mid-meeting. The WAV files are
+        finalized on disk and the meeting is left unfinished (no transcript), which is exactly the state
+        retry_meeting_transcription picks up from later. On-screen OCR text is lost, same as for any
+        other retry."""
+        self._screen_watcher.stop()
+        self._recorder.stop()
+
     def stop(self, on_progress: Callable[[str], None] | None = None) -> str:
         """Stops recording, transcribes, pushes the meeting to Copilot Studio (if configured), and saves
         it locally. Returns the plain transcript — there's no AI-generated notes to return anymore; that
@@ -139,15 +150,19 @@ class MeetingSession:
         for message in recorded.notices:
             report(message)
 
-        # Checked right before the expensive part starts, not any earlier — a warning here is what a
-        # `mkl_malloc: failed to allocate memory` crash further down would otherwise give no advance
-        # notice of at all (see transcription.engine.low_memory_warning).
-        warning = low_memory_warning(self._settings.whisper_model_size, available_memory_mb())
-        if warning is not None:
-            report(warning)
+        with transcription_slot(on_wait=lambda: report(_WAITING_FOR_TRANSCRIPTION_MESSAGE)):
+            # Checked right before the expensive part starts, not any earlier — a warning here is what a
+            # `mkl_malloc: failed to allocate memory` crash further down would otherwise give no advance
+            # notice of at all (see transcription.engine.low_memory_warning).
+            warning = low_memory_warning(self._settings.whisper_model_size, available_memory_mb())
+            if warning is not None:
+                report(warning)
 
-        mic_lines = self._transcriber.transcribe_parts(recorded.mic_paths, source="mic")
-        system_lines = self._transcriber.transcribe_parts(recorded.system_paths, source="system")
+            try:
+                mic_lines = self._transcriber.transcribe_parts(recorded.mic_paths, source="mic")
+                system_lines = self._transcriber.transcribe_parts(recorded.system_paths, source="system")
+            finally:
+                self._transcriber.unload()
         screen_lines = [
             TranscriptLine(event.timestamp_seconds, "screen_ocr", event.text)
             for event in self._screen_events
@@ -248,13 +263,17 @@ def retry_meeting_transcription(
             f'No recorded audio found for "{meeting.title}" in {meeting_dir} — nothing to retranscribe.'
         )
 
-    warning = low_memory_warning(settings.whisper_model_size, available_memory_mb())
-    if warning is not None:
-        report(warning)
+    with transcription_slot(on_wait=lambda: report(_WAITING_FOR_TRANSCRIPTION_MESSAGE)):
+        warning = low_memory_warning(settings.whisper_model_size, available_memory_mb())
+        if warning is not None:
+            report(warning)
 
-    transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
-    mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")
-    system_lines = transcriber.transcribe_parts(system_paths, source="system")
+        transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
+        try:
+            mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")
+            system_lines = transcriber.transcribe_parts(system_paths, source="system")
+        finally:
+            transcriber.unload()
     report("Transcription complete.")
 
     audio_lines = merge_transcript_lines(mic_lines, system_lines)

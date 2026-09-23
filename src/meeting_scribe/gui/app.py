@@ -165,6 +165,9 @@ class MeetingScribeApp(tk.Tk):
         self.settings = settings or load_settings()
         self.db = Database(self.settings.db_path)
         self._session: MeetingSession | None = None
+        # Finish-up jobs (a stopped meeting's transcription, a Projects-tab retry) still running on
+        # background threads — see run_in_background and _on_close.
+        self._background_threads: list[threading.Thread] = []
         # A windowed PyInstaller build has no console, so an exception raised inside any Tkinter
         # callback (a button command, an after() callback) would otherwise just vanish with nothing to
         # show for it. Tkinter calls this instead of its default stderr-print behavior — log it to a
@@ -293,9 +296,46 @@ class MeetingScribeApp(tk.Tk):
         self._record_tab.select_project(project.name)
         self._projects_tab.select_project(project.name)
 
+    def run_in_background(self, target: Callable[[], None]) -> None:
+        """Starts a meeting's finish-up work (transcription, pushing, saving) on a daemon thread, and
+        remembers it so closing the window while it's still running can warn first rather than cut it
+        off mid-transcript — see _on_close."""
+        self._background_threads = [thread for thread in self._background_threads if thread.is_alive()]
+        thread = threading.Thread(target=target, daemon=True)
+        self._background_threads.append(thread)
+        thread.start()
+
     def _on_close(self) -> None:
+        """Closing used to just destroy the window, whatever was going on: a meeting still recording kept
+        its capture threads reading PortAudio and writing WAV files while the interpreter shut down
+        around them (daemon threads are killed mid-native-call at exit — a crash on the way out, and
+        WAV files left without their final header), and a finishing meeting lost its transcript. Now it
+        asks first, and a recording is stopped cleanly — its audio kept, so the meeting can be
+        transcribed later with Retry on the Projects tab."""
+        session = self._session
+        finishing = any(thread.is_alive() for thread in self._background_threads)
+        if session is not None or finishing:
+            if session is not None:
+                message = (
+                    f'"{session.title}" is still recording. Close anyway? Recording will stop and the audio '
+                    "will be kept — you can transcribe it later with Retry on the Projects tab."
+                )
+            else:
+                message = (
+                    "A meeting is still being transcribed/saved in the background. Close anyway? It will "
+                    "be left unfinished — you can transcribe it later with Retry on the Projects tab."
+                )
+            if not messagebox.askyesno("Meeting Scribe", message, icon="warning", parent=self):
+                return
         if self._hotkey_listener is not None:
             self._hotkey_listener.stop()
+        if session is not None:
+            self._record_tab.flush_manual_notes()
+            self._session = None
+            try:
+                session.abandon()
+            except Exception:  # closing must still go ahead; the audio on disk is what matters
+                self._report_callback_exception(*sys.exc_info())
         self._record_tab.close_region_outline()
         self.db.close()
         self.destroy()
@@ -798,7 +838,7 @@ class RecordTab(ttk.Frame):
 
         try:
             return find_teams_meeting_name()
-        except RuntimeError:
+        except Exception:  # not Windows, or a win32 call failing on some window — never worth a failed Start
             return None
 
     def _refresh_devices(self) -> None:
@@ -879,8 +919,11 @@ class RecordTab(ttk.Frame):
                 screen_target=screen_target,
             )
             session.start()
-        except RuntimeError as exc:
-            messagebox.showerror("Meeting Scribe", str(exc))
+        except Exception as exc:  # a missing/unavailable audio device raises OSError, not RuntimeError
+            # Shown rather than left to report_callback_exception's log file: with only the log, a failed
+            # Start — particularly from the global hotkey, with this window not even in front — looks
+            # exactly like nothing happening at all.
+            messagebox.showerror("Meeting Scribe", f"Couldn't start recording: {exc}")
             return
 
         self.app._session = session
@@ -914,6 +957,13 @@ class RecordTab(ttk.Frame):
         if self._manual_notes_save_after_id is not None:
             self.after_cancel(self._manual_notes_save_after_id)
         self._manual_notes_save_after_id = self.after(400, self._save_manual_notes)
+
+    def flush_manual_notes(self) -> None:
+        """Saves any not-yet-saved manual notes right now instead of waiting out the debounce timer."""
+        if self._manual_notes_save_after_id is not None:
+            self.after_cancel(self._manual_notes_save_after_id)
+            self._manual_notes_save_after_id = None
+        self._save_manual_notes()
 
     def _save_manual_notes(self) -> None:
         self._manual_notes_save_after_id = None
@@ -960,10 +1010,7 @@ class RecordTab(ttk.Frame):
         # Flush any pending debounced save before detaching (see _schedule_manual_notes_save) so the
         # last few keystrokes before Stop aren't lost — _save_manual_notes reads self.app._session, so
         # this has to happen before that gets cleared below.
-        if self._manual_notes_save_after_id is not None:
-            self.after_cancel(self._manual_notes_save_after_id)
-            self._manual_notes_save_after_id = None
-        self._save_manual_notes()
+        self.flush_manual_notes()
 
         # Detach right away rather than waiting for the background job below to finish — transcribing
         # and pushing to Copilot Studio takes a moment, and there's no reason that should block starting
@@ -997,7 +1044,7 @@ class RecordTab(ttk.Frame):
                 return
             self.after(0, self._on_stop_done, session.title)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.app.run_in_background(worker)
 
     def _on_stop_done(self, meeting_title: str) -> None:
         self._log(f"[{meeting_title}] Saved.")
@@ -1337,7 +1384,7 @@ class ProjectsTab(ttk.Frame):
                 return
             self.after(0, self._on_retry_done, meeting.id, meeting.title)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.app.run_in_background(worker)
 
     def _show_retry_progress(self, meeting_id: int, message: str) -> None:
         if self._still_viewing(meeting_id):

@@ -430,6 +430,101 @@ def test_switch_records_a_notice_when_the_old_capture_thread_does_not_stop_in_ti
     assert any("didn't stop within 5s" in notice for notice in recorder.capture_notices())
 
 
+
+class _HungStream:
+    """A stream whose first read() blocks until released — a hung or disconnected device's driver."""
+
+    def __init__(self, chunk):
+        self.release = threading.Event()
+        self.entered_read = threading.Event()
+        self._chunk = chunk
+        self.closed = False
+
+    def read(self, frames, exception_on_overflow=False):
+        self.entered_read.set()
+        self.release.wait(timeout=10)
+        return self._chunk
+
+    def stop_stream(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def test_a_capture_thread_that_unblocks_after_being_switched_away_from_stays_stopped(tmp_path, monkeypatch):
+    # Regression test: the stop event is shared with the replacement thread and cleared for it, so an
+    # old thread that was stuck in read() during the switch used to wake up, see the cleared event, and
+    # carry on — writing the old device's audio into the new part and eventually closing the writer
+    # out from under the new thread.
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
+    recorder._mic_writer = writer
+
+    hung = _HungStream(b"\x09\x00" * 5)
+    recorder._pyaudio = _FakePyAudio(hung)
+    old_device = {"name": "Old Mic", "index": 0, "maxInputChannels": 1, "defaultSampleRate": 16000}
+    recorder._mic_thread = recorder._spawn_capture_thread(
+        SimpleNamespace(paInt16=8), old_device, writer, "mic_level", recorder._mic_monitor,
+        "Microphone", recorder._mic_stop_event,
+    )
+    assert hung.entered_read.wait(timeout=5)
+    old_thread = recorder._mic_thread
+
+    new_device = {"name": "USB Headset", "index": 1, "maxInputChannels": 1, "defaultSampleRate": 16000}
+    new_stream = _FakeStream([b"\x02\x00" * 5] * 3)
+    new_stream.read_gate = threading.Event()
+    original_read = new_stream.read
+
+    def gated_read(frames, exception_on_overflow=False):
+        new_stream.read_gate.wait(timeout=10)
+        if not new_stream._chunks:
+            recorder._mic_stop_event.set()
+            return b""
+        return original_read(frames)
+
+    new_stream.read = gated_read
+    recorder._pyaudio = _FakeAudioHost([new_device], default_input=new_device)
+    recorder._pyaudio.open = lambda **kwargs: new_stream
+    recorder._pyaudio_module = SimpleNamespace(paInt16=8)
+    monkeypatch.setattr(Recorder, "_join_capture_thread", staticmethod(lambda thread, timeout=5.0: thread.is_alive()))
+
+    recorder.switch_mic_device("USB Headset")
+
+    hung.release.set()  # the old device's read finally returns
+    old_thread.join(timeout=5)
+    assert not old_thread.is_alive()
+
+    new_stream.read_gate.set()
+    recorder._mic_thread.join(timeout=5)
+
+    # Nothing from the old device landed in the new part, and the new thread wasn't cut off early.
+    with contextlib.closing(wave.open(str(tmp_path / "mic.part2.wav"), "rb")) as second_part:
+        assert second_part.readframes(second_part.getnframes()) == b"\x02\x00" * 15
+    assert not any("capture stopped early" in notice for notice in recorder.capture_notices())
+
+
+def test_stop_does_not_terminate_pyaudio_while_a_switched_away_thread_is_still_stuck(tmp_path, monkeypatch):
+    # The old thread from a switch that timed out is still inside a native read on PortAudio — stop()
+    # terminating PortAudio under it is the same use-after-free as for a current thread.
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    release = threading.Event()
+    stuck = threading.Thread(target=release.wait, daemon=True)
+    stuck.start()
+    recorder._orphaned_threads.append((stuck, "Microphone"))
+    terminated = []
+    recorder._pyaudio = SimpleNamespace(terminate=lambda: terminated.append(True))
+    try:
+        recorder.stop()
+    finally:
+        release.set()
+        stuck.join(timeout=5)
+
+    assert terminated == []
+
+
 # --- stop() and a capture thread that refuses to stop -----------------------------------------------
 
 

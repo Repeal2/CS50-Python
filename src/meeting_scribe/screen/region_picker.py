@@ -134,12 +134,25 @@ def _position_window(window: "tk.Misc", left: int, top: int, width: int, height:
     reapplies its position on every poll tick.
 
     update_idletasks() first guarantees the window has a real platform handle to move — Tk creates one
-    immediately when a Toplevel is constructed, but forcing a pending-event flush before reading
-    winfo_id() is the safe way to depend on that rather than an implementation detail."""
+    immediately when a Toplevel is constructed, but forcing a pending-event flush before reading its
+    handle (see _toplevel_hwnd) is the safe way to depend on that rather than an implementation detail."""
     window.update_idletasks()
     import ctypes
+    from ctypes import wintypes
 
-    ctypes.windll.user32.MoveWindow(window.winfo_id(), left, top, width, height, True)
+    move_window = ctypes.windll.user32.MoveWindow
+    move_window.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+    move_window.restype = wintypes.BOOL
+    move_window(_toplevel_hwnd(window), left, top, width, height, True)
+
+
+def _toplevel_hwnd(window: "tk.Misc") -> int:
+    """The HWND of the actual top-level OS window for a Tk Toplevel. On Windows, winfo_id() is *not*
+    that: Tk nests every toplevel's contents in a child window inside a separate "wrapper" frame window,
+    and winfo_id() returns the child. Moving the child with MoveWindow shifts it around inside the wrapper
+    (clipped to it) while the wrapper — the thing actually on screen — stays wherever Tk first put it.
+    `wm frame` returns the wrapper."""
+    return int(window.wm_frame(), 16)
 
 
 def pick_region_interactively(parent: "tk.Misc") -> RegionTarget | None:

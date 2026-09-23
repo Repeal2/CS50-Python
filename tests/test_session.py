@@ -781,3 +781,24 @@ def test_session_reads_input_health_through_to_the_recorder(tmp_path):
 
             assert session.capture_notices() == ("Microphone 'Jabra' isn't available",)
             assert session.input_problems() == ("Microphone: no signal at all",)
+
+
+def test_abandon_stops_capture_without_transcribing_and_leaves_the_meeting_retryable(tmp_path):
+    # Closing the app mid-meeting: the audio must be finalized on disk, nothing transcribed, and the
+    # meeting left unfinished so Retry can pick it up later.
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher") as MockWatcher,
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+            session.abandon()
+
+            MockWatcher.return_value.stop.assert_called_once()
+            MockRecorder.return_value.stop.assert_called_once()
+            MockTranscriber.return_value.transcribe_parts.assert_not_called()
+            assert db.get_meeting(session.meeting_id).ended_at is None

@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import contextlib
 import sys
+import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Iterator, Sequence
 
 SOURCE_LABELS = {"mic": "You", "system": "Others", "screen_ocr": "Screen"}
 
@@ -92,6 +93,29 @@ def low_memory_warning(model_size: str, available_mb: float | None) -> str | Non
     )
 
 
+# One transcription at a time, process-wide. Back-to-back meetings (session.py) and a Projects-tab retry
+# each run on their own background thread with their own WhisperTranscriber, and each loads its own copy
+# of the model — two at once doubles the memory needed, which is exactly the `mkl_malloc: failed to
+# allocate memory` abort (a native crash that takes the whole app down, not a Python exception) the low-
+# memory warning exists for. Queuing them costs some latency on the second meeting, never its transcript.
+_transcription_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def transcription_slot(on_wait: Callable[[], None] | None = None) -> Iterator[None]:
+    """Holds the process-wide transcription slot for the duration of the block. `on_wait` is called
+    once, before blocking, if another transcription already holds it — so the caller can say why
+    nothing seems to be happening."""
+    if not _transcription_lock.acquire(blocking=False):
+        if on_wait is not None:
+            on_wait()
+        _transcription_lock.acquire()
+    try:
+        yield
+    finally:
+        _transcription_lock.release()
+
+
 @dataclass(frozen=True)
 class TranscriptLine:
     timestamp_seconds: float
@@ -117,6 +141,12 @@ class WhisperTranscriber:
             # CPU is the only device this app actually supports.
             self._model = WhisperModel(self._model_size, device="cpu", compute_type="int8")
         return self._model
+
+    def unload(self) -> None:
+        """Drops the loaded model so its memory can be reclaimed as soon as this transcriber is done,
+        rather than whenever the session holding it is garbage-collected — the next queued transcription
+        (see transcription_slot) shouldn't have to share memory with a model nobody is using anymore."""
+        self._model = None
 
     def transcribe(self, audio_path: Path, source: str) -> list[TranscriptLine]:
         """Runs Whisper over a recorded WAV file, returning one TranscriptLine per detected segment."""

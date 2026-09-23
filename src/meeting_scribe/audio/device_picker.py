@@ -13,6 +13,23 @@ import sys
 from dataclasses import dataclass
 
 
+def _open_pyaudio(pyaudio_module):
+    """PyAudio construction and teardown touch PortAudio's global (unlocked) init state, so they share
+    the recorder's lifecycle lock — "Refresh devices" can otherwise land at the same moment as a
+    finishing meeting's Recorder.stop() tearing PortAudio down on its background thread."""
+    from meeting_scribe.audio.recorder import _pyaudio_lifecycle_lock
+
+    with _pyaudio_lifecycle_lock:
+        return pyaudio_module.PyAudio()
+
+
+def _close_pyaudio(pyaudio_instance) -> None:
+    from meeting_scribe.audio.recorder import _pyaudio_lifecycle_lock
+
+    with _pyaudio_lifecycle_lock:
+        pyaudio_instance.terminate()
+
+
 @dataclass(frozen=True)
 class AudioDevice:
     index: int
@@ -25,7 +42,7 @@ def list_input_devices() -> list[AudioDevice]:
         raise RuntimeError("Device selection requires Windows (PyAudioWPatch)")
     import pyaudiowpatch as pyaudio
 
-    p = pyaudio.PyAudio()
+    p = _open_pyaudio(pyaudio)
     try:
         return [
             AudioDevice(index=info["index"], name=info["name"])
@@ -33,7 +50,7 @@ def list_input_devices() -> list[AudioDevice]:
             if info.get("maxInputChannels", 0) > 0 and not info.get("isLoopbackDevice")
         ]
     finally:
-        p.terminate()
+        _close_pyaudio(p)
 
 
 def list_loopback_devices() -> list[AudioDevice]:
@@ -42,11 +59,11 @@ def list_loopback_devices() -> list[AudioDevice]:
         raise RuntimeError("Device selection requires Windows (PyAudioWPatch)")
     import pyaudiowpatch as pyaudio
 
-    p = pyaudio.PyAudio()
+    p = _open_pyaudio(pyaudio)
     try:
         return [
             AudioDevice(index=info["index"], name=info["name"])
             for info in p.get_loopback_device_info_generator()
         ]
     finally:
-        p.terminate()
+        _close_pyaudio(p)

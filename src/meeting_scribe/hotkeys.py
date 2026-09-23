@@ -176,7 +176,16 @@ class GlobalHotkeyListener:
                 if msg.message == _WM_HOTKEY:
                     binding = self._bindings.get(msg.wParam)
                     if binding is not None:
-                        binding[1]()
+                        try:
+                            binding[1]()
+                        except Exception:
+                            # An exception escaping here would end this loop — and with it every
+                            # shortcut, silently, for the rest of the session (e.g. one press landing
+                            # while the app is mid-shutdown and Tk refuses the cross-thread after()).
+                            # Report it the same way as any other background-thread failure, then keep
+                            # listening.
+                            exc_info = (*sys.exc_info(), threading.current_thread())
+                            threading.excepthook(threading.ExceptHookArgs(exc_info))
         finally:
             for hotkey_id in self._bindings:
                 user32.UnregisterHotKey(None, hotkey_id)

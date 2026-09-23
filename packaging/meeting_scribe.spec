@@ -27,7 +27,7 @@ block_cipher = None
 hidden_imports = (
     collect_submodules("faster_whisper")
     + collect_submodules("ctranslate2")
-    + (["pyaudiowpatch", "win32gui", "win32con"] if sys.platform == "win32" else [])
+    + (["pyaudiowpatch", "win32gui", "win32con", "win32api", "win32process"] if sys.platform == "win32" else [])
 )
 
 vendored_tesseract = Path(SPECPATH) / "vendor" / "tesseract"
