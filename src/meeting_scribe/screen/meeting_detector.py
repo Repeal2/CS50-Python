@@ -206,27 +206,3 @@ def prompt_position(
     y = max(work_top, min(y, work_bottom - height))
     return x, y
 
-
-def after_screen_window_closed(
-    *, watched_was_teams: bool, in_teams_call: bool, teams_window_hwnd: int | None, watched_hwnd: int,
-    auto_stop: bool,
-) -> tuple[str, int | None]:
-    """What to do once the window a meeting's on-screen capture was pointed at has closed:
-    ("follow", hwnd) to point capture at the call's new window, ("wait", None) to check again next time,
-    ("stop", None) to stop recording, or ("forget", None) to stop watching.
-
-    Teams doesn't keep one window for a call: the pre-join lobby window is replaced by the call window
-    when you go in, and popping the meeting out or back replaces it again. So a Teams window closing
-    while Teams still has the microphone open isn't the call ending — it moved. Treating it as the end
-    ("Stop recording when the screen-source window closes") used to stop the meeting partway through
-    the call, and send what had been recorded so far off to be transcribed, with the rest of the call
-    never recorded at all; and with that option off, on-screen capture just went blank for the rest of
-    the meeting. Now capture follows the call to its new window, and the recording is only stopped once
-    Teams has let go of the microphone — the call really has ended."""
-    if watched_was_teams and in_teams_call:
-        if teams_window_hwnd is not None and teams_window_hwnd != watched_hwnd:
-            return "follow", teams_window_hwnd
-        return "wait", None
-    if auto_stop:
-        return "stop", None
-    return "forget", None

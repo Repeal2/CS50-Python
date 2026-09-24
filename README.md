@@ -32,15 +32,14 @@ saves everything locally, and pushes.
   half. That last one is a heuristic, not a verdict — it can't tell a wrong device from a muted one from
   a meeting nobody has spoken in yet — so it appears as a warning line under the meters and in the
   activity log, never as a dialog that steals focus from the call it's warning about.
-- **Watches the screen** at a low frame rate and OCRs it, so on-screen captions, shared slides, and chat
-  messages become part of the transcript even if they're never spoken aloud. You can point this at the
-  whole screen, a single selected window (e.g. just the Teams/Zoom window), or a custom rectangle you
-  drag out yourself (e.g. just a captions bar) — the app draws a live boundary around whichever custom
-  area is active so it's always visible on screen what's being captured. A custom rectangle can also be
-  pinned to a window ("Pin area to window" next to "Select area…") instead of a fixed screen position —
-  e.g. just the captions bar within the Teams window — so the captured area (and its on-screen outline)
-  moves and scales with that window: dragged to another monitor, resized, or re-laid-out at a different
-  per-monitor DPI scale, it stays in roughly the same relative spot rather than at fixed screen pixels.
+- **Reads on-screen text from a box you place.** When recording starts, an OCR box appears on screen —
+  over the bottom of the Teams call window the first time (where live captions show), and where you
+  left it after that. Drag its edge (or the ⠿ grip) to move it and its handles to resize it; nothing is
+  read until you press **Start OCR** on the button attached to its top-left corner, which then switches
+  to **Stop OCR** to pause. What's inside the frame is exactly what's read — the frame, handles and
+  button all sit outside it — and the inside is see-through and click-through, so the call underneath
+  stays usable. "Reset box position" on the Record tab puts it back if it ends up somewhere awkward. The
+  text read is saved to the meeting folder as it arrives, so it survives a crash and a Retry.
 - **Transcribes** the recorded audio locally (no audio ever leaves the machine) and merges it with the
   OCR stream into one time-ordered transcript. This — plus the push to Copilot Studio below — happens in
   the background after you hit Stop, so it doesn't block starting the next meeting right away; the
@@ -92,7 +91,7 @@ saves everything locally, and pushes.
 | Screen OCR | [pytesseract](https://github.com/madmaze/pytesseract) (wraps Tesseract) | Lightweight, no GPU, no ML runtime to bundle — important for a single-file Windows executable. Requires the Tesseract binary (see Packaging). |
 | System audio capture | [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) | A PyAudio fork with WASAPI loopback support, i.e. it can record "what the speakers are playing" on Windows without a virtual audio cable. |
 | Long recordings | Each track rolls over into numbered WAV parts (`mic.wav`, `mic.part2.wav`, …) just under 2 GiB | A WAV's RIFF header stores every chunk size as a 32-bit integer, so one file stops being describable somewhere under 4 GiB — and many readers treat those sizes as signed, which halves it. Writing past that point raises mid-write and kills the capture thread, silently ending the recording. Transcription stitches the parts back onto one clock. |
-| Window selection for OCR | [pywin32](https://github.com/mhammond/pywin32) (`win32gui`) | Enumerates open windows and re-reads a selected window's bounding box every capture cycle (it may move/resize), so OCR can be scoped to one app instead of the whole desktop. |
+| OCR area | An on-screen box (Tkinter, `-transparentcolor`) | One borderless, always-on-top window whose inside is see-through and click-through, so the area being read is visible and adjustable at all times without getting in the way of the call. |
 | Multi-monitor DPI coordinates | Per-monitor DPI awareness (`shcore.SetProcessDpiAwareness`, set before any window is created) | Without this, Windows virtualizes window/monitor coordinates for the process on any monitor that isn't running the primary monitor's DPI scale, which would throw `GetWindowRect` and mss's screen capture out of sync with each other on a mixed-DPI multi-monitor setup. |
 | Handoff to Copilot Studio | One-way file drop (see below), no API call, no response | Governance doesn't allow calling a third-party AI API directly. This app's scope ends at recording and handing off; managing/parsing the information is Copilot Studio's job, not this app's. |
 | Packaging | PyInstaller, one-file build | Produces the standalone `.exe` the project requires. |
@@ -107,8 +106,9 @@ src/meeting_scribe/
   audio/recorder.py   # mic + WASAPI loopback capture (Windows-only at runtime)
   audio/device_picker.py  # enumerates mic/speaker devices so one can be picked instead of the OS default
   screen/capture.py   # periodic screenshot + OCR, deduplicated, optionally scoped to one window or area
-  screen/window_picker.py  # enumerates open windows so one can be picked as the OCR target
-  screen/region_picker.py  # drag-to-select a custom OCR rectangle + its on-screen boundary outline
+  screen/ocr_box.py   # the on-screen OCR box: drag to move, handles to resize, Start/Stop OCR button
+  screen/window_picker.py  # finds the Teams call window (meeting name, where to place prompts and the box)
+  screen/region_picker.py  # drag-to-select a rectangle (used for Capture Attendees)
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
   ai/copilot_push.py    # one-way, named-file-package drop of a finished meeting to Copilot Studio
   storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents

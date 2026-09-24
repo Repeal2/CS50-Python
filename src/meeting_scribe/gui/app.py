@@ -27,6 +27,7 @@ from meeting_scribe.config import (
     update_copilot_settings,
     update_diarize_system_audio,
     update_meeting_hotkeys,
+    update_ocr_area,
     update_runpod_settings,
     update_whisper_model_size,
 )
@@ -41,20 +42,13 @@ from meeting_scribe.hotkeys import (
 )
 from meeting_scribe.screen.capture import ocr_region
 from meeting_scribe.screen.meeting_detector import (
-    after_screen_window_closed,
     DetectedMeeting,
     MeetingEndTracker,
     MeetingPromptTracker,
     detect_teams_meeting,
 )
-from meeting_scribe.screen.region_picker import (
-    RegionOutline,
-    RegionTarget,
-    WindowRegionTarget,
-    pick_region_interactively,
-    pin_region_to_window,
-)
-from meeting_scribe.screen.window_picker import WindowTarget, is_teams_window, window_exists
+from meeting_scribe.screen.ocr_box import OcrAreaBox, default_area, keep_on_screen, overlaps
+from meeting_scribe.screen.region_picker import RegionTarget, pick_region_interactively
 from meeting_scribe.session import MeetingSession, meeting_in_progress, retry_meeting_transcription
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
@@ -140,8 +134,8 @@ def _format_meeting_timestamp(iso_string: str) -> str:
 
 def _has_no_mic_signal(problems: "tuple[str, ...]") -> bool:
     """Whether `problems` (as returned by MeetingSession.input_problems()) currently includes the mic
-    reading digital silence — used to flash the OCR region outline red (see
-    RecordTab._refresh_input_warnings / screen.region_picker.RegionOutline.set_alert). Matches the exact
+    reading digital silence — used to flash the OCR box red (see
+    RecordTab._refresh_input_warnings / screen.ocr_box.OcrAreaBox.set_alert). Matches the exact
     wording audio.recorder._describe_stream_problem uses for that case ("no signal at all ... digital
     silence" — see its own "digital silence" test) rather than re-deriving the condition from scratch, so
     this stays in lockstep with whatever counts as that warning there."""
@@ -176,18 +170,6 @@ def _enumerate_devices() -> tuple[list, list]:
         return list_input_devices(), list_loopback_devices()
     except RuntimeError:
         return [], []
-
-
-def _hwnd_to_watch_for_auto_stop(
-    target: "WindowTarget | RegionTarget | WindowRegionTarget | None",
-) -> int | None:
-    """The window handle "Stop when the screen-source window closes" should watch for this screen
-    target, or None if there isn't one to watch. A plain RegionTarget (fixed screen coordinates) and
-    "Entire screen" (None) have no associated window, so the checkbox simply has no effect when either is
-    selected — there's nothing for it to notice closing."""
-    if isinstance(target, (WindowTarget, WindowRegionTarget)):
-        return target.hwnd
-    return None
 
 
 def _add_scrollable_text_tab(notebook: ttk.Notebook, title: str) -> tk.Text:
@@ -597,7 +579,7 @@ class MeetingScribeApp(tk.Tk):
                 session.abandon()
             except Exception:  # closing must still go ahead; the audio on disk is what matters
                 self._report_callback_exception(*sys.exc_info())
-        self._record_tab.close_region_outline()
+        self._record_tab.close_ocr_box()
         self.db.close()
         self.destroy()
 
@@ -612,28 +594,14 @@ class MeetingScribeApp(tk.Tk):
 
 
 class RecordTab(ttk.Frame):
-    ENTIRE_SCREEN_LABEL = "Entire screen"
-    PIN_NONE_LABEL = "(fixed position)"
     # Long enough to say a sentence into the microphone, short enough that nobody skips the test.
     MIC_TEST_SECONDS = 3.0
-    # How often _poll_auto_stop checks whether a watched screen-source window has closed. Frequent enough
-    # that "forgot to click Stop" doesn't leave a meeting recording for long after the call actually
-    # ended; infrequent enough that it's not worth its own tighter polling loop than that.
-    _AUTO_STOP_POLL_MS = 2000
 
     def __init__(self, parent: ttk.Notebook, app: MeetingScribeApp):
         super().__init__(parent)
         self.app = app
-        self._window_targets: list = []
-        self._region_target: RegionTarget | WindowRegionTarget | None = None
-        self._region_outline: RegionOutline | None = None
-        # What _poll_auto_stop watches: the recording session, the window its on-screen capture is
-        # pointed at, whether that's a Teams window, and whether "Stop recording when the screen-source
-        # window closes" was checked at Start — None when the screen source has no window ("Entire
-        # screen", a fixed area). Comparing the session by identity is what makes this automatically
-        # inert the instant Stop is pressed or a different meeting starts. See
-        # meeting_detector.after_screen_window_closed for what happens when the window closes.
-        self._auto_stop_watch: tuple[MeetingSession, int, bool, bool] | None = None
+        # The on-screen OCR box for the meeting being recorded — see screen.ocr_box. None while idle.
+        self._ocr_box: OcrAreaBox | None = None
         self._input_devices: list = []
         self._loopback_devices: list = []
         # Which session's recorder notices have already been written to the activity log, how many of
@@ -665,46 +633,16 @@ class RecordTab(ttk.Frame):
         self.title_combo.grid(row=1, column=1, sticky="we", padx=6, pady=4)
         self.title_var.trace_add("write", self._on_title_changed)
 
-        ttk.Label(form, text="Screen source").grid(row=2, column=0, sticky="w")
-        self.source_var = tk.StringVar(value=self.ENTIRE_SCREEN_LABEL)
-        self.source_combo = ttk.Combobox(
-            form, textvariable=self.source_var, width=40, state="readonly"
-        )
-        self.source_combo.grid(row=2, column=1, sticky="we", padx=6, pady=4)
-        self.source_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_region_outline())
-        source_buttons = ttk.Frame(form)
-        source_buttons.grid(row=2, column=2, padx=(6, 0))
-        ttk.Button(source_buttons, text="Refresh windows", command=self._refresh_windows).pack(
-            side="left"
-        )
-        ttk.Button(source_buttons, text="Select area…", command=self._pick_region).pack(
-            side="left", padx=(4, 0)
-        )
-
-        # "(fixed position)" keeps the area at whatever screen coordinates it was drawn at; picking a
-        # window here instead pins it to that window's current bounds, so a later "Select area…" makes
-        # a WindowRegionTarget (offset from the window's corner) rather than a plain RegionTarget — see
-        # _pick_region. Moving/dragging that window afterwards, including to another monitor, moves the
-        # captured area with it, the same way whole-window capture already does.
-        ttk.Label(form, text="Pin area to window").grid(row=3, column=0, sticky="w")
-        self.pin_window_var = tk.StringVar(value=self.PIN_NONE_LABEL)
-        self.pin_window_combo = ttk.Combobox(
-            form, textvariable=self.pin_window_var, width=40, state="readonly"
-        )
-        self.pin_window_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
-
-        # Off by default, and only meaningful when the screen source picked at Start is a specific
-        # window or an area pinned to one (see _hwnd_to_watch_for_auto_stop) — there's no window handle
-        # to watch for "Entire screen" or a fixed-position area, so checking this with either of those
-        # selected simply has no effect. Read once at Start, like screen_target itself; changing the
-        # dropdown or this checkbox mid-meeting doesn't retroactively change what's being watched.
-        ttk.Label(form, text="Auto-stop").grid(row=4, column=0, sticky="w")
-        self.stop_on_window_close_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        # On-screen text is read from whatever's inside the OCR box, which appears when a meeting starts
+        # — see screen.ocr_box and _start. Nothing is read until Start OCR is pressed on the box itself.
+        ttk.Label(form, text="On-screen text").grid(row=2, column=0, sticky="w")
+        ttk.Label(
             form,
-            text="Stop recording when the screen-source window closes",
-            variable=self.stop_on_window_close_var,
-        ).grid(row=4, column=1, sticky="w", padx=6, pady=4)
+            text="A box appears when recording starts — drag it over what to read, then press Start OCR on it.",
+            wraplength=360,
+            foreground="#555",
+        ).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Button(form, text="Reset box position", command=self._reset_ocr_box).grid(row=2, column=2, padx=(6, 0))
 
         ttk.Label(form, text="Microphone").grid(row=5, column=0, sticky="w")
         self.mic_var = tk.StringVar(value=self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
@@ -820,11 +758,8 @@ class RecordTab(ttk.Frame):
         output_scrollbar.pack(side="right", fill="y")
 
         self.refresh_projects()
-        self._refresh_windows()
         self._refresh_devices()
         self._poll_audio_levels()
-        self._poll_region_outline()
-        self._poll_auto_stop()
 
     def refresh_projects(self) -> None:
         names = [p.name for p in self.app.db.list_projects()]
@@ -893,7 +828,7 @@ class RecordTab(ttk.Frame):
         the first time each appears — noticing now beats finding out when the transcript comes back with
         one side of the conversation missing.
 
-        A dead-silent mic additionally flashes the OCR region outline red (see _sync_alert_outline) —
+        A dead-silent mic additionally flashes the OCR box red (see _sync_alert_outline) —
         right at the thing a user is actually looking at during a meeting, not just another line in an
         activity log they may not have scrolled to."""
         if session is not self._notice_session:
@@ -920,8 +855,8 @@ class RecordTab(ttk.Frame):
         self._sync_alert_outline(no_mic_signal=_has_no_mic_signal(problems))
 
     def _sync_alert_outline(self, *, no_mic_signal: bool) -> None:
-        if self._region_outline is not None:
-            self._region_outline.set_alert(no_mic_signal)
+        if self._ocr_box is not None:
+            self._ocr_box.set_alert(no_mic_signal)
 
     def _test_microphone(self) -> None:
         """Listens to the selected microphone for a few seconds and reports what it actually heard.
@@ -961,59 +896,6 @@ class RecordTab(ttk.Frame):
         self.test_mic_button["state"] = "normal"
         self.test_mic_button["text"] = "Test mic…"
 
-    def _poll_region_outline(self) -> None:
-        """Keeps a window-pinned custom area's on-screen outline glued to its window as the window
-        moves — including across monitors — by re-reading the window's current bounds on a timer, the
-        same idea as _poll_audio_levels. A plain (unpinned) area never moves, so there's nothing to do
-        for it here; _sync_region_outline positions it once, when it's picked or selected."""
-        if self._region_outline is not None and isinstance(self._region_target, WindowRegionTarget):
-            rect = self._current_absolute_rect(self._region_target)
-            if rect is not None:
-                self._region_outline.reposition(rect)
-        self.after(400, self._poll_region_outline)
-
-    def _poll_auto_stop(self) -> None:
-        """Stops the currently recording meeting on its own once its screen-source window (a specific
-        window, or an area pinned to one) closes — for apps like Teams/Zoom that open a distinct call
-        window and close it, not just minimize it, the instant the call ends, this means a forgotten Stop
-        button doesn't leave the meeting recording indefinitely. Only in effect when "Stop when the
-        screen-source window closes" was checked at Start (see _start's use of
-        _hwnd_to_watch_for_auto_stop) — a no-op otherwise, including for "Entire screen" or a
-        fixed-position area, neither of which has a window to watch."""
-        try:
-            self._check_screen_window()
-        finally:
-            self.after(self._AUTO_STOP_POLL_MS, self._poll_auto_stop)
-
-    def _check_screen_window(self) -> None:
-        if self._auto_stop_watch is None:
-            return
-        session, hwnd, was_teams, auto_stop = self._auto_stop_watch
-        if session is not self.app._session:
-            self._auto_stop_watch = None
-            return
-        if window_exists(hwnd):
-            return
-        detected = self.app._detected_meeting
-        teams_hwnd = detected.window.hwnd if detected is not None and detected.window is not None else None
-        action, new_hwnd = after_screen_window_closed(
-            watched_was_teams=was_teams,
-            in_teams_call=detected is not None,
-            teams_window_hwnd=teams_hwnd,
-            watched_hwnd=hwnd,
-            auto_stop=auto_stop,
-        )
-        if action == "follow":
-            session.follow_screen_window(new_hwnd)
-            self._auto_stop_watch = (session, new_hwnd, True, auto_stop)
-            self._log(f"[{session.title}] Teams moved the call to a new window — on-screen capture follows it.")
-        elif action == "stop":
-            self._auto_stop_watch = None
-            self._log(f'[{session.title}] Screen-source window closed — stopping automatically.')
-            self._stop()
-        elif action == "forget":
-            self._auto_stop_watch = None
-
     def select_project(self, name: str) -> None:
         self.project_var.set(name)
 
@@ -1023,98 +905,111 @@ class RecordTab(ttk.Frame):
         self.mic_var.set(self.app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
         self.system_var.set(self.app.settings.system_device_name or SYSTEM_DEFAULT_LABEL)
 
-    def _refresh_windows(self) -> None:
-        """Repopulates the screen-source dropdown with currently open, titled windows the user can
-        pick as an OCR target instead of the whole screen (e.g. just the Teams/Zoom window). Keeps
-        whatever custom area is currently picked (if any) as an option alongside them. Also repopulates
-        the "pin area to window" dropdown from the same window list, so a window that's closed since the
-        last refresh disappears from both."""
-        from meeting_scribe.screen.window_picker import list_capturable_windows
+    # --- the OCR box -------------------------------------------------------------------------------
+
+    def _virtual_screen(self) -> dict | None:
+        """Every monitor together, as one mss-style rect — what the box is kept inside."""
+        try:
+            import mss
+
+            with mss.mss() as sct:
+                return dict(sct.monitors[0])
+        except Exception:
+            return None
+
+    def _default_ocr_area(self) -> dict:
+        """Where a box that has never been placed goes: over the bottom of the Teams call window if one
+        is open (where live captions appear), otherwise the middle of the main screen."""
+        from meeting_scribe.screen.window_picker import (
+            find_teams_meeting_window,
+            get_monitor_work_area,
+            get_window_region,
+        )
+
+        window_rect = None
+        try:
+            teams = find_teams_meeting_window()
+            if teams is not None:
+                window_rect = get_window_region(teams.hwnd)
+        except Exception:
+            window_rect = None
+        try:
+            work_area = get_monitor_work_area(None)
+        except Exception:
+            work_area = {
+                "left": 0, "top": 0, "width": self.winfo_screenwidth(), "height": self.winfo_screenheight()
+            }
+        return default_area(work_area, window_rect)
+
+    def _initial_ocr_area(self) -> dict:
+        """Where the last meeting's box was left, if that's still on a connected screen; else the
+        default place."""
+        saved = self.app.settings.ocr_area
+        screen = self._virtual_screen()
+        if saved is not None:
+            area = dict(zip(("left", "top", "width", "height"), saved))
+            if screen is None:
+                return area
+            if overlaps(area, screen):
+                return keep_on_screen(area, screen)
+        area = self._default_ocr_area()
+        return keep_on_screen(area, screen) if screen is not None else area
+
+    def _show_ocr_box(self, session: MeetingSession, area: dict) -> None:
+        self.close_ocr_box()
+
+        def area_changed(new_area: dict) -> None:
+            if self.app._session is session:
+                session.set_screen_area(new_area)
+            self._remember_ocr_area(new_area)
+
+        def toggle() -> None:
+            if self.app._session is not session or self._ocr_box is None:
+                return
+            reading = not session.screen_reading
+            session.set_screen_reading(reading)
+            self._ocr_box.set_reading(reading)
+            area_now = self._ocr_box.area
+            if reading:
+                self._log(
+                    f"[{session.title}] OCR started — reading the {area_now['width']}x{area_now['height']} "
+                    "area inside the box."
+                )
+            else:
+                self._log(f"[{session.title}] OCR paused.")
 
         try:
-            self._window_targets = list_capturable_windows()
-        except RuntimeError:
-            self._window_targets = []  # not on Windows (e.g. dev machine) — whole-screen only
-        region_labels = [self._region_target.label] if self._region_target else []
-        values = [self.ENTIRE_SCREEN_LABEL] + region_labels + [w.title for w in self._window_targets]
-        self.source_combo["values"] = values
-        if self.source_var.get() not in values:
-            self.source_var.set(self.ENTIRE_SCREEN_LABEL)
+            self._ocr_box = OcrAreaBox(
+                self, area, on_area_changed=area_changed, on_toggle=toggle, bounds=self._virtual_screen()
+            )
+        except Exception as exc:  # the meeting still records audio without it
+            self._ocr_box = None
+            self._log(f"[{session.title}] Couldn't show the OCR box: {exc}")
 
-        pin_values = [self.PIN_NONE_LABEL] + [w.title for w in self._window_targets]
-        self.pin_window_combo["values"] = pin_values
-        if self.pin_window_var.get() not in pin_values:
-            self.pin_window_var.set(self.PIN_NONE_LABEL)
-        self._sync_region_outline()
+    def _remember_ocr_area(self, area: dict) -> None:
+        self.app.settings = update_ocr_area(
+            self.app.settings, ocr_area=(area["left"], area["top"], area["width"], area["height"])
+        )
 
-    def _pick_region(self) -> None:
-        """Opens the drag-to-select overlay, and if the user completes a selection, adds it to the
-        screen-source dropdown as a new option and switches to it immediately. If a window is chosen in
-        the "pin area to window" dropdown, the drawn rectangle is converted to an offset from that
-        window's current position (WindowRegionTarget) instead of a fixed screen rectangle, so it keeps
-        capturing the same part of the window even after the window moves — including to another
-        monitor. A window that's closed/minimized right when "Select area…" is clicked has no current
-        position to measure the offset from, so that case falls back to a fixed-position area, same as
-        leaving the pin dropdown on "(fixed position)"."""
-        region = pick_region_interactively(self)
-        if region is None:
-            return
+    def _reset_ocr_box(self) -> None:
+        """Puts the box back at its default place — for one that ended up somewhere awkward. Works
+        mid-meeting too; the area being read moves with it."""
+        area = self._default_ocr_area()
+        screen = self._virtual_screen()
+        if screen is not None:
+            area = keep_on_screen(area, screen)
+        self._remember_ocr_area(area)
+        session = self.app._session
+        if self._ocr_box is not None:
+            self._ocr_box.set_area(area)
+            if session is not None:
+                session.set_screen_area(area)
 
-        window = next((w for w in self._window_targets if w.title == self.pin_window_var.get()), None)
-        if window is not None:
-            from meeting_scribe.screen.window_picker import get_window_region
-
-            window_rect = get_window_region(window.hwnd)
-            if window_rect is not None:
-                region = pin_region_to_window(region, window, window_rect)
-
-        self._region_target = region
-        self._refresh_windows()
-        self.source_var.set(region.label)
-        self._sync_region_outline()
-
-    def _current_absolute_rect(self, target: RegionTarget | WindowRegionTarget) -> dict | None:
-        """Resolves a region target to an mss-style {left, top, width, height} rect in current screen
-        coordinates — a fixed RegionTarget already is one; a WindowRegionTarget needs its pinned
-        window's current bounds re-read first. None if a pinned window has since closed or minimized,
-        in which case there's nowhere on screen to draw the outline right now."""
-        if isinstance(target, RegionTarget):
-            return target.mss_region
-        from meeting_scribe.screen.window_picker import get_window_region
-
-        window_rect = get_window_region(target.hwnd)
-        return None if window_rect is None else target.mss_region(window_rect)
-
-    def _sync_region_outline(self) -> None:
-        """Shows a live boundary around the custom area on screen for as long as it's the selected
-        screen source — not just at the moment it was drawn — so it's always obvious what's being
-        captured, the same idea as the audio level meters. Hides it the moment something else is
-        picked instead. For a window-pinned area this only sets the *initial* position;
-        _poll_region_outline keeps it glued to the window's current position afterwards."""
-        if self._region_outline is not None:
-            self._region_outline.close()
-            self._region_outline = None
-        if self._region_target is not None and self.source_var.get() == self._region_target.label:
-            rect = self._current_absolute_rect(self._region_target)
-            if rect is not None:
-                self._region_outline = RegionOutline(self, rect)
-
-    def close_region_outline(self) -> None:
-        """Called when a meeting stops (nothing is being captured anymore, so the boundary shouldn't
-        linger on screen) and on app shutdown (so the boundary windows don't outlive the main window).
-        _start() calls _sync_region_outline() again, which re-shows it if the same area is still
-        selected for the next meeting."""
-        if self._region_outline is not None:
-            self._region_outline.close()
-            self._region_outline = None
-
-    def _selected_screen_target(self):
-        selected = self.source_var.get()
-        if selected == self.ENTIRE_SCREEN_LABEL:
-            return None
-        if self._region_target is not None and selected == self._region_target.label:
-            return self._region_target
-        return next((w for w in self._window_targets if w.title == selected), None)
+    def close_ocr_box(self) -> None:
+        """Called when a meeting stops, and on app shutdown, so the box never outlives what it's for."""
+        if self._ocr_box is not None:
+            self._ocr_box.close()
+            self._ocr_box = None
 
     def _detect_meeting_title(self) -> str | None:
         """Best-effort autofill for a still-default meeting title, from whichever Teams window looks
@@ -1188,7 +1083,10 @@ class RecordTab(ttk.Frame):
         meeting_title = self.title_var.get().strip() or DEFAULT_MEETING_TITLE
         if meeting_title == DEFAULT_MEETING_TITLE:
             meeting_title = self._detect_meeting_title() or DEFAULT_MEETING_TITLE
-        screen_target = self._selected_screen_target()
+        ocr_area = self._initial_ocr_area()
+        screen_target = RegionTarget(
+            left=ocr_area["left"], top=ocr_area["top"], width=ocr_area["width"], height=ocr_area["height"]
+        )
         try:
             session = MeetingSession(
                 self.app.settings,
@@ -1196,6 +1094,7 @@ class RecordTab(ttk.Frame):
                 project_name,
                 meeting_title,
                 screen_target=screen_target,
+                read_screen=False,
             )
             session.start()
         except Exception as exc:  # a missing/unavailable audio device raises OSError, not RuntimeError
@@ -1212,17 +1111,6 @@ class RecordTab(ttk.Frame):
         # a placeholder that isn't reflected in the field it stands in for isn't actually saved anywhere.
         self.project_var.set(project_name)
         self.title_var.set(meeting_title)
-        # Only takes effect if the screen source has a window to watch in the first place — see
-        # _hwnd_to_watch_for_auto_stop — and only for this meeting: unchecking the box or changing the
-        # screen source afterwards doesn't retroactively stop watching (or start watching) anything.
-        watched_hwnd = _hwnd_to_watch_for_auto_stop(screen_target)
-        self._auto_stop_watch = None
-        if watched_hwnd is not None:
-            try:
-                was_teams = is_teams_window(watched_hwnd)
-            except Exception:
-                was_teams = False
-            self._auto_stop_watch = (session, watched_hwnd, was_teams, bool(self.stop_on_window_close_var.get()))
         self.status_var.set(f"Recording — {project_name} / {meeting_title}")
         self.start_button["state"] = "disabled"
         self.stop_button["state"] = "normal"
@@ -1234,8 +1122,11 @@ class RecordTab(ttk.Frame):
         # Deliberately not cleared here: a previous meeting's background finish-up job (see _stop())
         # may still be logging its own progress, and wiping the log out from under it would lose that
         # context. The [title] prefix on every line is what keeps overlapping meetings' entries readable.
-        self._log(f'[{meeting_title}] Recording started — Project: {project_name}.')
-        self._sync_region_outline()
+        self._log(
+            f"[{meeting_title}] Recording started — Project: {project_name}. Place the OCR box over what "
+            "to read, then press Start OCR on it."
+        )
+        self._show_ocr_box(session, ocr_area)
 
     def _schedule_manual_notes_save(self, _event=None) -> None:
         """Debounces saving to the DB so a fast typist doesn't trigger a write on every keystroke —
@@ -1304,10 +1195,6 @@ class RecordTab(ttk.Frame):
         # captured in this closure, so the app has no more use for the "current" session slot.
         self.app._session = None
         self.app.close_meeting_prompts()
-        # Redundant when _poll_auto_stop is what called _stop() (it already cleared this before doing
-        # so), but necessary for a manual click on the Stop button — either way, nothing should still be
-        # watching a session that's no longer the active one.
-        self._auto_stop_watch = None
 
         self.stop_button["state"] = "disabled"
         self.capture_attendees_button["state"] = "disabled"
@@ -1315,10 +1202,8 @@ class RecordTab(ttk.Frame):
         self.start_button["state"] = "normal"
         self.status_var.set(f'Idle — finishing "{session.title}" in the background.')
         self._log(f'[{session.title}] Stop requested — finishing in the background.')
-        # The custom-area boundary is a "this is what's being captured" indicator — leaving it on screen
-        # after recording stops is just a stray colored box with nothing behind it. _start() re-shows it
-        # if the same area is still selected next time.
-        self.close_region_outline()
+        # Nothing is being read any more; _start() shows the box again, where it was left.
+        self.close_ocr_box()
 
         def worker() -> None:
             def report(message: str) -> None:
