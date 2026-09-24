@@ -11,6 +11,9 @@ doesn't wait for the previous one to finish transcribing/saving.
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -34,6 +37,81 @@ from meeting_scribe.transcription.engine import (
 )
 
 _WAITING_FOR_TRANSCRIPTION_MESSAGE = "Waiting for another meeting's transcription to finish first…"
+
+# The on-screen text a meeting's OCR picked up, one JSON line per event, written as each one arrives —
+# see _ScreenTextLog.
+SCREEN_TEXT_FILENAME = "screen_text.jsonl"
+
+# Meetings being recorded, finished (transcribed, pushed, saved) or retried right now. Until one of these
+# is done, its database row looks exactly like a meeting whose transcription failed (no end time, no
+# transcript) — which is what the Projects tab offers Retry for. Retrying a meeting that's still being
+# recorded transcribed the audio captured so far, sent it to Runpod partway through the call, and marked
+# the meeting finished with that partial transcript; so a meeting in here can't be retried.
+_meetings_in_progress: set[int] = set()
+_meetings_in_progress_lock = threading.Lock()
+
+
+def meeting_in_progress(meeting_id: int) -> bool:
+    """Whether this meeting is still being recorded, finished or retried in this process."""
+    with _meetings_in_progress_lock:
+        return meeting_id in _meetings_in_progress
+
+
+def _claim_meeting(meeting_id: int) -> bool:
+    with _meetings_in_progress_lock:
+        if meeting_id in _meetings_in_progress:
+            return False
+        _meetings_in_progress.add(meeting_id)
+        return True
+
+
+def _release_meeting(meeting_id: int) -> None:
+    with _meetings_in_progress_lock:
+        _meetings_in_progress.discard(meeting_id)
+
+
+class _ScreenTextLog:
+    """Keeps a meeting's OCR events both in memory and in a file beside its audio, appended as each one
+    arrives. They used to live only in memory until the meeting finished, so anything that stopped the
+    meeting from finishing — a transcription crash, the app being closed — lost every on-screen line,
+    and a retried transcript could only ever cover the audio. Written line by line and flushed each
+    time, so a crash loses at most the line being written."""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._lock = threading.Lock()
+        self.events: list[ScreenTextEvent] = []
+
+    def append(self, event: ScreenTextEvent) -> None:
+        with self._lock:
+            self.events.append(event)
+            try:
+                with open(self._path, "a", encoding="utf-8") as file:
+                    file.write(json.dumps({"t": event.timestamp_seconds, "text": event.text}) + "\n")
+            except OSError:
+                pass  # the in-memory copy still makes it into the transcript
+
+    def snapshot(self) -> list[ScreenTextEvent]:
+        with self._lock:
+            return list(self.events)
+
+
+def load_screen_text_events(meeting_dir: Path) -> list[ScreenTextEvent]:
+    """The OCR events a meeting saved as it went (see _ScreenTextLog) — empty if there are none. A line
+    that can't be read (the last one, cut off by a crash) is skipped rather than failing the rest."""
+    path = meeting_dir / SCREEN_TEXT_FILENAME
+    events: list[ScreenTextEvent] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return events
+    for line in lines:
+        try:
+            record = json.loads(line)
+            events.append(ScreenTextEvent(float(record["t"]), str(record["text"])))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return events
 
 
 @dataclass(frozen=True)
@@ -151,13 +229,13 @@ class MeetingSession:
             auto_microphone=settings.auto_switch_audio_devices,
             headset_microphone_name=settings.headset_microphone_name,
         )
-        self._screen_events: list[ScreenTextEvent] = []
+        self._screen_text = _ScreenTextLog(meeting_dir / SCREEN_TEXT_FILENAME)
         # Timestamped speaker-name-badge sightings, kept alongside the caption stream — not used for
         # anything yet, but this is the raw material a future system-audio diarization pass would line up
         # against WhisperX speaker clusters to turn "SPEAKER_00" into a real name.
         self._speaker_name_events: list[SpeakerNameEvent] = []
         self._screen_watcher = ScreenWatcher(
-            on_text=self._screen_events.append,
+            on_text=self._screen_text.append,
             on_speaker_name=self._speaker_name_events.append,
             interval_seconds=settings.screen_capture_interval_seconds,
             tesseract_cmd=settings.tesseract_cmd,
@@ -166,8 +244,30 @@ class MeetingSession:
         self._transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
 
     def start(self) -> None:
-        self._recorder.start()
+        _claim_meeting(self.meeting_id)
+        try:
+            self._recorder.start()
+        except BaseException:
+            _release_meeting(self.meeting_id)
+            raise
         self._screen_watcher.start()
+
+    @property
+    def screen_target(self):
+        return self._screen_watcher.target
+
+    def follow_screen_window(self, hwnd: int, title: str | None = None) -> None:
+        """Points on-screen text capture at a different window, keeping any custom area within it —
+        for when the call moves to a new window mid-meeting (Teams replaces its call window when the
+        meeting moves from the lobby into the call, or is popped out). Capture otherwise stops for good
+        the moment the window it was pointed at closes. A no-op for the whole screen or a fixed area."""
+        target = self._screen_watcher.target
+        if isinstance(target, WindowTarget):
+            self._screen_watcher.set_target(WindowTarget(hwnd=hwnd, title=title or target.title))
+        elif isinstance(target, WindowRegionTarget):
+            self._screen_watcher.set_target(
+                dataclasses.replace(target, hwnd=hwnd, window_title=title or target.window_title)
+            )
 
     def switch_mic_device(self, device_name: str | None) -> None:
         """Moves the mic recording to a different device mid-meeting instead of the old silent no-op
@@ -226,12 +326,14 @@ class MeetingSession:
         return self._recorder.input_problems()
 
     def abandon(self) -> None:
-        """Stops capturing without transcribing — for the app closing mid-meeting. The WAV files are
-        finalized on disk and the meeting is left unfinished (no transcript), which is exactly the state
-        retry_meeting_transcription picks up from later. On-screen OCR text is lost, same as for any
-        other retry."""
-        self._screen_watcher.stop()
-        self._recorder.stop()
+        """Stops capturing without transcribing — for the app closing mid-meeting. The WAV files and the
+        on-screen text log are finalized on disk and the meeting is left unfinished (no transcript),
+        which is exactly the state retry_meeting_transcription picks up from later."""
+        try:
+            self._screen_watcher.stop()
+            self._recorder.stop()
+        finally:
+            _release_meeting(self.meeting_id)
 
     def stop(self, on_progress: Callable[[str], None] | None = None) -> str:
         """Stops recording, transcribes, pushes the meeting to Copilot Studio (if configured), and saves
@@ -246,7 +348,15 @@ class MeetingSession:
             if on_progress is not None:
                 on_progress(message)
 
+        try:
+            return self._stop(report)
+        finally:
+            _release_meeting(self.meeting_id)
+
+    def _stop(self, report: Callable[[str], None]) -> str:
         self._screen_watcher.stop()
+        for message in self._screen_watcher.notices():
+            report(message)
         recorded = self._recorder.stop()
         report("Recording stopped.")
         # A capture thread that died mid-meeting (device unplugged, disk full, a driver error), a
@@ -273,7 +383,7 @@ class MeetingSession:
                 self._transcriber.unload()
         screen_lines = [
             TranscriptLine(event.timestamp_seconds, "screen_ocr", event.text)
-            for event in self._screen_events
+            for event in self._screen_text.snapshot()
         ]
         report("Transcription complete.")
 
@@ -338,14 +448,29 @@ def retry_meeting_transcription(
     mic/system WAV files to disk before attempting it). This works from those files directly, so nothing
     has to be re-recorded.
 
-    On-screen OCR text isn't recoverable this way: it only ever lived in the failed MeetingSession's
-    in-memory `_screen_events` list, which was lost along with that session, so a retried transcript
-    covers spoken audio only — the GUI should make that limitation visible rather than presenting the
-    result as a complete redo.
+    On-screen OCR text is picked back up from the log the meeting wrote as it went (see _ScreenTextLog);
+    a meeting recorded before that log existed has none, and its retried transcript covers audio only.
 
-    Raises ValueError if the meeting (or its project) doesn't exist, or if the meeting already has a
-    transcript (nothing to retry); raises FileNotFoundError if no recorded audio can be found for it.
+    Raises ValueError if the meeting (or its project) doesn't exist, if the meeting already has a
+    transcript (nothing to retry), or if it's still being recorded or finished (see
+    meeting_in_progress); raises FileNotFoundError if no recorded audio can be found for it.
     """
+    if not _claim_meeting(meeting_id):
+        raise ValueError(
+            "That meeting is still being recorded or finished — its transcript will appear when it's done."
+        )
+    try:
+        return _retry_meeting_transcription(settings, db, meeting_id, on_progress)
+    finally:
+        _release_meeting(meeting_id)
+
+
+def _retry_meeting_transcription(
+    settings: Settings,
+    db: Database,
+    meeting_id: int,
+    on_progress: Callable[[str], None] | None,
+) -> str:
 
     def report(message: str) -> None:
         if on_progress is not None:
@@ -387,14 +512,18 @@ def retry_meeting_transcription(
             transcriber.unload()
     report("Transcription complete.")
 
+    screen_lines = [
+        TranscriptLine(event.timestamp_seconds, "screen_ocr", event.text)
+        for event in load_screen_text_events(meeting_dir)
+    ]
     audio_lines = merge_transcript_lines(mic_lines, system.primary)
-    transcript_text = render_transcript(audio_lines)
+    transcript_text = render_transcript(merge_transcript_lines(audio_lines, screen_lines))
 
     # Clears any segments a previous, partially-successful retry left behind (e.g. one that transcribed
     # fine but then failed pushing to Copilot Studio) before inserting this attempt's — otherwise a
     # second retry would leave both attempts' segments sitting side by side.
     db.clear_transcript_segments(meeting_id)
-    _save_segments(db, meeting_id, mic_lines, system, screen_lines=[])
+    _save_segments(db, meeting_id, mic_lines, system, screen_lines)
 
     if settings.copilot_sync_dir is not None:
         text_reference_documents = []
@@ -415,8 +544,8 @@ def retry_meeting_transcription(
             meeting_code=meeting.meeting_code,
             project_name=project.name,
             meeting_title=meeting.title,
-            audio_transcript_text=transcript_text,
-            screen_transcript_text="",
+            audio_transcript_text=render_transcript(audio_lines),
+            screen_transcript_text=render_transcript(screen_lines),
             reference_documents=reference_documents,
             text_reference_documents=text_reference_documents,
             inbox_dir=settings.copilot_inbox_dir,

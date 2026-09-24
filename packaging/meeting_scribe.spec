@@ -28,6 +28,8 @@ hidden_imports = (
     collect_submodules("faster_whisper")
     + collect_submodules("ctranslate2")
     + (["pyaudiowpatch", "win32gui", "win32con", "win32api", "win32process"] if sys.platform == "win32" else [])
+    # audio.call_devices imports these lazily (inside functions), which PyInstaller's import scan can't see.
+    + (collect_submodules("pycaw") + ["comtypes", "comtypes.client", "psutil"] if sys.platform == "win32" else [])
 )
 
 vendored_tesseract = Path(SPECPATH) / "vendor" / "tesseract"

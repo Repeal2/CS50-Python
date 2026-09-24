@@ -267,3 +267,35 @@ def test_prompt_follows_a_window_on_a_monitor_left_of_the_primary():
 
 def test_prompt_with_no_window_goes_bottom_center_of_the_work_area():
     assert prompt_position(None, WORK_AREA, width=300, height=90) == (810, 942)
+
+
+# --- the screen-source window closing mid-meeting --------------------------------------------------------
+
+from meeting_scribe.screen.meeting_detector import after_screen_window_closed  # noqa: E402
+
+
+def _closed(**overrides):
+    kwargs = dict(watched_was_teams=True, in_teams_call=True, teams_window_hwnd=2, watched_hwnd=1, auto_stop=True)
+    kwargs.update(overrides)
+    return after_screen_window_closed(**kwargs)
+
+
+def test_a_teams_call_that_moved_to_a_new_window_is_followed_rather_than_stopped():
+    # The field case: Teams replaced its call window mid-meeting, "stop when the window closes" stopped
+    # the recording, and what had been recorded so far went off to be transcribed while the call went on.
+    assert _closed() == ("follow", 2)
+    assert _closed(auto_stop=False) == ("follow", 2)
+
+
+def test_while_teams_is_still_in_the_call_without_a_new_window_recording_carries_on():
+    assert _closed(teams_window_hwnd=None) == ("wait", None)
+    assert _closed(teams_window_hwnd=1) == ("wait", None)
+
+
+def test_once_the_call_has_ended_the_recording_stops_if_asked_to():
+    assert _closed(in_teams_call=False) == ("stop", None)
+    assert _closed(in_teams_call=False, auto_stop=False) == ("forget", None)
+
+
+def test_a_window_that_was_not_teams_stops_as_before():
+    assert _closed(watched_was_teams=False) == ("stop", None)
