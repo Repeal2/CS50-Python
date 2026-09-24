@@ -5,6 +5,7 @@ import pytest
 from meeting_scribe.screen import meeting_detector
 from meeting_scribe.screen.meeting_detector import (
     DetectedMeeting,
+    MeetingEndTracker,
     MeetingPromptTracker,
     _is_teams_app_key,
     _mic_in_use,
@@ -185,6 +186,56 @@ def test_tracker_never_prompts_a_call_joined_while_already_recording():
 def test_tracker_hides_the_prompt_when_the_call_ends_unanswered():
     tracker = MeetingPromptTracker()
     tracker.update(in_call=True, recording=False)
+    assert not tracker.update(in_call=False, recording=False)
+
+
+def _end_tracker_after(polls):
+    """A MeetingEndTracker fed (in_call, recording) pairs; returns it and what the last update said."""
+    tracker = MeetingEndTracker()
+    shown = False
+    for in_call, recording in polls:
+        shown = tracker.update(in_call=in_call, recording=recording)
+    return tracker, shown
+
+
+def test_end_prompt_needs_the_call_gone_for_two_checks_in_a_row():
+    _, shown = _end_tracker_after([(True, True), (False, True)])
+    assert not shown
+    _, shown = _end_tracker_after([(True, True), (False, True), (False, True)])
+    assert shown
+
+
+def test_end_prompt_ignores_a_momentary_gap_in_the_call():
+    _, shown = _end_tracker_after([(True, True), (False, True), (True, True), (False, True)])
+    assert not shown
+
+
+def test_end_prompt_never_asks_about_a_recording_that_never_saw_a_teams_call():
+    _, shown = _end_tracker_after([(False, True)] * 5)
+    assert not shown
+
+
+def test_end_prompt_stays_up_until_answered_then_not_again_for_that_call():
+    tracker, shown = _end_tracker_after([(True, True), (False, True), (False, True), (False, True)])
+    assert shown
+    tracker.dismiss()
+    assert not tracker.update(in_call=False, recording=True)
+    assert not tracker.update(in_call=False, recording=True)
+
+
+def test_end_prompt_asks_again_if_the_call_is_rejoined_and_ends_again():
+    tracker, _ = _end_tracker_after([(True, True), (False, True), (False, True)])
+    tracker.dismiss()
+    for in_call in (True, False, False):
+        shown = tracker.update(in_call=in_call, recording=True)
+    assert shown
+
+
+def test_end_prompt_hides_when_the_call_is_rejoined_or_recording_stops():
+    tracker, _ = _end_tracker_after([(True, True), (False, True), (False, True)])
+    assert not tracker.update(in_call=True, recording=True)
+
+    tracker, _ = _end_tracker_after([(True, True), (False, True), (False, True)])
     assert not tracker.update(in_call=False, recording=False)
 
 
