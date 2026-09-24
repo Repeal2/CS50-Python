@@ -156,12 +156,19 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
                 "Kickoff",
             )
             session.start()
-            result = session.stop()
+            progress = []
+            result = session.stop(on_progress=progress.append)
 
         # Credentials come from Settings, not environment variables.
-        MockRunpod.assert_called_once_with(
-            api_key="rp-key", endpoint_id="rp-endpoint", huggingface_token="hf-token"
+        kwargs = MockRunpod.call_args.kwargs
+        assert (kwargs["api_key"], kwargs["endpoint_id"], kwargs["huggingface_token"]) == (
+            "rp-key",
+            "rp-endpoint",
+            "hf-token",
         )
+        # Its progress lines go to the same place as the rest of stop()'s — the activity log.
+        kwargs["on_progress"]("Runpod job queued.")
+        assert progress[-1] == "Runpod job queued."
         MockRunpod.return_value.transcribe_parts.assert_called_once_with(
             recorder_instance.stop.return_value.system_paths, source="system"
         )

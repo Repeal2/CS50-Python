@@ -31,23 +31,27 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from meeting_scribe.transcription.engine import TranscriptLine, wav_duration_seconds
+from meeting_scribe.transcription.speech_encoding import EncodedChunk, encode_speech_chunks
 
 _API_KEY_ENV = "MEETING_SCRIBE_RUNPOD_API_KEY"
 _ENDPOINT_ID_ENV = "MEETING_SCRIBE_RUNPOD_ENDPOINT_ID"
 _HF_TOKEN_ENV = "MEETING_SCRIBE_RUNPOD_HF_TOKEN"
 
-# Base64-inlining the WAV into the job payload avoids needing any separate file host (S3/R2/etc.) to get
-# started, but Runpod's serverless queue API caps how big one job's request body can be — kodxana/
-# whisperx-worker_v2's README states this directly: 10MB for the async /run endpoint this module uses (20MB
-# for /runsync, which this module doesn't use). Above this, a real upload target + presigned URL (see
-# RunpodWhisperXTranscriber's `upload` argument) is the only option.
-_MAX_INLINE_AUDIO_BYTES = 10 * 1024 * 1024
+# Runpod caps one /run request body at 10 MB (kodxana/whisperx-worker_v2's README states this directly;
+# /runsync allows 20 MB, but this module doesn't use it). Audio goes inside the JSON body base64-encoded,
+# which inflates it by a third, so it's the encoded size that's checked against this, less some room for
+# the rest of the body.
+_MAX_REQUEST_BYTES = 10 * 1024 * 1024
+_REQUEST_OVERHEAD_BYTES = 16 * 1024
+# 45 minutes of 16 kbps Opus (see speech_encoding) is about 5 MB, ~7 MB once base64-encoded — a wide margin
+# under _MAX_REQUEST_BYTES even if a noisy recording makes Opus spend more than its target bitrate.
+_MAX_CHUNK_SECONDS = 45 * 60
 
 
 class RunpodWhisperXError(Exception):
     """Raised for anything that keeps a diarized transcript from coming back: missing configuration, a
-    failed/timed-out Runpod job, or an audio file too large to send inline with no uploader configured.
-    Always safe for a caller to catch and fall back to local (undiarized) transcription instead — see
+    failed/timed-out Runpod job, or audio that's still too large to send after compression. Always safe
+    for a caller to catch and fall back to local (undiarized) transcription instead — see
     session._transcribe_system_track."""
 
 
@@ -73,12 +77,11 @@ class RunpodWhisperXTranscriber:
     diarization. Mirrors WhisperTranscriber's transcribe_parts(audio_paths, source) shape so session.py
     can use either one interchangeably for the system track.
 
-    `upload`, if given, turns a local WAV path into a URL the worker can fetch, instead of inlining the
-    audio as base64 in the job payload — needed for anything past _MAX_INLINE_AUDIO_BYTES, i.e. most real
-    meeting recordings. Left as None until there's somewhere to upload to; until then this only works for
-    short recordings. `session` is an injected requests.Session-alike (get/post), mainly so tests don't
-    need a real network call or even the `requests` package installed — defaults to a real one lazily, the
-    same deferred-import approach WhisperTranscriber uses for faster_whisper.
+    The audio is compressed and split into chunks first (see speech_encoding), sent inline as base64 —
+    one Runpod job per chunk. `on_progress`, if given, gets a short status line at each step, for the
+    activity log. `session` is an injected requests.Session-alike (get/post), mainly so tests don't need a
+    real network call or even the `requests` package installed — defaults to a real one lazily, the same
+    deferred-import approach WhisperTranscriber uses for faster_whisper.
     """
 
     def __init__(
@@ -87,7 +90,7 @@ class RunpodWhisperXTranscriber:
         api_key: str | None = None,
         endpoint_id: str | None = None,
         huggingface_token: str | None = None,
-        upload: Callable[[Path], str] | None = None,
+        on_progress: Callable[[str], None] | None = None,
         session=None,
         poll_seconds: float = 5.0,
         timeout_seconds: float = 1800.0,
@@ -95,7 +98,7 @@ class RunpodWhisperXTranscriber:
         self._api_key = api_key or os.environ.get(_API_KEY_ENV)
         self._endpoint_id = endpoint_id or os.environ.get(_ENDPOINT_ID_ENV)
         self._huggingface_token = huggingface_token or os.environ.get(_HF_TOKEN_ENV)
-        self._upload = upload
+        self._on_progress = on_progress
         self._session = session
         self._poll_seconds = poll_seconds
         self._timeout_seconds = timeout_seconds
@@ -120,72 +123,163 @@ class RunpodWhisperXTranscriber:
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
 
+    def _report(self, message: str) -> None:
+        if self._on_progress is not None:
+            self._on_progress(message)
+
     def transcribe_parts(self, audio_paths: Sequence[Path], source: str) -> list[TranscriptLine]:
         """Transcribes one capture stream that may have been written as several WAV parts, with the same
         offset-stitching WhisperTranscriber.transcribe_parts does for a long meeting rolled over into
-        multiple files (see its docstring) — except speaker ids are only consistent *within* one part:
-        WhisperX diarizes each job independently, so "SPEAKER_00" in part 2 isn't guaranteed to be the
-        same person as "SPEAKER_00" in part 1. Fine for the common case of a meeting that never rolls
-        over; reconciling speaker identity across parts isn't attempted yet."""
+        multiple files (see its docstring). Each part is further split into chunks of at most
+        _MAX_CHUNK_SECONDS, one Runpod job each.
+
+        Speaker labels are only consistent within one chunk: each job is diarized on its own, so
+        "SPEAKER_00" in one chunk needn't be the same person as "SPEAKER_00" in the next. When there's
+        more than one chunk, labels are suffixed with the chunk number ("SPEAKER_00 (part 2)") rather than
+        presented as if they matched."""
+        if not audio_paths:
+            return []
+        # Takes about half a minute for an hour of audio, so say so rather than the log going quiet.
+        self._report("Compressing system audio for Runpod…")
+        chunks = self._encode(audio_paths)
+        if not chunks:
+            return []
+
+        total_mb = sum(len(chunk.data) for _, chunk in chunks) / 1_048_576
+        total_seconds = sum(chunk.duration_seconds for _, chunk in chunks)
+        split_note = f", in {len(chunks)} parts" if len(chunks) > 1 else ""
+        self._report(
+            f"Sending system audio to Runpod ({total_mb:.1f} MB, {_format_duration(total_seconds)}{split_note})…"
+        )
+        job_ids: list[str] = []
+        try:
+            for _offset, chunk in chunks:
+                job_ids.append(self._submit_job(_data_uri(chunk)))
+            self._report("Runpod job queued." if len(job_ids) == 1 else f"{len(job_ids)} Runpod jobs queued.")
+            outputs = self._wait_for_results(job_ids)
+            parsed = [_parse_segments(output) for output in outputs]
+        except Exception as error:
+            # Nothing will use the rest of the results now — stop paying for them.
+            self._cancel_quietly(job_ids)
+            if isinstance(error, RunpodWhisperXError):
+                raise
+            # A dropped connection, a missing `requests` package, a response in an unexpected shape:
+            # whatever it is, it has to surface as RunpodWhisperXError so the caller falls back to local
+            # transcription instead of the meeting losing its transcript over it.
+            raise RunpodWhisperXError(f"couldn't get a transcript from Runpod: {error!r}") from error
+
         lines: list[TranscriptLine] = []
-        offset_seconds = 0.0
-        for audio_path in audio_paths:
-            lines.extend(
-                TranscriptLine(
-                    timestamp_seconds=segment.start_seconds + offset_seconds,
-                    source=source,
-                    text=segment.text,
-                    speaker=segment.speaker,
+        speakers: set[str] = set()
+        for number, ((offset_seconds, _chunk), segments) in enumerate(zip(chunks, parsed), start=1):
+            for segment in segments:
+                speakers.add(segment.speaker)
+                label = segment.speaker if len(chunks) == 1 else f"{segment.speaker} (part {number})"
+                lines.append(
+                    TranscriptLine(
+                        timestamp_seconds=offset_seconds + segment.start_seconds,
+                        source=source,
+                        text=segment.text,
+                        speaker=label,
+                    )
                 )
-                for segment in self._transcribe_one(audio_path)
+        if len(chunks) == 1:
+            self._report(f"Diarized transcript received — {_count(len(speakers), 'speaker')}.")
+        else:
+            self._report(
+                f"Diarized transcript received — {len(chunks)} parts, speakers labeled separately in each."
             )
-            offset_seconds += wav_duration_seconds(audio_path)
         return lines
 
-    def _transcribe_one(self, audio_path: Path) -> list[_DiarizedSegment]:
-        job_id = self._submit_job(self._resolve_audio_url(audio_path))
-        output = self._wait_for_result(job_id)
-        return _parse_segments(output)
+    def _encode(self, audio_paths: Sequence[Path]) -> list[tuple[float, EncodedChunk]]:
+        """Every chunk of every part, paired with where it starts on the meeting's clock. Checked against
+        the request size limit before anything is sent, so a too-large chunk never leaves some jobs
+        submitted and others not."""
+        chunks: list[tuple[float, EncodedChunk]] = []
+        part_offset = 0.0
+        for audio_path in audio_paths:
+            try:
+                encoded = encode_speech_chunks(audio_path, max_chunk_seconds=_MAX_CHUNK_SECONDS)
+            except Exception as error:  # an unreadable/corrupt WAV part
+                raise RunpodWhisperXError(f"couldn't compress {audio_path.name} for sending: {error}") from error
+            for chunk in encoded:
+                chunks.append((part_offset + chunk.start_seconds, chunk))
+            part_offset += wav_duration_seconds(audio_path)
 
-    def _resolve_audio_url(self, audio_path: Path) -> str:
-        if self._upload is not None:
-            return self._upload(audio_path)
-        audio_bytes = audio_path.read_bytes()
-        if len(audio_bytes) > _MAX_INLINE_AUDIO_BYTES:
-            raise RunpodWhisperXError(
-                f"{audio_path.name} is {len(audio_bytes) / 1_048_576:.1f} MB, too large to send inline "
-                "as base64 — configure an `upload` callable (e.g. to S3-compatible storage) to use cloud "
-                "diarization on a meeting this long."
-            )
-        encoded = base64.b64encode(audio_bytes).decode("ascii")
-        return f"data:audio/wav;base64,{encoded}"
+        limit = _MAX_REQUEST_BYTES - _REQUEST_OVERHEAD_BYTES
+        for number, (_offset, chunk) in enumerate(chunks, start=1):
+            encoded_size = _base64_length(len(chunk.data))
+            if encoded_size > limit:
+                raise RunpodWhisperXError(
+                    f"part {number} is {encoded_size / 1_048_576:.1f} MB even after compression, over "
+                    f"Runpod's {_MAX_REQUEST_BYTES // 1_048_576} MB request limit"
+                )
+        return chunks
 
     def _submit_job(self, audio_url: str) -> str:
         payload = _build_payload(audio_url, huggingface_token=self._huggingface_token)
         response = self._ensure_session().post(
-            f"{self._base_url}/run", headers=self._headers, json=payload, timeout=30
+            f"{self._base_url}/run", headers=self._headers, json=payload, timeout=60
         )
         _raise_for_bad_response(response)
         return response.json()["id"]
 
-    def _wait_for_result(self, job_id: str) -> dict:
+    def _wait_for_results(self, job_ids: list[str]) -> list:
+        """Polls every job until all have finished, returning their outputs in the same order. All are
+        polled each round rather than one at a time, so a chunk that finishes early isn't left waiting —
+        Runpod only keeps a finished job's result for a limited time."""
         deadline = time.monotonic() + self._timeout_seconds
+        outputs: dict[str, object] = {}
         while True:
-            response = self._ensure_session().get(
-                f"{self._base_url}/status/{job_id}", headers=self._headers, timeout=30
-            )
-            _raise_for_bad_response(response)
-            body = response.json()
-            status = body.get("status")
-            if status == "COMPLETED":
-                return body["output"]
-            if status in ("FAILED", "CANCELLED"):
-                raise RunpodWhisperXError(f"Runpod job {job_id} ended as {status}: {body.get('error')}")
-            if time.monotonic() >= deadline:
-                raise RunpodWhisperXError(
-                    f"Runpod job {job_id} didn't finish within {self._timeout_seconds:.0f}s"
+            for job_id in job_ids:
+                if job_id in outputs:
+                    continue
+                response = self._ensure_session().get(
+                    f"{self._base_url}/status/{job_id}", headers=self._headers, timeout=30
                 )
+                _raise_for_bad_response(response)
+                body = response.json()
+                status = body.get("status")
+                if status == "COMPLETED":
+                    output = body.get("output")
+                    # The worker reports bad input by returning {"error": ...} as a completed job's
+                    # output, not by failing the job.
+                    if isinstance(output, dict) and output.get("error"):
+                        raise RunpodWhisperXError(f"Runpod job {job_id} failed: {output['error']}")
+                    outputs[job_id] = output
+                    if len(job_ids) > 1:
+                        self._report(f"Runpod finished part {job_ids.index(job_id) + 1} of {len(job_ids)}.")
+                elif status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+                    raise RunpodWhisperXError(f"Runpod job {job_id} ended as {status}: {body.get('error')}")
+            if len(outputs) == len(job_ids):
+                return [outputs[job_id] for job_id in job_ids]
+            if time.monotonic() >= deadline:
+                raise RunpodWhisperXError(f"Runpod didn't finish within {self._timeout_seconds:.0f}s")
             time.sleep(self._poll_seconds)
+
+    def _cancel_quietly(self, job_ids: list[str]) -> None:
+        for job_id in job_ids:
+            try:
+                self._ensure_session().post(f"{self._base_url}/cancel/{job_id}", headers=self._headers, timeout=15)
+            except Exception:
+                pass  # best effort — the failure that got us here is the one worth reporting
+
+
+def _data_uri(chunk: EncodedChunk) -> str:
+    return f"data:{chunk.mime_type};base64,{base64.b64encode(chunk.data).decode('ascii')}"
+
+
+def _base64_length(byte_count: int) -> int:
+    return 4 * ((byte_count + 2) // 3)
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{round(seconds)} s"
+    return f"{round(seconds / 60)} min"
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
 def _raise_for_bad_response(response) -> None:

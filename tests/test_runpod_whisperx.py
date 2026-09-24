@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import wave
 
@@ -14,12 +15,15 @@ from meeting_scribe.transcription.runpod_whisperx import (
 )
 
 
-def _write_wav(path, seconds, framerate=16000):
+def _write_wav(path, seconds, framerate=48000, channels=2):
+    """A silent WAV in the loopback recorder's usual format. Compressing it (see speech_encoding) needs
+    PyAV, which faster-whisper already depends on."""
+    pytest.importorskip("av")
     with contextlib.closing(wave.open(str(path), "wb")) as wav_file:
-        wav_file.setnchannels(1)
+        wav_file.setnchannels(channels)
         wav_file.setsampwidth(2)
         wav_file.setframerate(framerate)
-        wav_file.writeframes(b"\x00\x00" * int(framerate * seconds))
+        wav_file.writeframes(b"\x00\x00" * channels * int(framerate * seconds))
 
 
 class FakeResponse:
@@ -32,20 +36,35 @@ class FakeResponse:
         return self._json_body
 
 
-class FakeSession:
-    """Returns queued canned responses in call order — one per post()/get() the transcriber makes."""
+class FakeRunpod:
+    """Stands in for Runpod's API: each POST /run is given the next job id ("job-0", "job-1", ...);
+    GET /status/<id> answers from that job's list of status bodies in turn, repeating the last one once
+    they're used up; POST /cancel/<id> is recorded."""
 
-    def __init__(self, responses):
-        self._responses = iter(responses)
-        self.requests: list[tuple] = []
+    def __init__(self, *job_statuses):
+        self._job_statuses = [list(statuses) for statuses in job_statuses]
+        self.submitted_payloads: list[dict] = []
+        self.cancelled: list[str] = []
 
     def post(self, url, headers=None, json=None, timeout=None):
-        self.requests.append(("POST", url, json))
-        return next(self._responses)
+        if url.endswith("/run"):
+            self.submitted_payloads.append(json)
+            return FakeResponse(json_body={"id": f"job-{len(self.submitted_payloads) - 1}"})
+        self.cancelled.append(url.rsplit("/", 1)[1])
+        return FakeResponse(json_body={})
 
     def get(self, url, headers=None, timeout=None):
-        self.requests.append(("GET", url, None))
-        return next(self._responses)
+        statuses = self._job_statuses[int(url.rsplit("-", 1)[1])]
+        return FakeResponse(json_body=statuses.pop(0) if len(statuses) > 1 else statuses[0])
+
+
+def _completed(*segments):
+    return {
+        "status": "COMPLETED",
+        "output": {
+            "segments": [{"start": start, "speaker": speaker, "text": text} for start, speaker, text in segments]
+        },
+    }
 
 
 def _env(monkeypatch, *, api_key="key", endpoint_id="endpoint", hf_token=None):
@@ -133,132 +152,178 @@ def test_raise_for_bad_response_is_silent_on_success():
     _raise_for_bad_response(FakeResponse(status_code=200))  # must not raise
 
 
-def test_transcribe_parts_submits_polls_and_parses_a_completed_job(tmp_path, monkeypatch):
+
+def test_transcribe_parts_sends_compressed_audio_and_parses_the_result(tmp_path, monkeypatch):
     _env(monkeypatch, hf_token="hf_abc")
     audio = tmp_path / "system.wav"
     _write_wav(audio, seconds=5.0)
-
-    session = FakeSession(
-        [
-            FakeResponse(json_body={"id": "job-1"}),  # POST /run
-            FakeResponse(json_body={"status": "IN_QUEUE"}),  # GET /status (not done yet)
-            FakeResponse(
-                json_body={
-                    "status": "COMPLETED",
-                    "output": {"segments": [{"start": 1.5, "speaker": "SPEAKER_00", "text": "hi"}]},
-                }
-            ),
-        ]
-    )
-    transcriber = RunpodWhisperXTranscriber(session=session, poll_seconds=0)
+    runpod = FakeRunpod([{"status": "IN_QUEUE"}, _completed((1.5, "SPEAKER_00", "hi"))])
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
 
     lines = transcriber.transcribe_parts([audio], source="system")
 
     assert [(line.timestamp_seconds, line.source, line.speaker, line.text) for line in lines] == [
         (1.5, "system", "SPEAKER_00", "hi")
     ]
-    # The huggingface token reached the actual request payload.
-    _, _, run_payload = session.requests[0]
-    assert run_payload["input"]["huggingface_access_token"] == "hf_abc"
+    (payload,) = runpod.submitted_payloads
+    assert payload["input"]["huggingface_access_token"] == "hf_abc"
+    audio_file = payload["input"]["audio_file"]
+    assert audio_file.startswith("data:audio/ogg;base64,")
+    sent = base64.b64decode(audio_file.split(",", 1)[1])
+    assert sent[:4] == b"OggS"
+    # Compressed far below the WAV it came from (5 s of 48 kHz stereo is ~940 KB).
+    assert len(sent) < audio.stat().st_size / 20
 
 
-def test_transcribe_parts_raises_on_a_failed_job(tmp_path, monkeypatch):
+def test_a_long_recording_is_split_into_chunks_placed_on_the_meetings_clock(tmp_path, monkeypatch):
     _env(monkeypatch)
+    monkeypatch.setattr(runpod_whisperx, "_MAX_CHUNK_SECONDS", 1.0)
     audio = tmp_path / "system.wav"
-    _write_wav(audio, seconds=1.0)
-
-    session = FakeSession(
-        [
-            FakeResponse(json_body={"id": "job-1"}),
-            FakeResponse(json_body={"status": "FAILED", "error": "out of memory"}),
-        ]
+    _write_wav(audio, seconds=2.5)
+    runpod = FakeRunpod(
+        [_completed((0.2, "SPEAKER_00", "one"))],
+        [_completed((0.3, "SPEAKER_00", "two"))],
+        [_completed((0.4, "SPEAKER_01", "three"))],
     )
-    transcriber = RunpodWhisperXTranscriber(session=session, poll_seconds=0)
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
 
-    with pytest.raises(RunpodWhisperXError, match="out of memory"):
-        transcriber.transcribe_parts([audio], source="system")
+    lines = transcriber.transcribe_parts([audio], source="system")
 
-
-def test_transcribe_parts_raises_on_timeout(tmp_path, monkeypatch):
-    _env(monkeypatch)
-    audio = tmp_path / "system.wav"
-    _write_wav(audio, seconds=1.0)
-
-    session = FakeSession(
-        [
-            FakeResponse(json_body={"id": "job-1"}),
-            FakeResponse(json_body={"status": "IN_PROGRESS"}),
-        ]
-    )
-    transcriber = RunpodWhisperXTranscriber(session=session, poll_seconds=0, timeout_seconds=-1)
-
-    with pytest.raises(RunpodWhisperXError, match="didn't finish"):
-        transcriber.transcribe_parts([audio], source="system")
-
-
-def test_transcribe_parts_offsets_a_second_part_by_the_first_parts_duration(tmp_path, monkeypatch):
-    _env(monkeypatch)
-    first, second = tmp_path / "system.wav", tmp_path / "system.part2.wav"
-    _write_wav(first, seconds=60.0)
-    _write_wav(second, seconds=10.0)
-
-    session = FakeSession(
-        [
-            FakeResponse(json_body={"id": "job-1"}),
-            FakeResponse(
-                json_body={
-                    "status": "COMPLETED",
-                    "output": {"segments": [{"start": 2.0, "speaker": "SPEAKER_00", "text": "first part"}]},
-                }
-            ),
-            FakeResponse(json_body={"id": "job-2"}),
-            FakeResponse(
-                json_body={
-                    "status": "COMPLETED",
-                    "output": {"segments": [{"start": 3.0, "speaker": "SPEAKER_01", "text": "second part"}]},
-                }
-            ),
-        ]
-    )
-    transcriber = RunpodWhisperXTranscriber(session=session, poll_seconds=0)
-
-    lines = transcriber.transcribe_parts([first, second], source="system")
-
-    assert [(line.timestamp_seconds, line.text) for line in lines] == [
-        (2.0, "first part"),
-        (63.0, "second part"),
+    assert len(runpod.submitted_payloads) == 3
+    # Each chunk is diarized separately, so its labels are kept apart rather than merged as if the same
+    # SPEAKER_00 in every chunk were one person.
+    assert [(line.timestamp_seconds, line.speaker, line.text) for line in lines] == [
+        (0.2, "SPEAKER_00 (part 1)", "one"),
+        (1.3, "SPEAKER_00 (part 2)", "two"),
+        (2.4, "SPEAKER_01 (part 3)", "three"),
     ]
 
 
-def test_resolve_audio_url_inlines_a_small_file_as_base64(tmp_path, monkeypatch):
+def test_a_second_wav_part_is_offset_by_the_first_parts_duration(tmp_path, monkeypatch):
     _env(monkeypatch)
-    audio = tmp_path / "system.wav"
-    audio.write_bytes(b"tiny-audio-bytes")
-    transcriber = RunpodWhisperXTranscriber(session=FakeSession([]))
-
-    url = transcriber._resolve_audio_url(audio)
-
-    assert url.startswith("data:audio/wav;base64,")
-
-
-def test_resolve_audio_url_raises_when_too_large_and_no_uploader(tmp_path, monkeypatch):
-    _env(monkeypatch)
-    monkeypatch.setattr(runpod_whisperx, "_MAX_INLINE_AUDIO_BYTES", 4)
-    audio = tmp_path / "system.wav"
-    audio.write_bytes(b"way too big for the inline limit")
-    transcriber = RunpodWhisperXTranscriber(session=FakeSession([]))
-
-    with pytest.raises(RunpodWhisperXError, match="too large"):
-        transcriber._resolve_audio_url(audio)
-
-
-def test_resolve_audio_url_uses_the_upload_callable_when_given(tmp_path, monkeypatch):
-    _env(monkeypatch)
-    monkeypatch.setattr(runpod_whisperx, "_MAX_INLINE_AUDIO_BYTES", 4)
-    audio = tmp_path / "system.wav"
-    audio.write_bytes(b"way too big for the inline limit")
-    transcriber = RunpodWhisperXTranscriber(
-        session=FakeSession([]), upload=lambda path: f"https://bucket.example.com/{path.name}"
+    first, second = tmp_path / "system.wav", tmp_path / "system.part2.wav"
+    _write_wav(first, seconds=6.0)
+    _write_wav(second, seconds=2.0)
+    runpod = FakeRunpod(
+        [_completed((2.0, "SPEAKER_00", "first part"))],
+        [_completed((1.0, "SPEAKER_01", "second part"))],
     )
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
 
-    assert transcriber._resolve_audio_url(audio) == "https://bucket.example.com/system.wav"
+    lines = transcriber.transcribe_parts([first, second], source="system")
+
+    assert [(line.timestamp_seconds, line.text) for line in lines] == [(2.0, "first part"), (7.0, "second part")]
+
+
+def test_progress_is_reported_at_each_step(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=3.0)
+    runpod = FakeRunpod([_completed((0.0, "SPEAKER_00", "hi"), (1.0, "SPEAKER_01", "hello"))])
+    messages = []
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0, on_progress=messages.append)
+
+    transcriber.transcribe_parts([audio], source="system")
+
+    assert messages[0] == "Compressing system audio for Runpod…"
+    assert messages[1].startswith("Sending system audio to Runpod (")
+    assert "3 s" in messages[1]
+    assert messages[2:] == ["Runpod job queued.", "Diarized transcript received — 2 speakers."]
+
+
+def test_a_failed_job_raises_and_cancels_the_others(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setattr(runpod_whisperx, "_MAX_CHUNK_SECONDS", 1.0)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=2.0)
+    runpod = FakeRunpod(
+        [{"status": "FAILED", "error": "out of memory"}],
+        [{"status": "IN_PROGRESS"}],
+    )
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
+
+    with pytest.raises(RunpodWhisperXError, match="out of memory"):
+        transcriber.transcribe_parts([audio], source="system")
+    assert "job-1" in runpod.cancelled
+
+
+def test_an_error_returned_as_the_workers_output_raises(tmp_path, monkeypatch):
+    # The worker reports bad input by returning {"error": ...} from a job Runpod marks COMPLETED.
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+    runpod = FakeRunpod([{"status": "COMPLETED", "output": {"error": "audio input: bad data"}}])
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
+
+    with pytest.raises(RunpodWhisperXError, match="bad data"):
+        transcriber.transcribe_parts([audio], source="system")
+
+
+def test_a_job_that_never_finishes_raises(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+    runpod = FakeRunpod([{"status": "IN_PROGRESS"}])
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0, timeout_seconds=-1)
+
+    with pytest.raises(RunpodWhisperXError, match="didn't finish"):
+        transcriber.transcribe_parts([audio], source="system")
+    assert runpod.cancelled == ["job-0"]
+
+
+def test_a_network_error_becomes_a_runpod_error_so_the_caller_falls_back(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+
+    class Unreachable(FakeRunpod):
+        def post(self, url, headers=None, json=None, timeout=None):
+            raise ConnectionError("no route to host")
+
+    transcriber = RunpodWhisperXTranscriber(session=Unreachable(), poll_seconds=0)
+
+    with pytest.raises(RunpodWhisperXError, match="no route to host"):
+        transcriber.transcribe_parts([audio], source="system")
+
+
+def test_an_unexpected_response_shape_becomes_a_runpod_error(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+    runpod = FakeRunpod([{"status": "COMPLETED", "output": {"segments": [{"speaker": "SPEAKER_00", "text": "hi"}]}}])
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
+
+    with pytest.raises(RunpodWhisperXError):
+        transcriber.transcribe_parts([audio], source="system")
+
+
+def test_audio_still_too_large_after_compression_is_rejected_before_anything_is_sent(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setattr(runpod_whisperx, "_MAX_REQUEST_BYTES", 100)
+    monkeypatch.setattr(runpod_whisperx, "_REQUEST_OVERHEAD_BYTES", 0)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=3.0)
+    runpod = FakeRunpod([_completed()])
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
+
+    with pytest.raises(RunpodWhisperXError, match="even after compression"):
+        transcriber.transcribe_parts([audio], source="system")
+    assert runpod.submitted_payloads == []
+
+
+def test_an_unreadable_wav_becomes_a_runpod_error(tmp_path, monkeypatch):
+    pytest.importorskip("av")
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    audio.write_bytes(b"not audio at all")
+    transcriber = RunpodWhisperXTranscriber(session=FakeRunpod(), poll_seconds=0)
+
+    with pytest.raises(RunpodWhisperXError, match="couldn't compress"):
+        transcriber.transcribe_parts([audio], source="system")
+
+
+def test_no_audio_parts_means_no_jobs(monkeypatch):
+    _env(monkeypatch)
+    runpod = FakeRunpod()
+    assert RunpodWhisperXTranscriber(session=runpod).transcribe_parts([], source="system") == []
+    assert runpod.submitted_payloads == []
