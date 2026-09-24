@@ -1,6 +1,10 @@
 import base64
 import contextlib
+import json
+import sys
+import threading
 import wave
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -8,6 +12,7 @@ from meeting_scribe.transcription import runpod_whisperx
 from meeting_scribe.transcription.runpod_whisperx import (
     RunpodWhisperXError,
     RunpodWhisperXTranscriber,
+    _HttpSession,
     _build_payload,
     _parse_segments,
     _raise_for_bad_response,
@@ -228,6 +233,7 @@ def test_progress_is_reported_at_each_step(tmp_path, monkeypatch):
     assert messages[0] == "Compressing system audio for Runpod…"
     assert messages[1].startswith("Sending system audio to Runpod (")
     assert "3 s" in messages[1]
+    assert "KB" in messages[1]  # a few seconds of audio is well under a megabyte
     assert messages[2:] == ["Runpod job queued.", "Diarized transcript received — 2 speakers."]
 
 
@@ -327,3 +333,91 @@ def test_no_audio_parts_means_no_jobs(monkeypatch):
     runpod = FakeRunpod()
     assert RunpodWhisperXTranscriber(session=runpod).transcribe_parts([], source="system") == []
     assert runpod.submitted_payloads == []
+
+
+@pytest.fixture
+def local_api(monkeypatch):
+    """A real HTTP server on localhost standing in for Runpod, for exercising _HttpSession end to end.
+    Returns its base URL and a list of (method, path, authorization, body) for each request received."""
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, code, body):
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            received.append(("POST", self.path, self.headers.get("Authorization"), body))
+            self._reply(200, {"id": "job-0"} if self.path.endswith("/run") else {})
+
+        def do_GET(self):
+            received.append(("GET", self.path, self.headers.get("Authorization"), b""))
+            if self.path.endswith("/missing"):
+                self._reply(404, {"error": "no such job"})
+            else:
+                self._reply(200, {"status": "COMPLETED", "output": {"segments": [
+                    {"start": 0.5, "speaker": "SPEAKER_00", "text": "over real HTTP"}
+                ]}})
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}", received
+    server.shutdown()
+    server.server_close()
+
+
+def test_http_session_posts_json_and_reads_json_back(local_api):
+    base, received = local_api
+
+    response = _HttpSession().post(f"{base}/run", headers={"Authorization": "Bearer k"}, json={"a": 1}, timeout=5)
+
+    assert response.status_code == 200
+    assert response.json() == {"id": "job-0"}
+    assert received == [("POST", "/run", "Bearer k", b'{"a": 1}')]
+
+
+def test_http_session_returns_an_error_status_instead_of_raising(local_api):
+    base, _ = local_api
+
+    response = _HttpSession().get(f"{base}/status/missing", timeout=5)
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "no such job"}
+
+
+def test_http_session_post_without_a_body_sends_an_empty_one(local_api):
+    base, received = local_api
+
+    _HttpSession().post(f"{base}/cancel/job-0", timeout=5)
+
+    assert received == [("POST", "/cancel/job-0", None, b"")]
+
+
+def test_transcription_works_end_to_end_without_the_requests_package(tmp_path, monkeypatch, local_api):
+    # The failure seen in the field: an install with no `requests` package. None in sys.modules makes
+    # any `import requests` raise, so this proves nothing on the path still needs it.
+    base, received = local_api
+    monkeypatch.setitem(sys.modules, "requests", None)
+    monkeypatch.setattr(RunpodWhisperXTranscriber, "_base_url", property(lambda self: base))
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+
+    transcriber = RunpodWhisperXTranscriber(api_key="k", endpoint_id="e", poll_seconds=0)
+    lines = transcriber.transcribe_parts([audio], source="system")
+
+    assert [(line.timestamp_seconds, line.speaker, line.text) for line in lines] == [
+        (0.5, "SPEAKER_00", "over real HTTP")
+    ]
+    method, path, authorization, body = received[0]
+    assert (method, path, authorization) == ("POST", "/run", "Bearer k")
+    assert json.loads(body)["input"]["audio_file"].startswith("data:audio/ogg;base64,")

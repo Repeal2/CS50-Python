@@ -24,8 +24,11 @@ and adjusting those two functions to match; don't assume another template uses t
 from __future__ import annotations
 
 import base64
+import json
 import os
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -72,6 +75,43 @@ class _DiarizedSegment:
     text: str
 
 
+class _HttpResponse:
+    def __init__(self, status_code: int, body: bytes):
+        self.status_code = status_code
+        self.text = body.decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class _HttpSession:
+    """The two kinds of call this module makes, over the standard library rather than the `requests`
+    package — so there's nothing extra to install or bundle into the .exe. On Windows this also means
+    certificates are checked against the Windows certificate store, which on a corporate network includes
+    any root certificate IT has added for inspecting HTTPS traffic; `requests` uses its own bundled list
+    instead and would reject those connections. Proxy settings come from the environment or, on Windows,
+    the system's Internet settings. An HTTP error status is returned as a response, like `requests` does,
+    rather than raised."""
+
+    def post(self, url: str, headers: dict | None = None, json: dict | None = None, timeout: float | None = None):
+        body = b"" if json is None else _json_dumps(json).encode("utf-8")
+        return self._send(urllib.request.Request(url, data=body, headers=headers or {}, method="POST"), timeout)
+
+    def get(self, url: str, headers: dict | None = None, timeout: float | None = None):
+        return self._send(urllib.request.Request(url, headers=headers or {}, method="GET"), timeout)
+
+    @staticmethod
+    def _send(request: urllib.request.Request, timeout: float | None) -> _HttpResponse:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return _HttpResponse(response.status, response.read())
+        except urllib.error.HTTPError as error:
+            return _HttpResponse(error.code, error.read())
+
+
+_json_dumps = json.dumps  # _HttpSession.post's `json` parameter (named to match requests) shadows the module
+
+
 class RunpodWhisperXTranscriber:
     """Sends one audio track to a Runpod WhisperX serverless endpoint for transcription with speaker
     diarization. Mirrors WhisperTranscriber's transcribe_parts(audio_paths, source) shape so session.py
@@ -79,9 +119,8 @@ class RunpodWhisperXTranscriber:
 
     The audio is compressed and split into chunks first (see speech_encoding), sent inline as base64 —
     one Runpod job per chunk. `on_progress`, if given, gets a short status line at each step, for the
-    activity log. `session` is an injected requests.Session-alike (get/post), mainly so tests don't need a
-    real network call or even the `requests` package installed — defaults to a real one lazily, the same
-    deferred-import approach WhisperTranscriber uses for faster_whisper.
+    activity log. `session` is injectable (anything with _HttpSession's get/post) so tests don't make real
+    network calls; it defaults to _HttpSession.
     """
 
     def __init__(
@@ -99,7 +138,7 @@ class RunpodWhisperXTranscriber:
         self._endpoint_id = endpoint_id or os.environ.get(_ENDPOINT_ID_ENV)
         self._huggingface_token = huggingface_token or os.environ.get(_HF_TOKEN_ENV)
         self._on_progress = on_progress
-        self._session = session
+        self._session = session if session is not None else _HttpSession()
         self._poll_seconds = poll_seconds
         self._timeout_seconds = timeout_seconds
         if not self._api_key or not self._endpoint_id:
@@ -107,13 +146,6 @@ class RunpodWhisperXTranscriber:
                 f"Cloud speaker diarization is opted into but not configured — set {_API_KEY_ENV} and "
                 f"{_ENDPOINT_ID_ENV} (and usually {_HF_TOKEN_ENV}, for diarization itself to work)."
             )
-
-    def _ensure_session(self):
-        if self._session is None:
-            import requests
-
-            self._session = requests.Session()
-        return self._session
 
     @property
     def _base_url(self) -> str:
@@ -145,11 +177,12 @@ class RunpodWhisperXTranscriber:
         if not chunks:
             return []
 
-        total_mb = sum(len(chunk.data) for _, chunk in chunks) / 1_048_576
+        total_bytes = sum(len(chunk.data) for _, chunk in chunks)
         total_seconds = sum(chunk.duration_seconds for _, chunk in chunks)
         split_note = f", in {len(chunks)} parts" if len(chunks) > 1 else ""
         self._report(
-            f"Sending system audio to Runpod ({total_mb:.1f} MB, {_format_duration(total_seconds)}{split_note})…"
+            f"Sending system audio to Runpod ({_format_size(total_bytes)}, "
+            f"{_format_duration(total_seconds)}{split_note})…"
         )
         job_ids: list[str] = []
         try:
@@ -163,7 +196,7 @@ class RunpodWhisperXTranscriber:
             self._cancel_quietly(job_ids)
             if isinstance(error, RunpodWhisperXError):
                 raise
-            # A dropped connection, a missing `requests` package, a response in an unexpected shape:
+            # A dropped connection, a certificate rejected by a corporate proxy, a response in an unexpected shape:
             # whatever it is, it has to surface as RunpodWhisperXError so the caller falls back to local
             # transcription instead of the meeting losing its transcript over it.
             raise RunpodWhisperXError(f"couldn't get a transcript from Runpod: {error!r}") from error
@@ -217,7 +250,7 @@ class RunpodWhisperXTranscriber:
 
     def _submit_job(self, audio_url: str) -> str:
         payload = _build_payload(audio_url, huggingface_token=self._huggingface_token)
-        response = self._ensure_session().post(
+        response = self._session.post(
             f"{self._base_url}/run", headers=self._headers, json=payload, timeout=60
         )
         _raise_for_bad_response(response)
@@ -233,7 +266,7 @@ class RunpodWhisperXTranscriber:
             for job_id in job_ids:
                 if job_id in outputs:
                     continue
-                response = self._ensure_session().get(
+                response = self._session.get(
                     f"{self._base_url}/status/{job_id}", headers=self._headers, timeout=30
                 )
                 _raise_for_bad_response(response)
@@ -259,7 +292,7 @@ class RunpodWhisperXTranscriber:
     def _cancel_quietly(self, job_ids: list[str]) -> None:
         for job_id in job_ids:
             try:
-                self._ensure_session().post(f"{self._base_url}/cancel/{job_id}", headers=self._headers, timeout=15)
+                self._session.post(f"{self._base_url}/cancel/{job_id}", headers=self._headers, timeout=15)
             except Exception:
                 pass  # best effort — the failure that got us here is the one worth reporting
 
@@ -270,6 +303,12 @@ def _data_uri(chunk: EncodedChunk) -> str:
 
 def _base64_length(byte_count: int) -> int:
     return 4 * ((byte_count + 2) // 3)
+
+
+def _format_size(byte_count: int) -> str:
+    if byte_count < 1_048_576:
+        return f"{max(1, round(byte_count / 1024))} KB"
+    return f"{byte_count / 1_048_576:.1f} MB"
 
 
 def _format_duration(seconds: float) -> str:
