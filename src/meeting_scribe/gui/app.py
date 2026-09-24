@@ -22,6 +22,7 @@ from meeting_scribe.config import (
     WHISPER_MODEL_SIZES,
     Settings,
     load_settings,
+    update_audio_automation,
     update_audio_devices,
     update_copilot_settings,
     update_diarize_system_audio,
@@ -61,6 +62,7 @@ from meeting_scribe.transcription.engine import TranscriptLine, merge_transcript
 # Shown in a device dropdown in place of a device name, meaning "follow whatever Windows currently
 # considers the default" rather than a specific device — used on both the Record tab and Settings tab.
 SYSTEM_DEFAULT_LABEL = "System default"
+AUTO_HEADSET_LABEL = "Recognize by name"
 
 # Used when Start is clicked (or a Start hotkey fires — see MeetingScribeApp._handle_start_hotkey) with
 # the project field left blank, so a meeting never fails to start for lack of a project name. The
@@ -140,14 +142,16 @@ def _has_no_mic_signal(problems: "tuple[str, ...]") -> bool:
     return any(problem.startswith("Microphone:") and "digital silence" in problem for problem in problems)
 
 
-def _device_choices(device_names: "list[str]", selected: str) -> "list[str]":
+def _device_choices(
+    device_names: "list[str]", selected: str, default_label: str = SYSTEM_DEFAULT_LABEL
+) -> "list[str]":
     """Dropdown values for a mic/system-audio picker: "System default" plus every device currently
     present — and the currently selected device even if it isn't present right now (unplugged). Keeping
     it rather than resetting the selection to "System default" matters now that the lists refresh on
     their own whenever a device comes or goes: a reset would silently become the saved setting on the
     next Settings save, and the choice would be lost for when the device is plugged back in (the
     recorder already falls back to the default, with a notice, while it's missing)."""
-    values = [SYSTEM_DEFAULT_LABEL] + [name for name in device_names if name != SYSTEM_DEFAULT_LABEL]
+    values = [default_label] + [name for name in device_names if name != default_label]
     if selected and selected not in values:
         values.append(selected)
     return values
@@ -1727,7 +1731,23 @@ class SettingsTab(ttk.Frame):
             row=1, column=2, rowspan=2, padx=(6, 0)
         )
 
-        ttk.Label(form, text="Transcription model").grid(row=3, column=0, sticky="w")
+        # See config.Settings.auto_switch_audio_devices / headset_microphone_name.
+        ttk.Label(form, text="Headset microphone").grid(row=3, column=0, sticky="w")
+        self.headset_var = tk.StringVar(
+            value=self.app.settings.headset_microphone_name or AUTO_HEADSET_LABEL
+        )
+        self.headset_combo = ttk.Combobox(form, textvariable=self.headset_var, width=45, state="readonly")
+        self.headset_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
+
+        self.auto_switch_var = tk.BooleanVar(value=self.app.settings.auto_switch_audio_devices)
+        ttk.Checkbutton(
+            form,
+            text="Switch devices automatically — follow the speaker that's playing; use the headset mic "
+            "when it's live",
+            variable=self.auto_switch_var,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
+
+        ttk.Label(form, text="Transcription model").grid(row=5, column=0, sticky="w")
         self.whisper_model_var = tk.StringVar(value=self.app.settings.whisper_model_size)
         self.whisper_model_combo = ttk.Combobox(
             form,
@@ -1736,7 +1756,7 @@ class SettingsTab(ttk.Frame):
             width=45,
             state="readonly",
         )
-        self.whisper_model_combo.grid(row=3, column=1, sticky="we", padx=6, pady=4)
+        self.whisper_model_combo.grid(row=5, column=1, sticky="we", padx=6, pady=4)
 
         # Off by default — see config.Settings.diarize_system_audio. Only takes effect once the Runpod/
         # HuggingFace environment variables it needs are also set (see transcription.runpod_whisperx);
@@ -1746,37 +1766,37 @@ class SettingsTab(ttk.Frame):
             form,
             text="Identify speakers in the system-audio track (sends audio to Runpod + HuggingFace)",
             variable=self.diarize_system_audio_var,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=4)
 
         # Credentials for the diarization endpoint above — plaintext in settings.json either way, so this
         # isn't meaningfully less secure than an environment variable would have been for a single-user
         # desktop app; it's just easier to set. runpod_huggingface_token can be left blank if HF_TOKEN was
         # instead set directly as an environment variable on the Runpod endpoint itself.
-        ttk.Label(form, text="Runpod API key").grid(row=5, column=0, sticky="w")
+        ttk.Label(form, text="Runpod API key").grid(row=7, column=0, sticky="w")
         self.runpod_api_key_var = tk.StringVar(value=self.app.settings.runpod_api_key or "")
         ttk.Entry(form, textvariable=self.runpod_api_key_var, width=48, show="*").grid(
-            row=5, column=1, sticky="we", padx=6, pady=4
+            row=7, column=1, sticky="we", padx=6, pady=4
         )
 
-        ttk.Label(form, text="Runpod endpoint ID").grid(row=6, column=0, sticky="w")
+        ttk.Label(form, text="Runpod endpoint ID").grid(row=8, column=0, sticky="w")
         self.runpod_endpoint_id_var = tk.StringVar(value=self.app.settings.runpod_endpoint_id or "")
         ttk.Entry(form, textvariable=self.runpod_endpoint_id_var, width=48).grid(
-            row=6, column=1, sticky="we", padx=6, pady=4
+            row=8, column=1, sticky="we", padx=6, pady=4
         )
 
-        ttk.Label(form, text="HuggingFace token").grid(row=7, column=0, sticky="w")
+        ttk.Label(form, text="HuggingFace token").grid(row=9, column=0, sticky="w")
         self.runpod_hf_token_var = tk.StringVar(value=self.app.settings.runpod_huggingface_token or "")
         ttk.Entry(form, textvariable=self.runpod_hf_token_var, width=48, show="*").grid(
-            row=7, column=1, sticky="we", padx=6, pady=4
+            row=9, column=1, sticky="we", padx=6, pady=4
         )
 
         # Global (system-wide) shortcuts — work even while focused in Teams, not just this app. Off
         # ("Not set") until explicitly captured here; see hotkeys.py and MeetingScribeApp.apply_hotkeys.
-        ttk.Label(form, text="Start meeting shortcut").grid(row=8, column=0, sticky="w")
+        ttk.Label(form, text="Start meeting shortcut").grid(row=10, column=0, sticky="w")
         self.start_hotkey_var = tk.StringVar(value=_hotkey_label(self._pending_start_hotkey))
-        ttk.Label(form, textvariable=self.start_hotkey_var).grid(row=8, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(form, textvariable=self.start_hotkey_var).grid(row=10, column=1, sticky="w", padx=6, pady=4)
         start_hotkey_buttons = ttk.Frame(form)
-        start_hotkey_buttons.grid(row=8, column=2, padx=(6, 0))
+        start_hotkey_buttons.grid(row=10, column=2, padx=(6, 0))
         self.start_hotkey_button = ttk.Button(
             start_hotkey_buttons, text="Change…", command=lambda: self._begin_hotkey_capture("start")
         )
@@ -1785,11 +1805,11 @@ class SettingsTab(ttk.Frame):
             side="left", padx=(4, 0)
         )
 
-        ttk.Label(form, text="Stop meeting shortcut").grid(row=9, column=0, sticky="w")
+        ttk.Label(form, text="Stop meeting shortcut").grid(row=11, column=0, sticky="w")
         self.stop_hotkey_var = tk.StringVar(value=_hotkey_label(self._pending_stop_hotkey))
-        ttk.Label(form, textvariable=self.stop_hotkey_var).grid(row=9, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(form, textvariable=self.stop_hotkey_var).grid(row=11, column=1, sticky="w", padx=6, pady=4)
         stop_hotkey_buttons = ttk.Frame(form)
-        stop_hotkey_buttons.grid(row=9, column=2, padx=(6, 0))
+        stop_hotkey_buttons.grid(row=11, column=2, padx=(6, 0))
         self.stop_hotkey_button = ttk.Button(
             stop_hotkey_buttons, text="Change…", command=lambda: self._begin_hotkey_capture("stop")
         )
@@ -1818,6 +1838,14 @@ class SettingsTab(ttk.Frame):
             "one mic, or the wrong one is the Windows default. \"System default\" always follows "
             "whatever Windows currently has set as default. Watch the level meters on the Record tab "
             "to confirm a device is actually picking up audio.\n\n"
+            "Switch devices automatically (on by default) takes care of both during a meeting. System "
+            "audio: once the recorded speaker has been quiet for a few seconds, the others are listened "
+            "to and whichever is playing — only one plays the call — is recorded instead. Microphone: "
+            "every connected headset is listened to at the start, and whichever is live is used — the "
+            "Microphone above (your laptop's) only when none is, e.g. muted or switched off. Pick your "
+            "usual headset under Headset microphone to try it first, or leave it on \"Recognize by "
+            "name\" to try any input Windows calls a headset. Every switch is written to the activity log, and picking a device "
+            "by hand during a meeting turns the automation off for that meeting.\n\n"
             "Transcription model trades accuracy for memory/CPU: smaller (tiny/base/small) is faster and "
             "lighter but makes more mistakes, larger (medium/large) is more accurate but needs "
             "meaningfully more RAM — a long meeting can fail to transcribe with an out-of-memory error "
@@ -1869,6 +1897,9 @@ class SettingsTab(ttk.Frame):
         self.mic_combo["values"] = _device_choices([d.name for d in input_devices], self.mic_var.get())
         self.system_combo["values"] = _device_choices(
             [d.name for d in loopback_devices], self.system_var.get()
+        )
+        self.headset_combo["values"] = _device_choices(
+            [d.name for d in input_devices], self.headset_var.get(), default_label=AUTO_HEADSET_LABEL
         )
 
     def _begin_hotkey_capture(self, which: str) -> None:
@@ -1942,6 +1973,13 @@ class SettingsTab(ttk.Frame):
         )
         self.app.settings = update_audio_devices(
             self.app.settings, mic_device_name=mic_name, system_device_name=system_name
+        )
+        self.app.settings = update_audio_automation(
+            self.app.settings,
+            auto_switch_audio_devices=self.auto_switch_var.get(),
+            headset_microphone_name=(
+                None if self.headset_var.get() == AUTO_HEADSET_LABEL else self.headset_var.get()
+            ),
         )
         self.app.settings = update_whisper_model_size(
             self.app.settings, whisper_model_size=self.whisper_model_var.get()

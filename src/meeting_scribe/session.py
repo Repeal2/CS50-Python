@@ -147,6 +147,9 @@ class MeetingSession:
             meeting_dir,
             mic_device_name=settings.mic_device_name,
             system_device_name=settings.system_device_name,
+            auto_system_device=settings.auto_switch_audio_devices,
+            auto_microphone=settings.auto_switch_audio_devices,
+            headset_microphone_name=settings.headset_microphone_name,
         )
         self._screen_events: list[ScreenTextEvent] = []
         # Timestamped speaker-name-badge sightings, kept alongside the caption stream — not used for

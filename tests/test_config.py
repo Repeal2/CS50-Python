@@ -4,6 +4,7 @@ from pathlib import Path
 from meeting_scribe.config import (
     load_settings,
     resolve_tesseract_cmd,
+    update_audio_automation,
     update_audio_devices,
     update_copilot_settings,
     update_diarize_system_audio,
@@ -326,3 +327,34 @@ def test_meeting_dir_is_keyed_by_meeting_id_alone(tmp_path, monkeypatch):
     assert settings.meeting_dir(42) == tmp_path / "meetings" / "42"
     # No dependency on any project at all — the same meeting id always resolves to the same path.
     assert settings.meeting_dir(42) == settings.meeting_dir(42)
+
+
+def test_automatic_device_switching_is_on_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = load_settings()
+
+    assert settings.auto_switch_audio_devices is True
+    assert settings.headset_microphone_name is None
+
+
+def test_update_audio_automation_persists_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    settings = update_audio_devices(load_settings(), mic_device_name="Laptop Mic", system_device_name=None)
+    update_audio_automation(
+        settings, auto_switch_audio_devices=False, headset_microphone_name="Jabra Evolve2 65"
+    )
+
+    reloaded = load_settings()
+    assert reloaded.auto_switch_audio_devices is False
+    assert reloaded.headset_microphone_name == "Jabra Evolve2 65"
+    assert reloaded.mic_device_name == "Laptop Mic"
+
+
+def test_a_blank_headset_means_recognize_one_by_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_audio_automation(load_settings(), auto_switch_audio_devices=True, headset_microphone_name="")
+
+    assert load_settings().headset_microphone_name is None
