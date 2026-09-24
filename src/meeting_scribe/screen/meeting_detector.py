@@ -1,5 +1,5 @@
 """Notices when a Teams call starts, so the app can offer to record it (see gui.meeting_prompt) instead
-of relying on the user remembering to press Start.
+of relying on the user remembering to press Start — and when a recorded call ends, to offer to stop.
 
 "In a call" is read from Windows' own record of which apps are using the microphone right now — the
 same data behind the mic icon in the taskbar and Settings > Privacy > Microphone — rather than from
@@ -143,6 +143,42 @@ class MeetingPromptTracker:
     def dismiss(self) -> None:
         if self._state is _PromptState.PROMPTING:
             self._state = _PromptState.HANDLED
+
+
+class MeetingEndTracker:
+    """The counterpart to MeetingPromptTracker for the other end of a call: decides whether the "meeting
+    ended — stop recording?" prompt should be showing. Only a recording that has actually seen a Teams
+    call counts, so recording something else (a Zoom call, an in-person meeting) never gets asked. Once
+    asked, a recording isn't asked again unless a call is seen again (rejoining, say) and then ends.
+
+    The end has to hold for END_CONFIRM_POLLS consecutive polls, not just one, so a momentary gap in
+    Teams holding the mic (e.g. switching audio devices mid-call) doesn't pop up the prompt."""
+
+    END_CONFIRM_POLLS = 2
+
+    def __init__(self) -> None:
+        self._call_seen = False
+        self._polls_without_call = 0
+        self._prompting = False
+
+    def update(self, *, in_call: bool, recording: bool) -> bool:
+        if not recording:
+            self._call_seen = False
+            self._polls_without_call = 0
+            self._prompting = False
+        elif in_call:
+            self._call_seen = True
+            self._polls_without_call = 0
+            self._prompting = False
+        elif self._call_seen:
+            self._polls_without_call += 1
+            if self._polls_without_call >= self.END_CONFIRM_POLLS:
+                self._call_seen = False
+                self._prompting = True
+        return self._prompting
+
+    def dismiss(self) -> None:
+        self._prompting = False
 
 
 def prompt_position(

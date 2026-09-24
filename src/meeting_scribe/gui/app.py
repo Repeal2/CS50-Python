@@ -30,7 +30,7 @@ from meeting_scribe.config import (
     update_whisper_model_size,
 )
 from meeting_scribe.audio.device_watch import device_signature
-from meeting_scribe.gui.meeting_prompt import MeetingPrompt
+from meeting_scribe.gui.meeting_prompt import PromptCard, start_recording_prompt, stop_recording_prompt
 from meeting_scribe.hotkeys import (
     GlobalHotkeyListener,
     HotkeyCombo,
@@ -39,7 +39,12 @@ from meeting_scribe.hotkeys import (
     key_name,
 )
 from meeting_scribe.screen.capture import ocr_region
-from meeting_scribe.screen.meeting_detector import DetectedMeeting, MeetingPromptTracker, detect_teams_meeting
+from meeting_scribe.screen.meeting_detector import (
+    DetectedMeeting,
+    MeetingEndTracker,
+    MeetingPromptTracker,
+    detect_teams_meeting,
+)
 from meeting_scribe.screen.region_picker import (
     RegionOutline,
     RegionTarget,
@@ -230,8 +235,13 @@ class MeetingScribeApp(tk.Tk):
         self.after(self._DEVICE_POLL_MS, self._poll_devices)
 
         self._meeting_prompt_tracker = MeetingPromptTracker()
-        self._meeting_prompt: MeetingPrompt | None = None
+        self._meeting_end_tracker = MeetingEndTracker()
+        self._start_prompt: PromptCard | None = None
+        self._stop_prompt: PromptCard | None = None
         self._detected_meeting: DetectedMeeting | None = None
+        # The work area of the monitor the call was last seen on — where the "meeting ended" prompt goes,
+        # since by then the call window it would otherwise sit under has closed.
+        self._meeting_work_area: dict | None = None
         if sys.platform == "win32":
             self.after(self._MEETING_POLL_MS, self._poll_teams_meeting)
 
@@ -346,46 +356,84 @@ class MeetingScribeApp(tk.Tk):
     def _on_teams_meeting_polled(self, meeting: DetectedMeeting | None) -> None:
         try:
             self._detected_meeting = meeting
-            show = self._meeting_prompt_tracker.update(
-                in_call=meeting is not None, recording=self._session is not None
-            )
-            if not show or meeting is None:
-                self.close_meeting_prompt()
-                return
-            if self._meeting_prompt is None:
-                self._meeting_prompt = MeetingPrompt(
-                    self,
-                    meeting.name,
-                    on_start=self._start_from_meeting_prompt,
-                    on_dismiss=self._dismiss_meeting_prompt,
-                )
-            self._place_meeting_prompt(meeting)
+            in_call = meeting is not None
+            session = self._session
+            recording = session is not None
+
+            window_rect = None
+            if meeting is not None:
+                window_rect = self._measure_meeting_window(meeting)
+
+            if self._meeting_prompt_tracker.update(in_call=in_call, recording=recording) and meeting is not None:
+                if self._start_prompt is None:
+                    self._start_prompt = start_recording_prompt(
+                        self, meeting.name, self._start_from_meeting_prompt, self._dismiss_start_prompt
+                    )
+                if self._meeting_work_area is not None:
+                    self._start_prompt.place(window_rect, self._meeting_work_area)
+            else:
+                self._close_start_prompt()
+
+            if self._meeting_end_tracker.update(in_call=in_call, recording=recording) and session is not None:
+                work_area = self._meeting_work_area or self._primary_work_area()
+                if self._stop_prompt is None and work_area is not None:
+                    self._stop_prompt = stop_recording_prompt(
+                        self, session.title, self._stop_from_meeting_prompt, self._dismiss_stop_prompt
+                    )
+                    self._stop_prompt.place(None, work_area)
+            else:
+                self._close_stop_prompt()
         finally:
             self.after(self._MEETING_POLL_MS, self._poll_teams_meeting)
 
-    def _place_meeting_prompt(self, meeting: DetectedMeeting) -> None:
+    def _measure_meeting_window(self, meeting: DetectedMeeting) -> dict | None:
+        """The call window's current bounds (None if minimized), remembering which monitor it's on for
+        the "meeting ended" prompt — see _meeting_work_area."""
         from meeting_scribe.screen.window_picker import get_monitor_work_area, get_window_region
 
         hwnd = meeting.window.hwnd if meeting.window is not None else None
         try:
             window_rect = get_window_region(hwnd) if hwnd is not None else None
-            work_area = get_monitor_work_area(hwnd)
+            self._meeting_work_area = get_monitor_work_area(hwnd)
         except Exception:
-            return  # the call window closed since the check ran; the next check sorts it out
-        self._meeting_prompt.place(window_rect, work_area)
+            return None  # the call window closed since the check ran; the next check sorts it out
+        return window_rect
 
-    def close_meeting_prompt(self) -> None:
-        if self._meeting_prompt is not None:
-            self._meeting_prompt.close()
-            self._meeting_prompt = None
+    def _primary_work_area(self) -> dict | None:
+        from meeting_scribe.screen.window_picker import get_monitor_work_area
 
-    def _dismiss_meeting_prompt(self) -> None:
+        try:
+            return get_monitor_work_area(None)
+        except Exception:
+            return None
+
+    def close_meeting_prompts(self) -> None:
+        """Called when recording starts or stops by any route, so a prompt offering to do what just
+        happened doesn't linger until the next check."""
+        self._close_start_prompt()
+        self._close_stop_prompt()
+
+    def _close_start_prompt(self) -> None:
+        if self._start_prompt is not None:
+            self._start_prompt.close()
+            self._start_prompt = None
+
+    def _close_stop_prompt(self) -> None:
+        if self._stop_prompt is not None:
+            self._stop_prompt.close()
+            self._stop_prompt = None
+
+    def _dismiss_start_prompt(self) -> None:
         self._meeting_prompt_tracker.dismiss()
-        self.close_meeting_prompt()
+        self._close_start_prompt()
+
+    def _dismiss_stop_prompt(self) -> None:
+        self._meeting_end_tracker.dismiss()
+        self._close_stop_prompt()
 
     def _start_from_meeting_prompt(self) -> None:
         meeting = self._detected_meeting
-        self._dismiss_meeting_prompt()
+        self._dismiss_start_prompt()
         if self._session is not None:
             return
         # Uses the name detection already found rather than letting _start look it up again.
@@ -393,6 +441,11 @@ class MeetingScribeApp(tk.Tk):
             if self._record_tab.title_var.get().strip() in ("", DEFAULT_MEETING_TITLE):
                 self._record_tab.title_var.set(meeting.name)
         self._record_tab._start()
+
+    def _stop_from_meeting_prompt(self) -> None:
+        self._dismiss_stop_prompt()
+        if self._session is not None:
+            self._record_tab._stop()
 
     def refresh_project_lists(self) -> None:
         self._record_tab.refresh_projects()
@@ -1086,7 +1139,7 @@ class RecordTab(ttk.Frame):
             return
 
         self.app._session = session
-        self.app.close_meeting_prompt()
+        self.app.close_meeting_prompts()
         # Reflects the DEFAULT_PROJECT_NAME/detected-title fallbacks back into their fields, so what's
         # shown always matches what the meeting is actually recording under — same reasoning either way:
         # a placeholder that isn't reflected in the field it stands in for isn't actually saved anywhere.
@@ -1177,6 +1230,7 @@ class RecordTab(ttk.Frame):
         # the next meeting. Everything the background job needs (the session, its title) is already
         # captured in this closure, so the app has no more use for the "current" session slot.
         self.app._session = None
+        self.app.close_meeting_prompts()
         # Redundant when _poll_auto_stop is what called _stop() (it already cleared this before doing
         # so), but necessary for a manual click on the Stop button — either way, nothing should still be
         # watching a session that's no longer the active one.
