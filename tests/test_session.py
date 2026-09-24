@@ -45,6 +45,20 @@ def _plenty_of_memory(monkeypatch):
     monkeypatch.setattr("meeting_scribe.session.available_memory_mb", lambda: 1_000_000.0)
 
 
+@pytest.fixture(autouse=True)
+def _recordings_have_audio(monkeypatch):
+    """Most tests here name WAV paths that don't exist (the transcriber is mocked, so nothing reads
+    them). Tests of what happens to an empty or missing track use `_real_durations` to undo this."""
+    monkeypatch.setattr("meeting_scribe.session.wav_duration_seconds", lambda path: 60.0)
+
+
+@pytest.fixture
+def _real_durations(monkeypatch):
+    from meeting_scribe.transcription.engine import wav_duration_seconds
+
+    monkeypatch.setattr("meeting_scribe.session.wav_duration_seconds", wav_duration_seconds)
+
+
 def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
@@ -952,3 +966,88 @@ def test_abandon_stops_capture_without_transcribing_and_leaves_the_meeting_retry
             MockRecorder.return_value.stop.assert_called_once()
             MockTranscriber.return_value.transcribe_parts.assert_not_called()
             assert db.get_meeting(session.meeting_id).ended_at is None
+
+
+# --- a track with no audio in it (e.g. a system-audio device that never delivered anything) ----------
+
+
+def _write_wav(path: Path, seconds: float = 1.0) -> None:
+    import contextlib
+    import wave
+
+    with contextlib.closing(wave.open(str(path), "wb")) as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16000)
+        wav_file.writeframes(b"\x00\x00" * int(16000 * seconds))
+
+
+def test_session_leaves_out_an_empty_system_track_instead_of_failing(tmp_path, _real_durations):
+    # The field case: a 0-byte system.wav used to make local transcription raise "Invalid data found
+    # when processing input", which failed the whole meeting — the mic transcript with it.
+    mic, system = tmp_path / "mic.wav", tmp_path / "system.wav"
+    _write_wav(mic)
+    system.write_bytes(b"")
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod,
+    ):
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=(mic,), system_paths=(system,), started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(
+                _settings(tmp_path, diarize_system_audio=True, runpod_api_key="k", runpod_endpoint_id="e"),
+                db,
+                "Test Project",
+                "Kickoff",
+            )
+            session.start()
+            progress = []
+            result = session.stop(on_progress=progress.append)
+            finished = db.get_meeting(session.meeting_id).ended_at is not None
+
+    assert finished
+    assert "You: hello" in result
+    assert "System audio: system.wav has no audio in it, so that track is left out of the transcript." in progress
+    # Neither transcriber was asked to read the empty file.
+    assert MockTranscriber.return_value.transcribe_parts.call_args_list == [(((mic,),), {"source": "mic"})]
+    MockRunpod.assert_not_called()
+
+
+def test_retry_recovers_a_meeting_whose_system_track_is_empty(tmp_path, _real_durations):
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        from meeting_scribe.session import retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            _project, meeting_id = _stuck_meeting(settings, db)
+            _write_wav(settings.meeting_dir(meeting_id) / "mic.wav")
+            (settings.meeting_dir(meeting_id) / "system.wav").write_bytes(b"")
+
+            progress = []
+            result = retry_meeting_transcription(settings, db, meeting_id, on_progress=progress.append)
+
+            assert "You: hello" in result
+            assert db.get_meeting(meeting_id).ended_at is not None
+            assert any(message.startswith("System audio: system.wav has no audio") for message in progress)
+
+
+def test_retry_with_only_empty_tracks_says_so(tmp_path, _real_durations):
+    from meeting_scribe.session import retry_meeting_transcription
+
+    with Database(tmp_path / "test.db") as db:
+        settings = _settings(tmp_path)
+        _project, meeting_id = _stuck_meeting(settings, db)
+        for name in ("mic.wav", "system.wav"):
+            (settings.meeting_dir(meeting_id) / name).write_bytes(b"")
+
+        with pytest.raises(FileNotFoundError, match="is empty"):
+            retry_meeting_transcription(settings, db, meeting_id)

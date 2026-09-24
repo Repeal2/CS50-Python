@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import wave
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from meeting_scribe.audio.recorder import (
     _ACTIVITY_DBFS,
     _analyze_pcm16,
     _pcm16_level,
+    _ChunkStats,
     _SegmentedWavWriter,
     _SILENT_DBFS,
     _StreamActivityMonitor,
@@ -600,6 +602,29 @@ def test_stop_does_not_terminate_pyaudio_when_a_capture_thread_is_stuck(tmp_path
 
     assert terminated == []
     assert any("didn't stop within 5s" in notice for notice in recorder.capture_notices())
+
+
+def test_stop_closes_a_stuck_threads_file_so_it_is_still_a_readable_wav(tmp_path, monkeypatch):
+    # Seen in the field: WASAPI loopback delivers nothing while nothing plays through the selected
+    # output device, so a system-audio thread can sit in its very first read() for a whole meeting.
+    # `wave` only writes a header with the first chunk, so the file was left at 0 bytes, which FFmpeg
+    # rejects as "Invalid data found" — and that failed the whole meeting's transcription.
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    recorder._system_thread = _finished_thread()
+    recorder._system_writer = _SegmentedWavWriter(tmp_path / "system.wav", 2, SAMPLE_WIDTH_BYTES, 48000)
+    recorder._pyaudio = SimpleNamespace(terminate=lambda: None)
+    monkeypatch.setattr(Recorder, "_join_capture_thread", staticmethod(lambda thread, timeout=5.0: True))
+    assert (tmp_path / "system.wav").stat().st_size == 0
+
+    recorded = recorder.stop()
+
+    assert recorded.system_paths == (tmp_path / "system.wav",)
+    with contextlib.closing(wave.open(str(tmp_path / "system.wav"), "rb")) as wav_file:
+        assert (wav_file.getnchannels(), wav_file.getframerate(), wav_file.getnframes()) == (2, 48000, 0)
+    # If the thread ever wakes, its write is refused rather than touching a closed file.
+    with pytest.raises(ValueError, match="already closed"):
+        recorder._system_writer.write(b"\x00" * 4)
 
 
 def test_stop_still_terminates_pyaudio_when_capture_threads_stop_in_time(tmp_path, monkeypatch):
@@ -1212,3 +1237,55 @@ def test_reload_devices_reports_portaudio_failing_to_restart_and_can_try_again(t
     recorder._system_thread.join(timeout=5)
     assert recorder._pyaudio is host
     assert recorder.device_list_version == 1
+
+
+# --- a stream that never delivers anything -----------------------------------------------------------
+
+
+def _active_health() -> StreamHealth:
+    return StreamHealth(
+        seconds_captured=60.0,
+        peak_dbfs=-20.0,
+        heard_activity=True,
+        seconds_since_activity=1.0,
+        digital_silence=False,
+        clipping=False,
+    )
+
+
+def test_an_open_stream_that_has_delivered_nothing_reports_how_long_it_has_waited():
+    monitor = _StreamActivityMonitor()
+    assert monitor.health(100.0).seconds_without_data is None  # not opened yet — nothing to conclude
+
+    monitor.stream_opened(100.0)
+
+    assert monitor.health(125.0).seconds_without_data == 25.0
+
+
+def test_waiting_ends_once_a_chunk_arrives_and_restarts_when_the_stream_is_reopened():
+    monitor = _StreamActivityMonitor()
+    monitor.stream_opened(100.0)
+    monitor.observe(_ChunkStats(level=0.1, rms_dbfs=-40.0, all_zero=False, clipped=False), 101.0)
+    assert monitor.health(150.0).seconds_without_data is None
+
+    monitor.stream_opened(160.0)  # a device switch onto a device that delivers nothing
+
+    assert monitor.health(200.0).seconds_without_data == 40.0
+
+
+def test_system_audio_delivering_nothing_while_the_mic_is_active_is_reported():
+    # The field case: the call played through a headset while a different output was being recorded.
+    waiting = replace(StreamHealth.idle(), seconds_without_data=1600.0)
+
+    (problem,) = describe_input_problems(_active_health(), waiting)
+
+    assert problem.startswith("System audio: nothing at all has come through in 1600s")
+    assert "different one" in problem
+
+
+def test_no_data_is_not_reported_before_the_grace_period_or_while_the_other_track_is_quiet():
+    too_soon = replace(StreamHealth.idle(), seconds_without_data=10.0)
+    assert describe_input_problems(_active_health(), too_soon) == ()
+
+    long_wait = replace(StreamHealth.idle(), seconds_without_data=600.0)
+    assert describe_input_problems(StreamHealth.idle(), long_wait) == ()
