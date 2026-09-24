@@ -55,6 +55,7 @@ def _transcribe_system_track(
                 api_key=settings.runpod_api_key,
                 endpoint_id=settings.runpod_endpoint_id,
                 huggingface_token=settings.runpod_huggingface_token,
+                on_progress=report,
             )
             return transcriber.transcribe_parts(system_paths, source="system")
         except RunpodWhisperXError as error:
