@@ -12,6 +12,7 @@ from meeting_scribe.audio.recorder import (
     SAMPLE_WIDTH_BYTES,
     DeviceProbe,
     Recorder,
+    _HEADSET_RECHECK_SECONDS,
     _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS,
     _SegmentedWavWriter,
     _SILENT_DBFS,
@@ -20,7 +21,7 @@ from meeting_scribe.audio.recorder import (
     _analyze_pcm16,
     _probe_devices,
     choose_fallback_microphone,
-    find_headset_microphone,
+    find_headset_microphones,
     looks_like_headset,
     next_microphone,
     next_system_device,
@@ -118,30 +119,36 @@ def test_headsets_are_recognized_by_the_names_windows_gives_them():
     assert not looks_like_headset("Microphone Array (Realtek(R) Audio)")
 
 
-def test_the_headset_picked_in_settings_wins_over_name_matching():
-    names = INPUTS + ["USB Audio Device"]
-    assert find_headset_microphone(names, configured="USB Audio Device") == "USB Audio Device"
+def test_every_connected_headset_is_found_once_with_the_one_from_settings_first():
+    names = INPUTS + ["USB Audio Device", "Headset (WH-1000XM4 Hands-Free AG Audio)"]
+    assert find_headset_microphones(names, configured="USB Audio Device") == [
+        "USB Audio Device",
+        "Headset Microphone (Jabra Evol",  # the full-length Jabra name is the same headset
+        "Headset (WH-1000XM4 Hands-Free AG Audio)",
+    ]
 
 
-def test_a_headset_picked_in_settings_that_is_not_connected_is_not_used():
-    assert find_headset_microphone(INPUTS, configured="USB Audio Device") is None
+def test_a_headset_picked_in_settings_that_is_not_connected_is_left_out():
+    assert find_headset_microphones(INPUTS, configured="USB Audio Device") == [
+        "Headset Microphone (Jabra Evol"
+    ]
 
 
-def test_without_a_setting_the_headset_is_found_by_name():
-    assert find_headset_microphone(INPUTS, configured=None) == "Headset Microphone (Jabra Evol"
-    assert find_headset_microphone(["Microphone Array (Realtek)"], configured=None) is None
+def test_no_headsets_connected():
+    assert find_headset_microphones(["Microphone Array (Realtek)"], configured=None) == []
 
 
 def test_the_fallback_is_the_microphone_chosen_in_settings():
     fallback = choose_fallback_microphone(
-        INPUTS, configured="Microphone Array (Realtek)", default_name=None, headset=INPUTS[3]
+        INPUTS, configured="Microphone Array (Realtek)", default_name=None, headsets=[INPUTS[3]]
     )
     assert fallback == "Microphone Array (Realtek)"
 
 
-def test_the_fallback_is_never_the_headset_even_when_windows_made_it_the_default():
+def test_the_fallback_is_never_a_headset_even_when_windows_made_it_the_default():
     fallback = choose_fallback_microphone(
-        INPUTS, configured=INPUTS[3], default_name=INPUTS[2], headset=INPUTS[3]
+        INPUTS + ["USB Audio Device"], configured=INPUTS[3], default_name="USB Audio Device",
+        headsets=["USB Audio Device", INPUTS[3]],
     )
     assert fallback == "Microphone Array (Realtek)"
 
@@ -151,47 +158,51 @@ def test_the_fallback_skips_loopback_inputs():
         ["Stereo Mix (Realtek)", "Headset Microphone (Jabra)", "Microphone (USB)"],
         configured=None,
         default_name=None,
-        headset="Headset Microphone (Jabra)",
+        headsets=["Headset Microphone (Jabra)"],
     )
     assert fallback == "Microphone (USB)"
 
 
-def test_a_live_headset_is_kept():
+HEADSETS = ["Jabra", "Sony"]
+
+
+def _next(active, *, dead=False, live=None, fallback="Laptop"):
+    return next_microphone(
+        active=active, headsets=HEADSETS, fallback=fallback, active_is_dead=dead, live_headsets=live
+    )
+
+
+def test_a_working_headset_is_kept():
+    assert _next("Jabra") is None
+    assert _next("Jabra", live=["Sony"]) is None
+
+
+def test_a_dead_headset_hands_over_to_another_headset_that_is_live():
+    assert _next("Jabra", dead=True, live=["Sony"]) == "Sony"
+
+
+def test_the_laptop_is_used_only_when_no_headset_is_live():
+    assert _next("Jabra", dead=True, live=[]) == "Laptop"
+    assert _next("Jabra", dead=True, live=["Jabra"]) == "Laptop"  # itself doesn't count as another
+
+
+def test_from_the_laptop_the_first_live_headset_takes_over():
+    assert _next("Laptop", live=["Jabra", "Sony"]) == "Jabra"
+    assert _next("Laptop", live=["Sony"]) == "Sony"
+    assert _next("Laptop", live=[]) is None
+    assert _next("Laptop", live=None) is None  # nothing was listened to this time
+
+
+def test_the_same_headset_under_a_shortened_name_counts_as_the_one_in_use():
     assert next_microphone(
-        active="Headset", headset="Headset", fallback="Laptop",
-        active_seconds_without_signal=1.0, headset_is_live=None,
-    ) is None
-
-
-def test_a_headset_that_has_gone_digitally_silent_hands_over_to_the_laptop():
-    assert next_microphone(
-        active="Headset", headset="Headset", fallback="Laptop",
-        active_seconds_without_signal=_HEADSET_SILENT_BEFORE_FALLBACK_SECONDS, headset_is_live=None,
-    ) == "Laptop"
-
-
-def test_the_headset_takes_back_over_once_it_is_live_again():
-    assert next_microphone(
-        active="Laptop", headset="Headset", fallback="Laptop",
-        active_seconds_without_signal=0.0, headset_is_live=True,
-    ) == "Headset"
-    assert next_microphone(
-        active="Laptop", headset="Headset", fallback="Laptop",
-        active_seconds_without_signal=0.0, headset_is_live=False,
-    ) is None
-
-
-def test_the_same_headset_under_a_shortened_name_counts_as_the_headset():
-    assert next_microphone(
-        active="Headset Microphone (Jabra Evol", headset="Headset Microphone (Jabra Evolve2 65)",
-        fallback="Laptop", active_seconds_without_signal=0.0, headset_is_live=True,
+        active="Headset Microphone (Jabra Evol", headsets=["Headset Microphone (Jabra Evolve2 65)"],
+        fallback="Laptop", active_is_dead=False, live_headsets=["Headset Microphone (Jabra Evolve2 65)"],
     ) is None
 
 
 def test_nothing_changes_without_a_headset_connected():
     assert next_microphone(
-        active="Laptop", headset=None, fallback="Laptop",
-        active_seconds_without_signal=99.0, headset_is_live=None,
+        active="Laptop", headsets=[], fallback="Laptop", active_is_dead=True, live_headsets=None
     ) is None
 
 
@@ -356,48 +367,99 @@ def test_system_audio_is_left_alone_while_it_is_playing(tmp_path):
     assert switches == []
 
 
-def _mic_host(headset_stream):
-    laptop, headset = _info("Microphone Array (Realtek)", 0), _info("Headset Microphone (Jabra)", 1)
-    return _ProbeHost({1: headset_stream}, inputs=[laptop, headset], default_input=headset)
+LAPTOP, JABRA, SONY = "Microphone Array (Realtek)", "Headset Microphone (Jabra)", "Headset (Sony Hands-Free)"
 
 
-def test_the_microphone_falls_back_to_the_laptop_when_the_headset_goes_silent(tmp_path):
-    recorder, switches = _auto_recorder(
-        tmp_path, _mic_host(_PolledStream()), auto_microphone=True,
-        mic_device_name="Microphone Array (Realtek)",
-    )
-    recorder._mic_active_device_name = "Headset Microphone (Jabra)"
-    recorder._mic_monitor.stream_opened(time.monotonic() - _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS - 1)
+def _mic_host(jabra_stream, sony_stream=None):
+    devices = [_info(LAPTOP, 0), _info(JABRA, 1)]
+    streams = {1: jabra_stream}
+    if sony_stream is not None:
+        devices.append(_info(SONY, 2))
+        streams[2] = sony_stream
+    return _ProbeHost(streams, inputs=devices, default_input=devices[1])
+
+
+def _on_headset(tmp_path, host, silent_for):
+    recorder, switches = _auto_recorder(tmp_path, host, auto_microphone=True, mic_device_name=LAPTOP)
+    recorder._mic_active_device_name = JABRA
+    recorder._mic_monitor.stream_opened(time.monotonic() - silent_for)
     recorder._mic_monitor.observe(_analyze_pcm16(SILENT), time.monotonic())
+    return recorder, switches
+
+
+def test_a_silent_headset_hands_over_to_another_headset_that_is_live(tmp_path):
+    host = _mic_host(_PolledStream(), sony_stream=_PolledStream([QUIET] * 50))
+    recorder, switches = _on_headset(tmp_path, host, _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS + 1)
 
     recorder._auto_select_microphone(time.monotonic())
 
-    assert [(kind, name) for kind, name, _ in switches] == [("mic", "Microphone Array (Realtek)")]
-    assert "gone silent" in switches[0][2]["reason"]
+    assert [(kind, name) for kind, name, _ in switches] == [("mic", SONY)]
 
 
-def test_the_microphone_returns_to_the_headset_once_it_picks_something_up(tmp_path):
-    recorder, switches = _auto_recorder(
-        tmp_path, _mic_host(_PolledStream([QUIET] * 50)), auto_microphone=True
-    )
-    recorder._mic_active_device_name = "Microphone Array (Realtek)"
-    recorder._mic_monitor.stream_opened(time.monotonic())
+def test_the_microphone_falls_back_to_the_laptop_when_no_headset_is_live(tmp_path):
+    host = _mic_host(_PolledStream(), sony_stream=_PolledStream([SILENT] * 50))
+    recorder, switches = _on_headset(tmp_path, host, _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS + 1)
 
     recorder._auto_select_microphone(time.monotonic())
 
-    assert [(kind, name) for kind, name, _ in switches] == [("mic", "Headset Microphone (Jabra)")]
+    assert [(kind, name) for kind, name, _ in switches] == [("mic", LAPTOP)]
+    assert "no headset is picking anything up" in switches[0][2]["reason"]
 
 
-def test_a_muted_headset_is_not_switched_back_to(tmp_path):
-    recorder, switches = _auto_recorder(
-        tmp_path, _mic_host(_PolledStream([SILENT] * 50)), auto_microphone=True
-    )
-    recorder._mic_active_device_name = "Microphone Array (Realtek)"
-    recorder._mic_monitor.stream_opened(time.monotonic())
+def test_a_headset_that_is_only_briefly_quiet_is_not_second_guessed(tmp_path):
+    host = _mic_host(_PolledStream(), sony_stream=_PolledStream([LOUD] * 50))
+    recorder, switches = _on_headset(tmp_path, host, 2.0)
 
     recorder._auto_select_microphone(time.monotonic())
 
     assert switches == []
+
+
+def test_at_the_start_a_switched_off_headset_is_left_straight_away_for_a_live_one(tmp_path):
+    host = _mic_host(_PolledStream([SILENT] * 50), sony_stream=_PolledStream([QUIET] * 50))
+    recorder, switches = _on_headset(tmp_path, host, 0.0)
+
+    recorder._auto_select_microphone(time.monotonic(), starting=True)
+
+    assert [(kind, name) for kind, name, _ in switches] == [("mic", SONY)]
+
+
+def test_at_the_start_a_live_headset_is_kept(tmp_path):
+    host = _mic_host(_PolledStream([QUIET] * 50), sony_stream=_PolledStream([LOUD] * 50))
+    recorder, switches = _on_headset(tmp_path, host, 0.0)
+
+    recorder._auto_select_microphone(time.monotonic(), starting=True)
+
+    assert switches == []
+
+
+def test_from_the_laptop_every_headset_is_checked(tmp_path):
+    host = _mic_host(_PolledStream([SILENT] * 50), sony_stream=_PolledStream([QUIET] * 50))
+    recorder, switches = _auto_recorder(tmp_path, host, auto_microphone=True, mic_device_name=LAPTOP)
+    recorder._mic_active_device_name = LAPTOP
+    recorder._mic_monitor.stream_opened(time.monotonic())
+
+    recorder._auto_select_microphone(time.monotonic())
+
+    assert [(kind, name) for kind, name, _ in switches] == [("mic", SONY)]
+
+
+def test_from_the_laptop_headsets_are_rechecked_only_every_so_often(tmp_path):
+    host = _mic_host(_PolledStream([SILENT] * 500))
+    recorder, switches = _auto_recorder(tmp_path, host, auto_microphone=True, mic_device_name=LAPTOP)
+    recorder._mic_active_device_name = LAPTOP
+    recorder._mic_monitor.stream_opened(time.monotonic())
+    now = time.monotonic()
+
+    recorder._auto_select_microphone(now)
+    assert recorder._next_headset_check == now + _HEADSET_RECHECK_SECONDS
+
+    host.streams[1] = _PolledStream([QUIET] * 50)  # unmuted, but not due to be checked yet
+    recorder._auto_select_microphone(now + 1)
+    assert switches == []
+
+    recorder._auto_select_microphone(now + _HEADSET_RECHECK_SECONDS)
+    assert [(kind, name) for kind, name, _ in switches] == [("mic", JABRA)]
 
 
 def test_picking_a_device_by_hand_turns_its_automation_off(tmp_path, monkeypatch):
@@ -412,3 +474,19 @@ def test_picking_a_device_by_hand_turns_its_automation_off(tmp_path, monkeypatch
 
     recorder.switch_system_device("Speakers", automatic=True)
     assert recorder._auto_system is True
+
+
+def test_the_first_microphone_check_runs_straight_away_and_listens_to_every_headset(tmp_path, monkeypatch):
+    recorder = Recorder(tmp_path, auto_microphone=True)
+    calls = []
+
+    def check(self, now, starting=False):
+        calls.append(starting)
+        self._watch_stop_event.set()
+
+    monkeypatch.setattr(Recorder, "_auto_select_microphone", check)
+    thread = threading.Thread(target=recorder._auto_select_devices)
+    thread.start()
+    thread.join(timeout=2)
+
+    assert calls == [True]

@@ -541,26 +541,31 @@ def _same_device(a: str, b: str) -> bool:
     return a == b or (len(shorter) >= 16 and longer.startswith(shorter))
 
 
-def find_headset_microphone(input_names, configured: str | None) -> str | None:
-    """The headset microphone that's connected right now, or None. `configured` is the one picked in
-    Settings; without one, the first input whose name says it's a headset (see looks_like_headset)."""
-    if configured:
-        return configured if configured in input_names else None
-    return next((name for name in input_names if looks_like_headset(name)), None)
+def find_headset_microphones(input_names, configured: str | None) -> list[str]:
+    """Every headset microphone connected right now, in order of preference: the one picked in Settings
+    (`configured`) first, then each input whose name says it's a headset (see looks_like_headset). The
+    same headset listed under several of Windows' audio APIs (see _same_device) counts once."""
+    candidates = [name for name in input_names if name == configured or looks_like_headset(name)]
+    candidates.sort(key=lambda name: name != configured)  # stable: otherwise keeps Windows' order
+    headsets: list[str] = []
+    for name in candidates:
+        if not any(_same_device(name, kept) for kept in headsets):
+            headsets.append(name)
+    return headsets
 
 
 def choose_fallback_microphone(
-    input_names, *, configured: str | None, default_name: str | None, headset: str | None
+    input_names, *, configured: str | None, default_name: str | None, headsets
 ) -> str | None:
-    """The microphone to use when the headset can't be: the one chosen in Settings, else the Windows
-    default, else the first input that isn't a headset — never the headset itself (Windows tends to make
-    a newly connected headset its default) or a loopback input like Stereo Mix."""
+    """The microphone to use when no headset can be: the one chosen in Settings, else the Windows
+    default, else the first input that isn't a headset — never a headset (Windows tends to make a newly
+    connected one its default) or a loopback input like Stereo Mix."""
 
     def usable(name: str | None) -> bool:
         return (
             bool(name)
             and name in input_names
-            and not (headset is not None and _same_device(name, headset))
+            and not any(_same_device(name, headset) for headset in headsets)
             and not looks_like_headset(name)
             and not any(hint in name.lower() for hint in _NOT_A_MICROPHONE_HINTS)
         )
@@ -574,26 +579,33 @@ def choose_fallback_microphone(
 def next_microphone(
     *,
     active: str | None,
-    headset: str | None,
+    headsets,
     fallback: str | None,
-    active_seconds_without_signal: float | None,
-    headset_is_live: bool | None,
+    active_is_dead: bool,
+    live_headsets,
 ) -> str | None:
-    """Which microphone to switch to now, or None to stay put. The headset whenever it's connected and
-    live; the fallback once the headset has handed over nothing but digital silence for a while (muted
-    at the headset, or switched off with its dongle still plugged in) — silence a working microphone
-    never produces, so it's safe to act on. `headset_is_live` is the result of listening to the headset
-    while on the fallback, or None if it wasn't checked this time."""
-    if headset is None or fallback is None or fallback == headset:
+    """Which microphone to switch to now, or None to stay put.
+
+    `headsets` is every connected headset, most preferred first (see find_headset_microphones), and
+    `live_headsets` the ones a probe just heard any signal from, in the same order — None if none were
+    listened to this time. `active_is_dead` says the headset being recorded has handed over nothing but
+    digital silence (muted at the headset, or switched off with its dongle still plugged in) — silence a
+    working microphone never produces, so it's safe to act on.
+
+    On a headset that's still working: stay. On one that's gone dead: the first other headset that's
+    live, else the fallback. On the fallback: the first headset that's live."""
+    live = [
+        name for name in (live_headsets or ())
+        if active is None or not _same_device(name, active)
+    ]
+    on_headset = active is not None and any(_same_device(active, headset) for headset in headsets)
+    if not on_headset:
+        return live[0] if live else None
+    if not active_is_dead:
         return None
-    if active is not None and _same_device(active, headset):
-        if (
-            active_seconds_without_signal is not None
-            and active_seconds_without_signal >= _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS
-        ):
-            return fallback
-        return None
-    return headset if headset_is_live else None
+    if live:
+        return live[0]
+    return fallback
 
 
 def next_system_device(
@@ -791,8 +803,9 @@ class Recorder:
     who'd otherwise have to remember to change it for every call. A background thread checks every
     `_AUTO_DEVICE_POLL_SECONDS`: once the recorded output device has been quiet for a while, it listens
     to the other outputs and follows whichever is playing (only one plays the call); and the
-    microphone is the headset (`headset_microphone_name`, or one recognized by name) whenever one is
-    connected and live, the usual microphone otherwise — see next_system_device / next_microphone.
+    microphone is whichever connected headset is live (`headset_microphone_name` first, then any
+    recognized by name), the usual microphone only when none is — see next_system_device /
+    next_microphone.
     Listening is done on separate streams, so recording carries on throughout, and every switch lands
     in capture_notices() with its reason. Picking a device by hand mid-meeting turns that stream's
     automation off for the rest of the meeting — the person has decided.
@@ -887,10 +900,12 @@ class Recorder:
         self._started_at = time.monotonic()
 
         if self._auto_mic:
-            headset = self._connected_headset()
-            if headset is not None and headset != self._mic_device_name:
-                self._mic_device_name = headset
-                self._record_switch(f"Microphone set to {headset!r} — a headset is connected.")
+            # The preferred headset to begin with; the automation's first check, straight after start,
+            # listens to every connected headset and moves to one that's live if this one isn't.
+            headsets = self._connected_headsets()
+            if headsets and headsets[0] != self._mic_device_name:
+                self._mic_device_name = headsets[0]
+                self._record_switch(f"Microphone set to {headsets[0]!r} — a headset is connected.")
         mic_info = self._resolve_input_device(self._mic_device_name)
         system_info = self._resolve_loopback_device(pyaudio, self._system_device_name)
         self._mic_active_device_name = mic_info["name"]
@@ -1068,15 +1083,21 @@ class Recorder:
     def _auto_select_devices(self) -> None:
         """Runs on its own thread for the life of the meeting when either automation is on — see the
         class docstring. Exits promptly on stop(), same as _watch_devices; a probe in progress is cut
-        short by the same event."""
-        while not self._watch_stop_event.wait(_AUTO_DEVICE_POLL_SECONDS):
-            for step in (self._auto_select_system_device, self._auto_select_microphone):
+        short by the same event. The microphone is checked straight away, rather than after the first
+        interval, so a meeting that starts on a headset that's switched off moves off it in a second
+        rather than after _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS."""
+        steps = [lambda now: self._auto_select_microphone(now, starting=True)]
+        while True:
+            for step in steps:
                 try:
                     step(time.monotonic())
                 except Exception as exc:  # a background check must never take the meeting down
                     self._record_notice(
                         f"Automatic device selection skipped a check ({type(exc).__name__}: {exc})."
                     )
+            if self._watch_stop_event.wait(_AUTO_DEVICE_POLL_SECONDS):
+                return
+            steps = [self._auto_select_system_device, self._auto_select_microphone]
 
     def _auto_select_system_device(self, now: float) -> None:
         if not self._auto_system or now < self._next_system_search:
@@ -1101,9 +1122,16 @@ class Recorder:
         if choice is not None and self._auto_system and not self._watch_stop_event.is_set():
             self.switch_system_device(choice, reason="the call's sound is playing through it", automatic=True)
 
-    def _auto_select_microphone(self, now: float) -> None:
+    def _auto_select_microphone(self, now: float, *, starting: bool = False) -> None:
+        """One check of the microphone — see next_microphone. Headsets are listened to only when that
+        could change anything: at the start of the meeting (all of them, the one being recorded
+        included), once the one being recorded has gone silent (the others), and every
+        _HEADSET_RECHECK_SECONDS while on the fallback (all of them)."""
         if not self._auto_mic:
             return
+        active = self._mic_active_device_name
+        silent_for = self.mic_health().seconds_without_signal
+        active_is_dead = silent_for is not None and silent_for >= _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS
         with self._probe_lock:
             pyaudio_instance = self._pyaudio
             if pyaudio_instance is None:
@@ -1111,53 +1139,62 @@ class Recorder:
             from meeting_scribe.audio.device_picker import input_devices_from
 
             names = [device.name for device in input_devices_from(pyaudio_instance)]
-            headset = find_headset_microphone(names, self._headset_microphone_name)
+            headsets = find_headset_microphones(names, self._headset_microphone_name)
+            if not headsets:
+                return
             try:
                 default_name = pyaudio_instance.get_default_input_device_info().get("name")
             except Exception:  # no default input at all
                 default_name = None
             fallback = choose_fallback_microphone(
-                names, configured=self._configured_mic_name, default_name=default_name, headset=headset
+                names, configured=self._configured_mic_name, default_name=default_name, headsets=headsets
             )
-            active = self._mic_active_device_name
-            headset_is_live = None
-            if (
-                headset is not None
-                and fallback is not None
-                and not (active is not None and _same_device(active, headset))
-                and now >= self._next_headset_check
-            ):
-                self._next_headset_check = now + _HEADSET_RECHECK_SECONDS
-                headset_info = _find_input_device(pyaudio_instance, headset)
+            on_headset = active is not None and any(_same_device(active, h) for h in headsets)
+            if starting:
+                to_probe = list(headsets)
+            elif on_headset:
+                to_probe = [h for h in headsets if not _same_device(h, active)] if active_is_dead else []
+            elif now >= self._next_headset_check:
+                to_probe = list(headsets)
+            else:
+                to_probe = []
+            live_headsets = None
+            if to_probe:
+                if not on_headset:
+                    self._next_headset_check = now + _HEADSET_RECHECK_SECONDS
+                infos = [info for info in (_find_input_device(pyaudio_instance, h) for h in to_probe) if info]
                 probes = _probe_devices(
-                    pyaudio_instance, self._pyaudio_module, [headset_info] if headset_info else [],
-                    _PROBE_SECONDS, self._watch_stop_event,
+                    pyaudio_instance, self._pyaudio_module, infos, _PROBE_SECONDS, self._watch_stop_event
                 )
-                headset_is_live = any(probe.heard_signal for probe in probes)
+                live_headsets = [probe.name for probe in probes if probe.heard_signal]
+                if starting and on_headset and not any(_same_device(active, h) for h in live_headsets):
+                    active_is_dead = True
         choice = next_microphone(
             active=active,
-            headset=headset,
+            headsets=headsets,
             fallback=fallback,
-            active_seconds_without_signal=self.mic_health().seconds_without_signal,
-            headset_is_live=headset_is_live,
+            active_is_dead=active_is_dead,
+            live_headsets=live_headsets,
         )
         if choice is None or not self._auto_mic or self._watch_stop_event.is_set():
             return
-        if choice == headset:
-            reason = "the headset is connected and picking up sound"
+        if any(_same_device(choice, h) for h in headsets):
+            reason = "that headset is connected and picking up sound"
+            if on_headset:
+                reason = "the headset in use isn't picking anything up, and this one is"
         else:
-            reason = "the headset microphone has gone silent (muted, or switched off?)"
+            reason = "no headset is picking anything up (muted, or switched off?)"
             self._next_headset_check = now + _HEADSET_RECHECK_SECONDS
         self.switch_mic_device(choice, reason=reason, automatic=True)
 
-    def _connected_headset(self) -> str | None:
+    def _connected_headsets(self) -> list[str]:
         from meeting_scribe.audio.device_picker import input_devices_from
 
         try:
             names = [device.name for device in input_devices_from(self._pyaudio)]
         except Exception:
-            return None
-        return find_headset_microphone(names, self._headset_microphone_name)
+            return []
+        return find_headset_microphones(names, self._headset_microphone_name)
 
     def _safe_device_signature(self):
         # Swallows everything: this is a background poll, not something a transient enumeration hiccup
