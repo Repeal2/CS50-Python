@@ -124,6 +124,60 @@ def _is_teams_process(hwnd: int) -> bool:
     return "teams" in Path(exe_path).stem.lower()
 
 
+@dataclass(frozen=True)
+class TeamsMeetingWindow:
+    hwnd: int
+    # None when no Teams window's title reads as a meeting name — the window is still worth knowing
+    # about as somewhere to anchor UI next to (see gui.meeting_prompt), just not as a source of a name.
+    meeting_name: str | None
+
+
+def _best_teams_meeting_window(windows: list[tuple[int, str]]) -> TeamsMeetingWindow | None:
+    """Picks the Teams window most likely to be the active call from (hwnd, title) pairs of visible
+    Teams windows, in EnumWindows' (roughly z-order) order. A bare title with no "| Microsoft Teams"
+    suffix wins over a suffixed one: some Teams versions/configurations open a window dedicated to the
+    active call, separate from the main app, titled with nothing else — a much less ambiguous signal than
+    the main window's title, which carries that suffix on every tab, not just while in a call. Falls back
+    to the first Teams window at all (with no name) when none of them reads as a meeting."""
+    named: list[tuple[bool, TeamsMeetingWindow]] = []
+    for hwnd, title in windows:
+        name = _meeting_name_from_title(title)
+        if name:
+            named.append((_TEAMS_TITLE_SUFFIX_RE.search(title) is None, TeamsMeetingWindow(hwnd, name)))
+    if named:
+        named.sort(key=lambda pair: not pair[0])
+        return named[0][1]
+    if windows:
+        return TeamsMeetingWindow(windows[0][0], None)
+    return None
+
+
+def _visible_teams_windows() -> list[tuple[int, str]]:
+    import win32gui
+
+    windows: list[tuple[int, str]] = []
+
+    def _on_window(hwnd: int, _extra: None) -> bool:
+        if win32gui.IsWindowVisible(hwnd) and _is_teams_process(hwnd):
+            title = win32gui.GetWindowText(hwnd).strip()
+            if title:
+                windows.append((hwnd, title))
+        return True
+
+    win32gui.EnumWindows(_on_window, None)
+    return windows
+
+
+def find_teams_meeting_window() -> TeamsMeetingWindow | None:
+    """The Teams window most likely to be the active call (see _best_teams_meeting_window), or None if
+    no Teams window is open at all. Doesn't by itself mean a call is in progress — every tab of the main
+    Teams window has a title that can read as a meeting name — so callers that need to know that combine
+    it with a stronger signal (see screen.meeting_detector)."""
+    if sys.platform != "win32":
+        raise RuntimeError("Detecting the active Teams meeting requires Windows (win32gui, win32process)")
+    return _best_teams_meeting_window(_visible_teams_windows())
+
+
 def find_teams_meeting_name() -> str | None:
     """Best-effort detection of an active Teams meeting's name, for auto-filling the Record tab's title
     field when it's still at its default (see gui.app.RecordTab._detect_meeting_title) — so starting a
@@ -132,28 +186,23 @@ def find_teams_meeting_name() -> str | None:
 
     Returns None if Teams isn't running, isn't in a call, or every Teams window found looks like the
     main app on some non-call tab rather than a meeting — never raises for "nothing found", only for
-    being run off Windows. A bare title with no "| Microsoft Teams" suffix is preferred over a suffixed
-    one when both are candidates: some Teams versions/configurations open a window dedicated to the
-    active call, separate from the main app, titled with nothing else — a much less ambiguous signal
-    than the main window's title, which carries that suffix on every tab, not just while in a call."""
+    being run off Windows."""
+    window = find_teams_meeting_window()
+    return window.meeting_name if window is not None else None
+
+
+def get_monitor_work_area(hwnd: int | None) -> dict:
+    """The work area (the monitor minus the taskbar) of the monitor `hwnd` is on — or nearest to, if
+    it's minimized or off-screen — as an mss-style {left, top, width, height} dict. None means the
+    primary monitor."""
     if sys.platform != "win32":
-        raise RuntimeError("Detecting the active Teams meeting requires Windows (win32gui, win32process)")
-    import win32gui
+        raise RuntimeError("Monitor lookup requires Windows (win32api)")
+    import win32api
+    import win32con
 
-    # (is_bare, name) pairs — sorted so a bare (no-suffix) title wins over a suffixed one, with
-    # EnumWindows' own (roughly z-order) order as the tiebreak among candidates of the same kind.
-    candidates: list[tuple[bool, str]] = []
-
-    def _on_window(hwnd: int, _extra: None) -> bool:
-        if win32gui.IsWindowVisible(hwnd) and _is_teams_process(hwnd):
-            title = win32gui.GetWindowText(hwnd).strip()
-            name = _meeting_name_from_title(title)
-            if name:
-                candidates.append((_TEAMS_TITLE_SUFFIX_RE.search(title) is None, name))
-        return True
-
-    win32gui.EnumWindows(_on_window, None)
-    if not candidates:
-        return None
-    candidates.sort(key=lambda pair: not pair[0])
-    return candidates[0][1]
+    if hwnd is None:
+        monitor = win32api.MonitorFromPoint((0, 0), win32con.MONITOR_DEFAULTTOPRIMARY)
+    else:
+        monitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+    left, top, right, bottom = win32api.GetMonitorInfo(monitor)["Work"]
+    return {"left": left, "top": top, "width": right - left, "height": bottom - top}
