@@ -166,16 +166,20 @@ def test_a_segments_speaker_label_is_saved_and_defaults_to_none(tmp_path):
     with Database(tmp_path / "test.db") as db:
         project = db.create_project("Speakers")
         meeting_id = db.create_meeting(project.id, "Kickoff")
-        db.add_transcript_segment(meeting_id, "system", 1.0, "Diarized line.", speaker="SPEAKER_00")
-        db.add_transcript_segment(meeting_id, "mic", 2.0, "My own line.")
+        db.add_transcript_segment(
+            meeting_id, "system", 1.0, "Diarized line.", speaker="SPEAKER_00", engine="runpod"
+        )
+        db.add_transcript_segment(meeting_id, "mic", 2.0, "My own line.", engine="local")
+        db.add_transcript_segment(meeting_id, "screen_ocr", 3.0, "Slide: Agenda")
 
-        assert [(row["text"], row["speaker"]) for row in db.get_segments(meeting_id)] == [
-            ("Diarized line.", "SPEAKER_00"),
-            ("My own line.", None),
+        assert [(row["text"], row["speaker"], row["engine"]) for row in db.get_segments(meeting_id)] == [
+            ("Diarized line.", "SPEAKER_00", "runpod"),
+            ("My own line.", None, "local"),
+            ("Slide: Agenda", None, None),
         ]
 
 
-def test_segments_created_before_speaker_existed_get_the_column_via_migration(tmp_path):
+def test_segments_created_before_speaker_and_engine_existed_get_the_columns_via_migration(tmp_path):
     # A database from before diarization: transcript_segments has no speaker column, and already holds
     # a line. Opening it must add the column (old lines read back as None) rather than fail on insert.
     db_path = tmp_path / "legacy.db"
@@ -203,11 +207,11 @@ def test_segments_created_before_speaker_existed_get_the_column_via_migration(tm
     conn.close()
 
     with Database(db_path) as db:
-        db.add_transcript_segment(meeting_id, "system", 1.0, "A new line.", speaker="SPEAKER_01")
+        db.add_transcript_segment(meeting_id, "system", 1.0, "A new line.", speaker="SPEAKER_01", engine="runpod")
 
-        assert [(row["text"], row["speaker"]) for row in db.get_segments(meeting_id)] == [
-            ("An old line.", None),
-            ("A new line.", "SPEAKER_01"),
+        assert [(row["text"], row["speaker"], row["engine"]) for row in db.get_segments(meeting_id)] == [
+            ("An old line.", None, None),
+            ("A new line.", "SPEAKER_01", "runpod"),
         ]
 
 
