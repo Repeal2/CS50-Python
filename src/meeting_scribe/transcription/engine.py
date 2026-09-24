@@ -190,7 +190,7 @@ def wav_duration_seconds(path: Path) -> float:
         with contextlib.closing(wave.open(str(path), "rb")) as wav_file:
             framerate = wav_file.getframerate()
             return wav_file.getnframes() / framerate if framerate else 0.0
-    except (OSError, wave.Error):
+    except (OSError, EOFError, wave.Error):  # EOFError: a 0-byte file, which never got a header
         return 0.0
 
 

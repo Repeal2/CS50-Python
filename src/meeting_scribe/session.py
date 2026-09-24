@@ -30,6 +30,7 @@ from meeting_scribe.transcription.engine import (
     merge_transcript_lines,
     render_transcript,
     transcription_slot,
+    wav_duration_seconds,
 )
 
 _WAITING_FOR_TRANSCRIPTION_MESSAGE = "Waiting for another meeting's transcription to finish first…"
@@ -59,6 +60,8 @@ def _transcribe_system_track(
     compared side by side on the Projects tab. A cloud failure is reported rather than raised: a
     third-party outage or a missing API key shouldn't cost a meeting its transcript, just the per-speaker
     labels."""
+    if not system_paths:
+        return _SystemTranscripts(local=[], runpod=None)
     runpod_lines = None
     if settings.diarize_system_audio:
         try:
@@ -80,6 +83,19 @@ def _transcribe_system_track(
             report("Transcribing system audio on this PC too, for comparison…")
     local_lines = local_transcriber.transcribe_parts(system_paths, source="system")
     return _SystemTranscripts(local=local_lines, runpod=runpod_lines)
+
+
+def _parts_with_audio(paths: Sequence[Path], label: str, report: Callable[[str], None]) -> tuple[Path, ...]:
+    """The WAV parts that actually contain audio. One that's missing, empty or unreadable — e.g. a
+    capture stream whose device never delivered anything (see Recorder.stop) — is left out with a
+    message, rather than failing transcription for the whole meeting, including the track that's fine."""
+    kept = []
+    for path in paths:
+        if wav_duration_seconds(path) > 0:
+            kept.append(path)
+        else:
+            report(f"{label}: {path.name} has no audio in it, so that track is left out of the transcript.")
+    return tuple(kept)
 
 
 def _save_segments(
@@ -237,6 +253,8 @@ class MeetingSession:
         for message in recorded.notices:
             report(message)
 
+        mic_paths = _parts_with_audio(recorded.mic_paths, "Microphone", report)
+        system_paths = _parts_with_audio(recorded.system_paths, "System audio", report)
         with transcription_slot(on_wait=lambda: report(_WAITING_FOR_TRANSCRIPTION_MESSAGE)):
             # Checked right before the expensive part starts, not any earlier — a warning here is what a
             # `mkl_malloc: failed to allocate memory` crash further down would otherwise give no advance
@@ -246,10 +264,8 @@ class MeetingSession:
                 report(warning)
 
             try:
-                mic_lines = self._transcriber.transcribe_parts(recorded.mic_paths, source="mic")
-                system = _transcribe_system_track(
-                    self._settings, self._transcriber, recorded.system_paths, report
-                )
+                mic_lines = self._transcriber.transcribe_parts(mic_paths, source="mic")
+                system = _transcribe_system_track(self._settings, self._transcriber, system_paths, report)
             finally:
                 self._transcriber.unload()
         screen_lines = [
@@ -347,6 +363,12 @@ def retry_meeting_transcription(
     if not mic_paths and not system_paths:
         raise FileNotFoundError(
             f'No recorded audio found for "{meeting.title}" in {meeting_dir} — nothing to retranscribe.'
+        )
+    mic_paths = _parts_with_audio(mic_paths, "Microphone", report)
+    system_paths = _parts_with_audio(system_paths, "System audio", report)
+    if not mic_paths and not system_paths:
+        raise FileNotFoundError(
+            f'The recorded audio for "{meeting.title}" in {meeting_dir} is empty — nothing to retranscribe.'
         )
 
     with transcription_slot(on_wait=lambda: report(_WAITING_FOR_TRANSCRIPTION_MESSAGE)):

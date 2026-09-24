@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -83,6 +83,10 @@ _CLIP_HOLD_SECONDS = 5.0
 # looks like.
 _DIGITAL_SILENCE_GRACE_SECONDS = 15.0
 _NO_ACTIVITY_GRACE_SECONDS = 90.0
+# How long an open stream can go without delivering a single chunk before that's worth saying. Shorter
+# than the no-activity fuse: a quiet meeting still delivers chunks (low-level ones), so receiving nothing
+# at all isn't a quiet meeting — for system audio it means nothing is playing through that output device.
+_NO_DATA_GRACE_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -140,6 +144,11 @@ class StreamHealth:
     seconds_since_activity: float | None  # None if it has never heard anything
     digital_silence: bool
     clipping: bool
+    # How long the stream has been open without delivering a single chunk — None once anything has
+    # arrived since it (last) opened. WASAPI loopback only delivers while something is playing through
+    # that output device, so a system-audio stream that stays at this for long means the call is coming
+    # out of a different device than the one being recorded (and its thread sits blocked in read()).
+    seconds_without_data: float | None = None
 
     @classmethod
     def idle(cls) -> StreamHealth:
@@ -174,6 +183,13 @@ class _StreamActivityMonitor:
         self._last_clip_at: float | None = None
         self._clipped_chunks = 0
         self._peak_dbfs = _SILENT_DBFS
+        self._opened_at: float | None = None
+
+    def stream_opened(self, now: float) -> None:
+        """Called each time a capture stream opens — at the start of a meeting and after a device switch —
+        so a stream that never delivers anything can be told apart from one that hasn't started yet."""
+        with self._lock:
+            self._opened_at = now
 
     def observe(self, stats: _ChunkStats, now: float) -> None:
         with self._lock:
@@ -191,8 +207,13 @@ class _StreamActivityMonitor:
 
     def health(self, now: float) -> StreamHealth:
         with self._lock:
+            waiting = None
+            if self._opened_at is not None and (
+                self._last_observed_at is None or self._last_observed_at < self._opened_at
+            ):
+                waiting = now - self._opened_at
             if self._first_observed_at is None:
-                return StreamHealth.idle()
+                return replace(StreamHealth.idle(), seconds_without_data=waiting)
             seconds_captured = max(0.0, now - self._first_observed_at)
             return StreamHealth(
                 seconds_captured=seconds_captured,
@@ -207,6 +228,7 @@ class _StreamActivityMonitor:
                     and self._last_clip_at is not None
                     and now - self._last_clip_at <= _CLIP_HOLD_SECONDS
                 ),
+                seconds_without_data=waiting,
             )
 
 
@@ -219,6 +241,17 @@ def _describe_stream_problem(health: StreamHealth, label: str, other_heard_activ
     have been active before it says anything, and why it's phrased as something to check rather than a
     diagnosis.
     """
+    if (
+        health.seconds_without_data is not None
+        and health.seconds_without_data >= _NO_DATA_GRACE_SECONDS
+        and other_heard_activity
+    ):
+        return (
+            f"{label}: nothing at all has come through in {int(health.seconds_without_data)}s while the "
+            "other track was active. Windows only passes on audio from the selected device, so a call "
+            "playing through a different one (a headset, say) isn't being recorded — check the right "
+            "device is selected."
+        )
     if health.digital_silence and health.seconds_captured >= _DIGITAL_SILENCE_GRACE_SECONDS:
         return (
             f"{label}: no signal at all — every sample is digital silence. A working device always has "
@@ -879,14 +912,23 @@ class Recorder:
         with self._lifecycle_lock:
             self._mic_stop_event.set()
             self._system_stop_event.set()
-            stuck_labels = [
-                label
-                for thread, label in (
-                    (self._mic_thread, "Microphone"),
-                    (self._system_thread, "System audio"),
-                )
-                if thread is not None and self._join_capture_thread(thread)
-            ]
+            stuck_labels = []
+            for thread, label, writer in (
+                (self._mic_thread, "Microphone", self._mic_writer),
+                (self._system_thread, "System audio", self._system_writer),
+            ):
+                if thread is not None and self._join_capture_thread(thread):
+                    stuck_labels.append(label)
+                    # The thread closes its writer on the way out, and this one can't get out — so close
+                    # it here, or the file is left open, and without a header at all if the device never
+                    # delivered a chunk (the header is only written with the first one), which nothing
+                    # can then read. Safe to do under the stuck thread: the writer is locked, and if the
+                    # thread ever wakes, its next write raises "already closed" and it exits.
+                    if writer is not None:
+                        try:
+                            writer.close()
+                        except Exception as exc:
+                            self._record_capture_failure(label, exc)
             stuck_labels += [label for thread, label in self._orphaned_threads if thread.is_alive()]
             if self._pyaudio is not None:
                 if stuck_labels:
@@ -1045,6 +1087,7 @@ class Recorder:
                     input_device_index=device_info["index"],
                     frames_per_buffer=CHUNK_FRAMES,
                 )
+                monitor.stream_opened(time.monotonic())
                 while not (stop_event.is_set() or retired.is_set()):
                     data = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
                     if retired.is_set():

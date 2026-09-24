@@ -140,8 +140,12 @@ def test_wav_duration_seconds_tolerates_a_file_it_cannot_read(tmp_path):
     not_a_wav = tmp_path / "junk.wav"
     not_a_wav.write_bytes(b"not audio")
 
+    empty = tmp_path / "empty.wav"  # what a capture stream that never received anything leaves behind
+    empty.write_bytes(b"")
+
     assert wav_duration_seconds(missing) == 0.0
     assert wav_duration_seconds(not_a_wav) == 0.0
+    assert wav_duration_seconds(empty) == 0.0
 
 
 def test_transcribe_parts_puts_every_part_back_on_the_meetings_clock(tmp_path, monkeypatch):
