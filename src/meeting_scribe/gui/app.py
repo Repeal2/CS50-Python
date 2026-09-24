@@ -56,7 +56,7 @@ from meeting_scribe.screen.window_picker import WindowTarget, window_exists
 from meeting_scribe.session import MeetingSession, retry_meeting_transcription
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
-from meeting_scribe.transcription.engine import TranscriptLine, render_transcript
+from meeting_scribe.transcription.engine import TranscriptLine, merge_transcript_lines, render_transcript
 
 # Shown in a device dropdown in place of a device name, meaning "follow whatever Windows currently
 # considers the default" rather than a specific device — used on both the Record tab and Settings tab.
@@ -88,6 +88,37 @@ _UNFINISHED_MEETING_NOTICE = (
     "— note that on-screen text captured during the meeting can't be recovered this way, only spoken "
     "audio."
 )
+
+
+_NO_RUNPOD_TRANSCRIPT_NOTICE = (
+    "(No Runpod transcript for this meeting — either \"Identify speakers\" was off in Settings when it "
+    "started, or Runpod failed; the activity log says which.)"
+)
+
+
+def _meeting_transcripts(rows) -> tuple[str, str, str]:
+    """(on-screen text, audio transcribed on this PC, audio with Runpod's system track) as rendered text
+    for the Projects tab, from a meeting's saved transcript_segments rows. Both audio versions include
+    the same mic lines — only the system track differs — so each reads as the whole conversation. The
+    Runpod one is "" when there are no Runpod lines. A line saved before transcripts were tagged by
+    engine has none, and counts as this PC's."""
+    screen, mic, local_system, runpod_system = [], [], [], []
+    for row in rows:
+        line = TranscriptLine(row["timestamp_seconds"], row["source"], row["text"], speaker=row["speaker"])
+        if line.source == "screen_ocr":
+            screen.append(line)
+        elif line.source == "mic":
+            mic.append(line)
+        elif row["engine"] == "runpod":
+            runpod_system.append(line)
+        else:
+            local_system.append(line)
+    runpod_text = render_transcript(merge_transcript_lines(mic, runpod_system)) if runpod_system else ""
+    return (
+        render_transcript(screen),
+        render_transcript(merge_transcript_lines(mic, local_system)),
+        runpod_text,
+    )
 
 
 def _format_meeting_timestamp(iso_string: str) -> str:
@@ -1423,7 +1454,10 @@ class ProjectsTab(ttk.Frame):
         self.detail_notebook.pack(fill="both", expand=True)
 
         self.ocr_text = _add_scrollable_text_tab(self.detail_notebook, "OCR Transcript")
-        self.audio_text = _add_scrollable_text_tab(self.detail_notebook, "Audio Transcript")
+        # The system audio can be transcribed both on this PC and by Runpod (see
+        # session._transcribe_system_track) — one tab each, both with the same mic lines, for comparing.
+        self.audio_text = _add_scrollable_text_tab(self.detail_notebook, "Audio (this PC)")
+        self.runpod_audio_text = _add_scrollable_text_tab(self.detail_notebook, "Audio (Runpod)")
         self.manual_notes_text = _add_scrollable_text_tab(self.detail_notebook, "Manual notes")
         self.attendees_text = _add_scrollable_text_tab(self.detail_notebook, "Attendees")
         self._build_documents_tab()
@@ -1542,7 +1576,9 @@ class ProjectsTab(ttk.Frame):
             self.meeting_list.insert("end", f"{meeting.title} — {timestamp}")
 
     def _clear_meeting_details(self) -> None:
-        for widget in (self.ocr_text, self.audio_text, self.manual_notes_text, self.attendees_text):
+        for widget in (
+            self.ocr_text, self.audio_text, self.runpod_audio_text, self.manual_notes_text, self.attendees_text
+        ):
             _set_text(widget, "")
         self._meeting_documents = []
         self.meeting_documents_list.delete(0, "end")
@@ -1555,13 +1591,10 @@ class ProjectsTab(ttk.Frame):
         if meeting is None:
             return
 
-        segments = self.app.db.get_segments(meeting.id)
-        lines = [TranscriptLine(row["timestamp_seconds"], row["source"], row["text"]) for row in segments]
-        ocr_lines = [line for line in lines if line.source == "screen_ocr"]
-        audio_lines = [line for line in lines if line.source in ("mic", "system")]
-
-        _set_text(self.ocr_text, render_transcript(ocr_lines) or "(no on-screen text captured)")
-        _set_text(self.audio_text, render_transcript(audio_lines) or "(no speech captured)")
+        ocr_text, local_text, runpod_text = _meeting_transcripts(self.app.db.get_segments(meeting.id))
+        _set_text(self.ocr_text, ocr_text or "(no on-screen text captured)")
+        _set_text(self.audio_text, local_text or "(no speech captured)")
+        _set_text(self.runpod_audio_text, runpod_text or _NO_RUNPOD_TRANSCRIPT_NOTICE)
         _set_text(self.manual_notes_text, meeting.manual_notes or "(no manual notes for this meeting)")
         _set_text(self.attendees_text, meeting.attendees or "(no attendees captured)")
 

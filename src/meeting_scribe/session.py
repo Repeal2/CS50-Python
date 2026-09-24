@@ -11,6 +11,7 @@ doesn't wait for the previous one to finish transcribing/saving.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -34,16 +35,31 @@ from meeting_scribe.transcription.engine import (
 _WAITING_FOR_TRANSCRIPTION_MESSAGE = "Waiting for another meeting's transcription to finish first…"
 
 
+@dataclass(frozen=True)
+class _SystemTranscripts:
+    local: list[TranscriptLine]
+    # None when cloud diarization is off, or failed.
+    runpod: list[TranscriptLine] | None
+
+    @property
+    def primary(self) -> list[TranscriptLine]:
+        """The one used for the meeting's own transcript and the Copilot push: Runpod's when there is
+        one, since its speaker labels are the point of opting in."""
+        return self.runpod if self.runpod is not None else self.local
+
+
 def _transcribe_system_track(
     settings: Settings,
     local_transcriber: WhisperTranscriber,
     system_paths: Sequence[Path],
     report: Callable[[str], None],
-) -> list[TranscriptLine]:
-    """Transcribes the system-audio track — everyone but the meeting owner — using cloud speaker
-    diarization when opted into (Settings.diarize_system_audio), local transcription otherwise. Cloud
-    diarization falling back to local on any failure, rather than raising, is deliberate: a third-party
-    outage or a missing API key shouldn't cost a meeting its transcript, just the per-speaker labels."""
+) -> _SystemTranscripts:
+    """Transcribes the system-audio track — everyone but the meeting owner — on this PC, and also with
+    cloud speaker diarization when opted into (Settings.diarize_system_audio), so the two can be
+    compared side by side on the Projects tab. A cloud failure is reported rather than raised: a
+    third-party outage or a missing API key shouldn't cost a meeting its transcript, just the per-speaker
+    labels."""
+    runpod_lines = None
     if settings.diarize_system_audio:
         try:
             from meeting_scribe.transcription.runpod_whisperx import (
@@ -57,10 +73,32 @@ def _transcribe_system_track(
                 huggingface_token=settings.runpod_huggingface_token,
                 on_progress=report,
             )
-            return transcriber.transcribe_parts(system_paths, source="system")
+            runpod_lines = transcriber.transcribe_parts(system_paths, source="system")
         except RunpodWhisperXError as error:
-            report(f"Cloud speaker diarization failed ({error}) — falling back to local transcription.")
-    return local_transcriber.transcribe_parts(system_paths, source="system")
+            report(f"Cloud speaker diarization failed ({error}) — using the local transcript only.")
+        else:
+            report("Transcribing system audio on this PC too, for comparison…")
+    local_lines = local_transcriber.transcribe_parts(system_paths, source="system")
+    return _SystemTranscripts(local=local_lines, runpod=runpod_lines)
+
+
+def _save_segments(
+    db: Database,
+    meeting_id: int,
+    mic_lines: list[TranscriptLine],
+    system: _SystemTranscripts,
+    screen_lines: list[TranscriptLine],
+) -> None:
+    """Saves every line, tagged with the transcriber that produced it, so the Projects tab can show the
+    local and Runpod versions of the system audio side by side (each alongside the same mic lines)."""
+    for line in screen_lines:
+        db.add_transcript_segment(meeting_id, line.source, line.timestamp_seconds, line.text)
+    for line in mic_lines + system.local:
+        db.add_transcript_segment(meeting_id, line.source, line.timestamp_seconds, line.text, engine="local")
+    for line in system.runpod or []:
+        db.add_transcript_segment(
+            meeting_id, line.source, line.timestamp_seconds, line.text, speaker=line.speaker, engine="runpod"
+        )
 
 
 class MeetingSession:
@@ -209,7 +247,7 @@ class MeetingSession:
 
             try:
                 mic_lines = self._transcriber.transcribe_parts(recorded.mic_paths, source="mic")
-                system_lines = _transcribe_system_track(
+                system = _transcribe_system_track(
                     self._settings, self._transcriber, recorded.system_paths, report
                 )
             finally:
@@ -225,14 +263,11 @@ class MeetingSession:
         # and system), screen_lines is the OCR stream. The combined `merged` rendering is still what's
         # kept in this app's own local record (finish_meeting below), where mixing sources by timestamp
         # is exactly the point.
-        audio_lines = merge_transcript_lines(mic_lines, system_lines)
+        audio_lines = merge_transcript_lines(mic_lines, system.primary)
         merged = merge_transcript_lines(audio_lines, screen_lines)
         transcript_text = render_transcript(merged)
 
-        for line in merged:
-            self._db.add_transcript_segment(
-                self.meeting_id, line.source, line.timestamp_seconds, line.text
-            )
+        _save_segments(self._db, self.meeting_id, mic_lines, system, screen_lines)
 
         if self._settings.copilot_sync_dir is not None:
             meeting = self._db.get_meeting(self.meeting_id)
@@ -322,20 +357,19 @@ def retry_meeting_transcription(
         transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
         try:
             mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")
-            system_lines = _transcribe_system_track(settings, transcriber, system_paths, report)
+            system = _transcribe_system_track(settings, transcriber, system_paths, report)
         finally:
             transcriber.unload()
     report("Transcription complete.")
 
-    audio_lines = merge_transcript_lines(mic_lines, system_lines)
+    audio_lines = merge_transcript_lines(mic_lines, system.primary)
     transcript_text = render_transcript(audio_lines)
 
     # Clears any segments a previous, partially-successful retry left behind (e.g. one that transcribed
     # fine but then failed pushing to Copilot Studio) before inserting this attempt's — otherwise a
     # second retry would leave both attempts' segments sitting side by side.
     db.clear_transcript_segments(meeting_id)
-    for line in audio_lines:
-        db.add_transcript_segment(meeting_id, line.source, line.timestamp_seconds, line.text)
+    _save_segments(db, meeting_id, mic_lines, system, screen_lines=[])
 
     if settings.copilot_sync_dir is not None:
         text_reference_documents = []

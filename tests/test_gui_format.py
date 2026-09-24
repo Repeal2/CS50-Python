@@ -140,3 +140,34 @@ def test_device_choices_keeps_a_selected_device_that_is_currently_unplugged():
 def test_device_choices_does_not_duplicate_system_default():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     assert gui_app._device_choices([], gui_app.SYSTEM_DEFAULT_LABEL) == [gui_app.SYSTEM_DEFAULT_LABEL]
+
+
+def _segment_row(timestamp, source, text, *, speaker=None, engine=None):
+    return {"timestamp_seconds": timestamp, "source": source, "text": text, "speaker": speaker, "engine": engine}
+
+
+def test_meeting_transcripts_puts_each_system_version_beside_the_same_mic_lines():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    rows = [
+        _segment_row(0.0, "mic", "let's start", engine="local"),
+        _segment_row(2.0, "system", "sounds could", engine="local"),
+        _segment_row(2.0, "system", "sounds good", speaker="SPEAKER_00", engine="runpod"),
+        _segment_row(3.0, "screen_ocr", "Slide: Agenda"),
+    ]
+
+    screen, local, runpod = gui_app._meeting_transcripts(rows)
+
+    assert screen == "[00:03] Screen: Slide: Agenda"
+    assert local == "[00:00] You: let's start\n[00:02] Others: sounds could"
+    assert runpod == "[00:00] You: let's start\n[00:02] SPEAKER_00: sounds good"
+
+
+def test_meeting_transcripts_has_no_runpod_version_when_runpod_was_not_used():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    # Includes a line saved before lines were tagged by engine, which counts as this PC's.
+    rows = [_segment_row(0.0, "mic", "hello", engine="local"), _segment_row(1.0, "system", "hi")]
+
+    _screen, local, runpod = gui_app._meeting_transcripts(rows)
+
+    assert local == "[00:00] You: hello\n[00:01] Others: hi"
+    assert runpod == ""

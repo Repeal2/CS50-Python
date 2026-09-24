@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
     source TEXT NOT NULL CHECK (source IN ('mic', 'system', 'screen_ocr')),
     timestamp_seconds REAL NOT NULL,
-    text TEXT NOT NULL
+    text TEXT NOT NULL,
+    speaker TEXT,
+    engine TEXT
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -76,6 +78,12 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
     documents_columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
     if "source_path" not in documents_columns:
         conn.execute("ALTER TABLE documents ADD COLUMN source_path TEXT")
+
+    segment_columns = {row["name"] for row in conn.execute("PRAGMA table_info(transcript_segments)")}
+    if "speaker" not in segment_columns:
+        conn.execute("ALTER TABLE transcript_segments ADD COLUMN speaker TEXT")
+    if "engine" not in segment_columns:
+        conn.execute("ALTER TABLE transcript_segments ADD COLUMN engine TEXT")
 
 
 def _slugify(name: str) -> str:
@@ -210,15 +218,26 @@ class Database:
             return cur.lastrowid
 
     def add_transcript_segment(
-        self, meeting_id: int, source: str, timestamp_seconds: float, text: str
+        self,
+        meeting_id: int,
+        source: str,
+        timestamp_seconds: float,
+        text: str,
+        speaker: str | None = None,
+        engine: str | None = None,
     ) -> None:
+        """`speaker` is a diarized line's label (see TranscriptLine.speaker) — None for everything else.
+        `engine` says which transcriber produced a spoken line — "local" (Whisper on this PC) or "runpod"
+        — since the system-audio track can be transcribed by both, for comparison (see
+        session._transcribe_system_track). None for on-screen text, and for lines saved before this
+        existed, which were all one transcript."""
         if not text.strip():
             return
         with self._lock:
             self._conn.execute(
-                "INSERT INTO transcript_segments (meeting_id, source, timestamp_seconds, text) "
-                "VALUES (?, ?, ?, ?)",
-                (meeting_id, source, timestamp_seconds, text),
+                "INSERT INTO transcript_segments (meeting_id, source, timestamp_seconds, text, speaker, engine) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (meeting_id, source, timestamp_seconds, text, speaker, engine),
             )
             self._conn.commit()
 
