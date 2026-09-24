@@ -68,9 +68,10 @@ class Settings:
     # historical/simple behavior, and still the default until the user picks something explicit.
     mic_device_name: str | None = None
     system_device_name: str | None = None
-    # On by default: during a meeting, system audio follows whichever output device is actually playing,
-    # and the microphone is the headset whenever one is connected and live, mic_device_name otherwise —
-    # see audio.recorder.Recorder. headset_microphone_name picks the headset; None recognizes one by name.
+    # On by default: during a meeting, the microphone and system audio are whichever devices Teams has
+    # open (see audio.call_devices). When that can't be told, system audio follows whichever output
+    # device is actually playing, and the microphone is the headset whenever one is connected and live,
+    # mic_device_name otherwise — see audio.recorder.Recorder. headset_microphone_name picks the headset; None recognizes one by name.
     auto_switch_audio_devices: bool = True
     headset_microphone_name: str | None = None
     # Root of a folder synced by OneDrive/SharePoint — an Inbox subfolder lives under it (see

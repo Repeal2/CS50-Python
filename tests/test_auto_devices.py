@@ -332,6 +332,7 @@ def _auto_recorder(tmp_path, host, **kwargs):
     recorder._started_at = 0.0
     recorder._pyaudio = host
     recorder._pyaudio_module = PA
+    recorder._call_devices = lambda: None  # not in a Teams call, whatever the machine running this is doing
     switches = []
     recorder.switch_system_device = lambda name, **kw: switches.append(("system", name, kw))
     recorder.switch_mic_device = lambda name, **kw: switches.append(("mic", name, kw))
@@ -490,3 +491,198 @@ def test_the_first_microphone_check_runs_straight_away_and_listens_to_every_head
     thread.join(timeout=2)
 
     assert calls == [True]
+
+
+# --- following the devices Teams is using -----------------------------------------------------------------
+
+from meeting_scribe.audio.call_devices import CallAudioDevices  # noqa: E402
+
+
+def test_the_microphone_follows_the_one_teams_is_using_over_any_headset_guess(tmp_path):
+    host = _mic_host(_PolledStream([QUIET] * 50))
+    recorder, switches = _on_headset(tmp_path, host, 0.0)
+    recorder._call_devices = lambda: CallAudioDevices(microphones=(LAPTOP,))
+
+    recorder._auto_select_microphone(time.monotonic(), starting=True)
+
+    assert switches == [("mic", LAPTOP, {"reason": "Teams is using this microphone", "automatic": True})]
+
+
+def test_the_microphone_teams_is_using_is_kept_without_listening_to_anything(tmp_path):
+    jabra = _PolledStream([SILENT] * 50)  # would count as dead if the headset checks ran
+    host = _mic_host(jabra)
+    recorder, switches = _on_headset(tmp_path, host, _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS + 1)
+    recorder._call_devices = lambda: CallAudioDevices(microphones=(JABRA,))
+
+    recorder._auto_select_microphone(time.monotonic())
+
+    assert switches == []
+    assert len(jabra._chunks) == 50  # never probed
+
+
+def test_system_audio_follows_the_output_teams_is_playing_through_straight_away(tmp_path):
+    host = _ProbeHost(
+        {5: _PolledStream([LOUD] * 50), 6: _PolledStream()},
+        loopbacks=[_info("Speakers [Loopback]", 5, True), _info("Headphones (Jabra) [Loopback]", 6, True)],
+    )
+    recorder, switches = _auto_recorder(tmp_path, host, auto_system_device=True)
+    recorder._call_devices = lambda: CallAudioDevices(speakers=("Headphones (Jabra)",))
+    recorder._system_active_device_name = "Speakers [Loopback]"
+    recorder._system_monitor.stream_opened(time.monotonic())
+    recorder._system_monitor.observe(_analyze_pcm16(LOUD), time.monotonic())  # not quiet at all
+
+    recorder._auto_select_system_device(time.monotonic())
+
+    assert switches == [(
+        "system", "Headphones (Jabra) [Loopback]",
+        {"reason": "Teams is playing the call through it", "automatic": True},
+    )]
+
+
+def test_teams_devices_are_ignored_once_the_automation_is_off(tmp_path):
+    host = _mic_host(_PolledStream([QUIET] * 50))
+    recorder, switches = _on_headset(tmp_path, host, 0.0)
+    recorder._auto_mic = False
+    recorder._call_devices = lambda: CallAudioDevices(microphones=(LAPTOP,))
+
+    recorder._auto_select_microphone(time.monotonic())
+
+    assert switches == []
+
+
+def test_teams_devices_are_asked_for_once_per_pass_not_once_per_stream(tmp_path):
+    recorder = Recorder(tmp_path)
+    calls = []
+    recorder._call_devices = lambda: calls.append(1) or None
+    recorder._call_app_devices(100.0)
+    recorder._call_app_devices(100.5)
+    recorder._call_app_devices(102.0)
+    assert len(calls) == 2
+
+
+# --- keeping system audio on the meeting's clock ---------------------------------------------------------
+
+
+def _loopback_thread(tmp_path, stream):
+    recorder = Recorder(tmp_path)
+    recorder._pyaudio = _ProbeHost({4: stream})
+    writer = _SegmentedWavWriter(tmp_path / "system.wav", 1, SAMPLE_WIDTH_BYTES, 16000)
+    thread = recorder._spawn_capture_thread(
+        PA, _info("Speakers [Loopback]", 4, loopback=True), writer, "system_level",
+        recorder._system_monitor, "System audio", recorder._system_stop_event,
+    )
+    return recorder, thread
+
+
+def _frames(path):
+    with contextlib.closing(wave.open(str(path), "rb")) as wav:
+        return wav.readframes(wav.getnframes())
+
+
+def test_silence_is_written_while_nothing_plays_so_the_file_keeps_time(tmp_path):
+    # The field case: WASAPI hands over nothing at all while nothing plays, so the system-audio file
+    # held only the moments something played — shorter than the meeting, and out of step with the mic.
+    recorder, thread = _loopback_thread(tmp_path, _PolledStream())
+    time.sleep(0.8)
+    recorder._system_stop_event.set()
+    thread.join(timeout=2)
+
+    frames = _frames(tmp_path / "system.wav")
+    seconds = len(frames) / SAMPLE_WIDTH_BYTES / 16000
+    assert 0.5 <= seconds <= 1.0
+    assert frames == bytes(len(frames))
+
+
+def test_audio_that_plays_is_kept_and_the_quiet_after_it_is_filled_in(tmp_path):
+    recorder, thread = _loopback_thread(tmp_path, _PolledStream([LOUD]))
+    time.sleep(0.8)
+    recorder._system_stop_event.set()
+    thread.join(timeout=2)
+
+    frames = _frames(tmp_path / "system.wav")
+    assert frames.startswith(LOUD)
+    assert len(frames) / SAMPLE_WIDTH_BYTES / 16000 >= 0.5
+    assert frames[len(LOUD):] == bytes(len(frames) - len(LOUD))
+
+
+# --- a stream that dies is reopened ----------------------------------------------------------------------
+
+
+class _FailingStream(_PolledStream):
+    def get_read_available(self):
+        if not self._chunks:
+            raise OSError("Unanticipated host error")  # the device went away under it
+        return super().get_read_available()
+
+
+def test_a_capture_stream_that_dies_is_flagged_for_reopening(tmp_path):
+    recorder, thread = _loopback_thread(tmp_path, _FailingStream([LOUD]))
+    thread.join(timeout=2)
+
+    assert recorder._stream_failed.is_set()
+    assert any("capture stopped early" in notice for notice in recorder.capture_notices())
+
+
+def test_a_stream_stopped_on_purpose_is_not_reopened(tmp_path):
+    recorder, thread = _loopback_thread(tmp_path, _PolledStream())
+    recorder._system_stop_event.set()
+    thread.join(timeout=2)
+    assert not recorder._stream_failed.is_set()
+
+
+def test_reopening_backs_off_when_it_keeps_failing(tmp_path, monkeypatch):
+    recorder = Recorder(tmp_path)
+    reloads = []
+
+    def reload(self, *, reason):
+        reloads.append(reason)
+        self._stream_failed.set()  # the reopened stream failed again
+
+    monkeypatch.setattr(Recorder, "reload_devices", reload)
+    recorder._stream_failed.set()
+
+    recorder._recover_failed_streams(100.0)
+    recorder._recover_failed_streams(100.5)  # too soon
+    recorder._recover_failed_streams(101.0)
+    recorder._recover_failed_streams(102.0)  # too soon: now waiting 2s
+    recorder._recover_failed_streams(103.0)
+
+    assert len(reloads) == 3
+    assert recorder._next_recovery_at == 103.0 + 4.0
+
+
+def test_a_successful_reopen_says_so(tmp_path, monkeypatch):
+    recorder = Recorder(tmp_path)
+    monkeypatch.setattr(Recorder, "reload_devices", lambda self, *, reason: None)
+    recorder._stream_failed.set()
+
+    recorder._recover_failed_streams(100.0)
+
+    assert not recorder._stream_failed.is_set()
+    assert any("reopened" in notice for notice in recorder.capture_notices())
+
+
+def test_when_teams_has_two_microphones_open_the_one_being_recorded_is_kept(tmp_path):
+    host = _mic_host(_PolledStream([QUIET] * 50))
+    recorder, switches = _on_headset(tmp_path, host, 0.0)
+    recorder._call_devices = lambda: CallAudioDevices(microphones=(LAPTOP, JABRA))
+
+    recorder._auto_select_microphone(time.monotonic())
+
+    assert switches == []
+
+
+def test_a_computer_that_slept_mid_meeting_does_not_write_the_sleep_out_as_silence(tmp_path, monkeypatch):
+    real_monotonic = time.monotonic
+    started = real_monotonic()
+    # Jump an hour ahead a moment after the stream opens, as a lid closed and reopened would.
+    monkeypatch.setattr(
+        "meeting_scribe.audio.recorder.time.monotonic",
+        lambda: real_monotonic() + (3600.0 if real_monotonic() - started > 0.3 else 0.0),
+    )
+    recorder, thread = _loopback_thread(tmp_path, _PolledStream())
+    time.sleep(0.9)
+    recorder._system_stop_event.set()
+    thread.join(timeout=2)
+
+    assert len(_frames(tmp_path / "system.wav")) / SAMPLE_WIDTH_BYTES / 16000 < 2.0

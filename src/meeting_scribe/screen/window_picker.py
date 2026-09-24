@@ -171,6 +171,13 @@ def _best_teams_meeting_window(windows: list[tuple[int, str]]) -> TeamsMeetingWi
     return None
 
 
+def is_teams_window(hwnd: int) -> bool:
+    """Whether this window belongs to Teams (see _is_teams_process). False off Windows."""
+    if sys.platform != "win32":
+        return False
+    return _is_teams_process(hwnd)
+
+
 def _visible_teams_windows() -> list[tuple[int, str]]:
     import win32gui
 

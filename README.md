@@ -14,6 +14,14 @@ saves everything locally, and pushes.
   meter for each confirms it's actually picking up audio rather than guessing. The meters use a
   logarithmic (dBFS) scale rather than a plain linear ratio, since normal microphone volume is often only
   a few percent of full scale and would otherwise barely move a linear meter.
+- **Follows the devices Teams is using.** With "Switch devices automatically" on (Settings, on by
+  default), the app asks Windows which microphone and speaker Teams has open — the same per-app audio
+  sessions the Volume Mixer shows — and records those, switching mid-meeting if Teams does. Only when that
+  can't be told (Teams isn't in a call, or runs in a browser) does it fall back to guessing: the output
+  that's playing, and a headset microphone recognized by name. Silence on the system-audio track (WASAPI
+  delivers nothing while nothing plays) is written out as silence, so the track stays as long as the
+  meeting and in step with the microphone, and a capture stream that dies mid-meeting (a Bluetooth
+  headset switching profiles, say) is reopened rather than left dead.
 - **Checks the microphone is actually the right one.** "Test mic…" next to the device dropdown records
   three seconds from the selected device and says what it heard — a peak level, or the specific reason it
   heard nothing — which is the one moment when a silent mic is unambiguous (you know you're supposed to

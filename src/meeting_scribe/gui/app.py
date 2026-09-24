@@ -41,6 +41,7 @@ from meeting_scribe.hotkeys import (
 )
 from meeting_scribe.screen.capture import ocr_region
 from meeting_scribe.screen.meeting_detector import (
+    after_screen_window_closed,
     DetectedMeeting,
     MeetingEndTracker,
     MeetingPromptTracker,
@@ -53,8 +54,8 @@ from meeting_scribe.screen.region_picker import (
     pick_region_interactively,
     pin_region_to_window,
 )
-from meeting_scribe.screen.window_picker import WindowTarget, window_exists
-from meeting_scribe.session import MeetingSession, retry_meeting_transcription
+from meeting_scribe.screen.window_picker import WindowTarget, is_teams_window, window_exists
+from meeting_scribe.session import MeetingSession, meeting_in_progress, retry_meeting_transcription
 from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
 from meeting_scribe.transcription.engine import TranscriptLine, merge_transcript_lines, render_transcript
@@ -87,8 +88,13 @@ _NOTES_INDENT = "    "
 # through a long meeting. The recorded audio survives that crash; only the transcript is missing.
 _UNFINISHED_MEETING_NOTICE = (
     "Transcription didn't finish for this meeting, but the recording is safe. Retry to transcribe it "
-    "— note that on-screen text captured during the meeting can't be recovered this way, only spoken "
-    "audio."
+    "— on-screen text is included if it was saved during the meeting."
+)
+
+# Shown instead, with Retry disabled, for a meeting that has no transcript yet only because it's still
+# being recorded or finished — see session.meeting_in_progress.
+_IN_PROGRESS_MEETING_NOTICE = (
+    "This meeting is still being recorded or transcribed — its transcript will appear here when it's done."
 )
 
 
@@ -621,13 +627,13 @@ class RecordTab(ttk.Frame):
         self._window_targets: list = []
         self._region_target: RegionTarget | WindowRegionTarget | None = None
         self._region_outline: RegionOutline | None = None
-        # The (session, hwnd) pair _poll_auto_stop watches for "stop when the screen-source window
-        # closes" — None whenever that isn't in effect for whatever's currently recording (checkbox left
-        # unchecked, or "Entire screen"/a fixed area was the screen source). Captured once at Start, like
-        # screen_target itself; comparing the session by identity is what makes this automatically inert
-        # the instant Stop is pressed (by the poll itself or manually) or a different meeting starts,
-        # with no separate cleanup needed beyond what _stop() already does.
-        self._auto_stop_watch: tuple[MeetingSession, int] | None = None
+        # What _poll_auto_stop watches: the recording session, the window its on-screen capture is
+        # pointed at, whether that's a Teams window, and whether "Stop recording when the screen-source
+        # window closes" was checked at Start — None when the screen source has no window ("Entire
+        # screen", a fixed area). Comparing the session by identity is what makes this automatically
+        # inert the instant Stop is pressed or a different meeting starts. See
+        # meeting_detector.after_screen_window_closed for what happens when the window closes.
+        self._auto_stop_watch: tuple[MeetingSession, int, bool, bool] | None = None
         self._input_devices: list = []
         self._loopback_devices: list = []
         # Which session's recorder notices have already been written to the activity log, how many of
@@ -974,13 +980,39 @@ class RecordTab(ttk.Frame):
         screen-source window closes" was checked at Start (see _start's use of
         _hwnd_to_watch_for_auto_stop) — a no-op otherwise, including for "Entire screen" or a
         fixed-position area, neither of which has a window to watch."""
-        if self._auto_stop_watch is not None:
-            session, hwnd = self._auto_stop_watch
-            if session is self.app._session and not window_exists(hwnd):
-                self._auto_stop_watch = None
-                self._log(f'[{session.title}] Screen-source window closed — stopping automatically.')
-                self._stop()
-        self.after(self._AUTO_STOP_POLL_MS, self._poll_auto_stop)
+        try:
+            self._check_screen_window()
+        finally:
+            self.after(self._AUTO_STOP_POLL_MS, self._poll_auto_stop)
+
+    def _check_screen_window(self) -> None:
+        if self._auto_stop_watch is None:
+            return
+        session, hwnd, was_teams, auto_stop = self._auto_stop_watch
+        if session is not self.app._session:
+            self._auto_stop_watch = None
+            return
+        if window_exists(hwnd):
+            return
+        detected = self.app._detected_meeting
+        teams_hwnd = detected.window.hwnd if detected is not None and detected.window is not None else None
+        action, new_hwnd = after_screen_window_closed(
+            watched_was_teams=was_teams,
+            in_teams_call=detected is not None,
+            teams_window_hwnd=teams_hwnd,
+            watched_hwnd=hwnd,
+            auto_stop=auto_stop,
+        )
+        if action == "follow":
+            session.follow_screen_window(new_hwnd)
+            self._auto_stop_watch = (session, new_hwnd, True, auto_stop)
+            self._log(f"[{session.title}] Teams moved the call to a new window — on-screen capture follows it.")
+        elif action == "stop":
+            self._auto_stop_watch = None
+            self._log(f'[{session.title}] Screen-source window closed — stopping automatically.')
+            self._stop()
+        elif action == "forget":
+            self._auto_stop_watch = None
 
     def select_project(self, name: str) -> None:
         self.project_var.set(name)
@@ -1183,8 +1215,14 @@ class RecordTab(ttk.Frame):
         # Only takes effect if the screen source has a window to watch in the first place — see
         # _hwnd_to_watch_for_auto_stop — and only for this meeting: unchecking the box or changing the
         # screen source afterwards doesn't retroactively stop watching (or start watching) anything.
-        watched_hwnd = _hwnd_to_watch_for_auto_stop(screen_target) if self.stop_on_window_close_var.get() else None
-        self._auto_stop_watch = (session, watched_hwnd) if watched_hwnd is not None else None
+        watched_hwnd = _hwnd_to_watch_for_auto_stop(screen_target)
+        self._auto_stop_watch = None
+        if watched_hwnd is not None:
+            try:
+                was_teams = is_teams_window(watched_hwnd)
+            except Exception:
+                was_teams = False
+            self._auto_stop_watch = (session, watched_hwnd, was_teams, bool(self.stop_on_window_close_var.get()))
         self.status_var.set(f"Recording — {project_name} / {meeting_title}")
         self.start_button["state"] = "disabled"
         self.stop_button["state"] = "normal"
@@ -1602,7 +1640,10 @@ class ProjectsTab(ttk.Frame):
         _set_text(self.manual_notes_text, meeting.manual_notes or "(no manual notes for this meeting)")
         _set_text(self.attendees_text, meeting.attendees or "(no attendees captured)")
 
-        if meeting.ended_at is None:
+        if meeting.ended_at is None and meeting_in_progress(meeting.id):
+            self.retry_status_var.set(_IN_PROGRESS_MEETING_NOTICE)
+            self.retry_button["state"] = "disabled"
+        elif meeting.ended_at is None:
             self.retry_status_var.set(_UNFINISHED_MEETING_NOTICE)
             self.retry_button["state"] = "normal"
         else:
@@ -1742,8 +1783,8 @@ class SettingsTab(ttk.Frame):
         self.auto_switch_var = tk.BooleanVar(value=self.app.settings.auto_switch_audio_devices)
         ttk.Checkbutton(
             form,
-            text="Switch devices automatically — follow the speaker that's playing; use the headset mic "
-            "when it's live",
+            text="Switch devices automatically — use the mic and speaker Teams is using; otherwise follow "
+            "the speaker that's playing and use the headset mic when it's live",
             variable=self.auto_switch_var,
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
 

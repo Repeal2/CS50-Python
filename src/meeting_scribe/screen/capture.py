@@ -57,6 +57,23 @@ _NAME_BADGE_RE = re.compile(
 )
 _MAX_BADGE_LENGTH = 45
 
+# `_grab_stable_frame` waits for a frame that holds still, but some never do: a whole Teams window with a
+# participant's live video in it changes between any two grabs, however close together. Waiting for
+# stillness there meant waiting forever — OCR silently stopped for as long as anyone's camera was on,
+# which for most calls is most of the meeting. After this many unsettled captures in a row, the latest
+# frame is read anyway.
+_UNSETTLED_CAPTURES_BEFORE_READING_ANYWAY = 2
+
+# A capture that fails (the window moved half off-screen, Tesseract choked on a frame, a monitor was
+# unplugged) is skipped rather than ending on-screen capture for the rest of the meeting, as it used to.
+# Consecutive failures back off to this, so a failure that repeats every cycle doesn't spin.
+_MAX_FAILURE_BACKOFF_SECONDS = 30.0
+
+# How long stop() waits for a capture in progress to finish. OCR of a large frame can take several
+# seconds; giving up early used to mean the lines still settling on screen at the end of the meeting
+# were flushed after the meeting had already collected its on-screen text, and never made it in.
+_STOP_TIMEOUT_SECONDS = 60.0
+
 
 def _looks_like_ui_noise(line: str) -> bool:
     letters = sum(1 for ch in line if ch.isalpha())
@@ -157,6 +174,30 @@ class ScreenWatcher:
         self._finalized_lines: set[str] = set()
         # Lines seen in the last capture that hadn't stopped growing yet — see module docstring.
         self._pending_lines: list[str] = []
+        self._unsettled_captures = 0
+        self._notices: list[str] = []
+        self._notices_lock = threading.Lock()
+
+    @property
+    def target(self) -> WindowTarget | RegionTarget | WindowRegionTarget | None:
+        return self._target
+
+    def set_target(self, target: WindowTarget | RegionTarget | WindowRegionTarget | None) -> None:
+        """Changes what's captured from the next cycle on — see session.MeetingSession.follow_screen_window.
+        A plain attribute swap: the capture thread reads it once per cycle."""
+        self._target = target
+        self._last_frame_hash = None
+
+    def notices(self) -> tuple[str, ...]:
+        """Anything that went wrong with on-screen capture, as ready-to-show sentences — each distinct
+        problem once."""
+        with self._notices_lock:
+            return tuple(self._notices)
+
+    def _record_notice(self, message: str) -> None:
+        with self._notices_lock:
+            if message not in self._notices:
+                self._notices.append(message)
 
     def start(self) -> None:
         self._stop_event.clear()
@@ -167,25 +208,45 @@ class ScreenWatcher:
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=self._interval + 5)
+            self._thread.join(timeout=max(_STOP_TIMEOUT_SECONDS, self._interval + 5))
+            if self._thread.is_alive():
+                self._record_notice(
+                    "On-screen capture was still reading a frame when the meeting stopped; the last "
+                    "on-screen lines may be missing."
+                )
 
     def _run(self) -> None:
-        import mss
-        import pytesseract
-        from PIL import Image
+        try:
+            import mss
+            import pytesseract
+            from PIL import Image
 
-        if self._tesseract_cmd:
-            pytesseract.pytesseract.tesseract_cmd = self._tesseract_cmd
+            if self._tesseract_cmd:
+                pytesseract.pytesseract.tesseract_cmd = self._tesseract_cmd
 
-        with mss.mss() as sct:
-            while not self._stop_event.is_set():
-                loop_start = time.monotonic()
-                region = self._resolve_region(sct)
-                if region is not None:
-                    self._capture_once(sct, region, Image, pytesseract)
-                elapsed = time.monotonic() - loop_start
-                self._stop_event.wait(max(0.0, self._interval - elapsed))
-        self._flush_pending()
+            with mss.mss() as sct:
+                failures = 0
+                while not self._stop_event.is_set():
+                    loop_start = time.monotonic()
+                    try:
+                        region = self._resolve_region(sct)
+                        if region is not None:
+                            self._capture_once(sct, region, Image, pytesseract)
+                        failures = 0
+                    except Exception as exc:
+                        failures += 1
+                        self._record_notice(
+                            f"On-screen capture skipped a frame ({type(exc).__name__}: {exc}) and carried on."
+                        )
+                    elapsed = time.monotonic() - loop_start
+                    wait = self._interval - elapsed
+                    if failures:
+                        wait = max(wait, min(_MAX_FAILURE_BACKOFF_SECONDS, self._interval * 2 ** (failures - 1)))
+                    self._stop_event.wait(max(0.0, wait))
+        except Exception as exc:  # couldn't even start: no screen capture or no Tesseract at all
+            self._record_notice(f"On-screen capture couldn't run: {type(exc).__name__}: {exc}")
+        finally:
+            self._flush_pending()
 
     def _resolve_region(self, sct) -> dict | None:
         """Returns the mss region to capture: the whole virtual screen, a fixed user-drawn rectangle, a
@@ -217,13 +278,19 @@ class ScreenWatcher:
         shot_b = sct.grab(region)
         image_b = Image.frombytes("RGB", shot_b.size, shot_b.rgb)
         if image_a.tobytes() != image_b.tobytes():
-            return None
+            self._unsettled_captures += 1
+            if self._unsettled_captures < _UNSETTLED_CAPTURES_BEFORE_READING_ANYWAY:
+                return None
+            # See _UNSETTLED_CAPTURES_BEFORE_READING_ANYWAY. Reset, so the next frame gets its own chance
+            # to settle before being read unsettled again.
+            self._unsettled_captures = 0
         return image_b
 
     def _capture_once(self, sct, region, Image, pytesseract) -> None:
         image = self._grab_stable_frame(sct, region, Image)
         if image is None:
             return  # frame was still changing (mid-scroll/animation); try again next cycle
+        self._unsettled_captures = 0
         frame_hash = hashlib.blake2b(image.tobytes(), digest_size=16).hexdigest()
         if frame_hash == self._last_frame_hash:
             return  # screen hasn't changed since the last capture; skip the OCR cost

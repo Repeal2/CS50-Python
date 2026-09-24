@@ -20,6 +20,7 @@ from typing import Callable
 
 import numpy as np
 
+from meeting_scribe.audio.call_devices import CallAudioDevices, find_call_audio_devices, match_portaudio_device
 from meeting_scribe.audio.device_watch import device_signature
 
 CHUNK_FRAMES = 1024
@@ -113,6 +114,30 @@ _HEADSET_RECHECK_SECONDS = 15.0
 _HEADSET_NAME_HINTS = ("headset", "headphone", "hands-free", "handsfree", "earbud", "earphone", "airpods")
 # Inputs that are really the computer's output looped back — never a sensible microphone fallback.
 _NOT_A_MICROPHONE_HINTS = ("stereo mix", "what u hear", "wave out", "loopback")
+# How long one answer to "which devices is Teams using" is reused. The microphone and system-audio checks
+# both ask on each pass of the automation, a moment apart; asking Windows twice for the same thing buys
+# nothing.
+_CALL_DEVICES_CACHE_SECONDS = 1.0
+
+# WASAPI loopback delivers nothing at all while nothing plays through the output device — not silence,
+# no data. Written as-is, the system-audio file would only hold the moments something was playing, run
+# shorter than the meeting, and drift further from the microphone track with every pause, so everything
+# after the first quiet stretch would be transcribed at the wrong time. The capture thread fills those
+# stretches with silence instead, keeping the file on the wall clock. It only fills once nothing has
+# arrived for this long — a stream that's playing hands over data every few milliseconds — so it never
+# lands in the middle of a sentence.
+_LOOPBACK_GAP_SECONDS = 0.25
+# Once filling, the thread catches up every few milliseconds, so it's never this far behind unless it
+# wasn't running at all — the computer went to sleep mid-meeting.
+_MAX_LOOPBACK_FILL_SECONDS = 5.0
+
+# A capture stream that dies mid-meeting (a Bluetooth headset switching to its hands-free profile when a
+# call starts, a driver hiccup, a device reset) is reopened rather than left dead for the rest of the
+# meeting. Retries back off, so a device that fails straight away every time isn't hammered; a stream
+# that then runs this long has recovered, and the next failure starts the back-off again.
+_RECOVERY_FIRST_DELAY_SECONDS = 1.0
+_RECOVERY_MAX_DELAY_SECONDS = 60.0
+_RECOVERY_RESET_AFTER_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -883,6 +908,16 @@ class Recorder:
         self.device_list_version = 0
         # Injectable for tests; see audio.device_watch.
         self._device_signature: Callable[[], object | None] = device_signature
+        # Injectable for tests; see audio.call_devices. Asked by the automation (auto_* above) before
+        # any of its own guessing: when Teams has a microphone or speaker open, that's the one.
+        self._call_devices: Callable[[], CallAudioDevices | None] = find_call_audio_devices
+        self._call_devices_cache: tuple[float, CallAudioDevices | None] | None = None
+        # Set by a capture thread that died on its own (not stopped or replaced), so the device watcher
+        # reopens it — see _recover_failed_streams.
+        self._stream_failed = threading.Event()
+        self._recovery_attempts = 0
+        self._next_recovery_at = 0.0
+        self._last_recovery_at: float | None = None
 
     def start(self) -> None:
         if sys.platform != "win32":
@@ -899,13 +934,23 @@ class Recorder:
         self._system_stop_event.clear()
         self._started_at = time.monotonic()
 
-        if self._auto_mic:
+        call = self._call_app_devices(time.monotonic()) if (self._auto_mic or self._auto_system) else None
+        call_mic = self._call_app_input(call) if self._auto_mic else None
+        call_speaker = self._call_app_loopback(call) if self._auto_system else None
+        if call_mic is not None:
+            if call_mic != self._mic_device_name:
+                self._mic_device_name = call_mic
+                self._record_switch(f"Microphone set to {call_mic!r} — Teams is using it.")
+        elif self._auto_mic:
             # The preferred headset to begin with; the automation's first check, straight after start,
             # listens to every connected headset and moves to one that's live if this one isn't.
             headsets = self._connected_headsets()
             if headsets and headsets[0] != self._mic_device_name:
                 self._mic_device_name = headsets[0]
                 self._record_switch(f"Microphone set to {headsets[0]!r} — a headset is connected.")
+        if call_speaker is not None and call_speaker != self._system_device_name:
+            self._system_device_name = call_speaker
+            self._record_switch(f"System audio set to {call_speaker!r} — Teams is playing the call through it.")
         mic_info = self._resolve_input_device(self._mic_device_name)
         system_info = self._resolve_loopback_device(pyaudio, self._system_device_name)
         self._mic_active_device_name = mic_info["name"]
@@ -1069,16 +1114,49 @@ class Recorder:
         _watch_stop_event, so this exits promptly on stop rather than finishing out a long poll interval.
         """
         last = self._safe_device_signature()
-        while not self._watch_stop_event.wait(self._DEVICE_POLL_SECONDS):
+        while not self._watch_stop_event.wait(self._poll_interval()):
             current = self._safe_device_signature()
-            if current is None:
-                continue  # can't tell right now; compare against the last good reading next time
-            if last is not None and current != last:
+            if current is not None and last is not None and current != last:
                 try:
                     self.reload_devices(reason="audio devices changed")
                 except Exception as exc:
                     self._record_capture_failure("Audio devices", exc)
-            last = current
+                # Reopening both streams is also what recovery would have done.
+                self._stream_failed.clear()
+            elif self._stream_failed.is_set():
+                self._recover_failed_streams(time.monotonic())
+            if current is not None:
+                last = current  # can't tell right now: compare against the last good reading next time
+
+    def _poll_interval(self) -> float:
+        # Recovery is checked on the same loop; a stream that died shouldn't wait out the full interval.
+        if self._stream_failed.is_set():
+            return min(self._DEVICE_POLL_SECONDS, _RECOVERY_FIRST_DELAY_SECONDS)
+        return self._DEVICE_POLL_SECONDS
+
+    def _recover_failed_streams(self, now: float) -> None:
+        """Reopens a capture stream that died mid-meeting — see _RECOVERY_*. Goes through
+        reload_devices, since the usual reason a stream dies is that the device it was reading changed
+        underneath it (a Bluetooth headset's profile switch replaces its endpoints outright), and only a
+        fresh PortAudio device list can see what replaced it."""
+        if now < self._next_recovery_at:
+            return
+        if self._last_recovery_at is not None and now - self._last_recovery_at >= _RECOVERY_RESET_AFTER_SECONDS:
+            self._recovery_attempts = 0
+        self._stream_failed.clear()
+        self._recovery_attempts += 1
+        self._last_recovery_at = now
+        self._next_recovery_at = now + min(
+            _RECOVERY_MAX_DELAY_SECONDS, _RECOVERY_FIRST_DELAY_SECONDS * 2 ** (self._recovery_attempts - 1)
+        )
+        try:
+            self.reload_devices(reason="reopened after the stream stopped")
+        except Exception as exc:
+            self._record_capture_failure("Audio devices", exc)
+            self._stream_failed.set()
+            return
+        if not self._stream_failed.is_set():
+            self._record_switch("Audio capture reopened after a stream stopped mid-meeting — recording continues.")
 
     def _auto_select_devices(self) -> None:
         """Runs on its own thread for the life of the meeting when either automation is on — see the
@@ -1099,8 +1177,67 @@ class Recorder:
                 return
             steps = [self._auto_select_system_device, self._auto_select_microphone]
 
+    def _call_app_devices(self, now: float) -> CallAudioDevices | None:
+        """What Teams is using right now (see audio.call_devices), briefly cached."""
+        cached = self._call_devices_cache
+        if cached is not None and now - cached[0] < _CALL_DEVICES_CACHE_SECONDS:
+            return cached[1]
+        try:
+            devices = self._call_devices()
+        except Exception:
+            devices = None
+        self._call_devices_cache = (now, devices)
+        return devices
+
+    def _call_app_input(self, call: CallAudioDevices | None) -> str | None:
+        """The input device, by this recorder's PortAudio name, that Teams has open — the one being
+        recorded if Teams has that one open among others. None if Teams isn't using one, or only ones
+        PortAudio doesn't list (yet: a reload follows a device change)."""
+        if call is None or not call.microphones or self._pyaudio is None:
+            return None
+        from meeting_scribe.audio.device_picker import input_devices_from
+
+        try:
+            names = [device.name for device in input_devices_from(self._pyaudio)]
+        except Exception:
+            return None
+        return self._pick_call_device(call.microphones, names, self._mic_active_device_name)
+
+    def _call_app_loopback(self, call: CallAudioDevices | None) -> str | None:
+        """The loopback device for the output Teams is playing the call through — see _call_app_input."""
+        if call is None or not call.speakers or self._pyaudio is None:
+            return None
+        try:
+            names = [info["name"] for info in self._pyaudio.get_loopback_device_info_generator()]
+        except Exception:
+            return None
+        names = [name for name in names if name.endswith("[Loopback]")]
+        return self._pick_call_device(call.speakers, names, self._system_active_device_name)
+
+    @staticmethod
+    def _pick_call_device(endpoints, portaudio_names, active: str | None) -> str | None:
+        matched = [
+            name for name in (match_portaudio_device(endpoint, portaudio_names) for endpoint in endpoints) if name
+        ]
+        if active is not None:
+            for name in matched:
+                if _same_device(active, name):
+                    return active  # already on one of them: stay, rather than hop between them
+        return matched[0] if matched else None
+
     def _auto_select_system_device(self, now: float) -> None:
-        if not self._auto_system or now < self._next_system_search:
+        if not self._auto_system:
+            return
+        with self._probe_lock:
+            target = self._call_app_loopback(self._call_app_devices(now))
+        if target is not None:
+            # Teams says where the call is coming out — no need to wait for the recorded device to go
+            # quiet and listen around for it.
+            active = self._system_active_device_name
+            if (active is None or not _same_device(active, target)) and not self._watch_stop_event.is_set():
+                self.switch_system_device(target, reason="Teams is playing the call through it", automatic=True)
+            return
+        if now < self._next_system_search:
             return
         quiet = self.system_health().seconds_without_sound
         if quiet is None or quiet < _SYSTEM_QUIET_BEFORE_SEARCH_SECONDS:
@@ -1130,6 +1267,14 @@ class Recorder:
         if not self._auto_mic:
             return
         active = self._mic_active_device_name
+        with self._probe_lock:
+            target = self._call_app_input(self._call_app_devices(now))
+        if target is not None:
+            # Teams says which microphone it has open, which beats any guess made from names or levels —
+            # including a headset that isn't called one, or a laptop mic Teams was deliberately set to.
+            if (active is None or not _same_device(active, target)) and not self._watch_stop_event.is_set():
+                self.switch_mic_device(target, reason="Teams is using this microphone", automatic=True)
+            return
         silent_for = self.mic_health().seconds_without_signal
         active_is_dead = silent_for is not None and silent_for >= _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS
         with self._probe_lock:
@@ -1255,8 +1400,9 @@ class Recorder:
                     # Refresh devices) tries again from here, since _pyaudio is left as None.
                     self._record_switch(
                         f"Couldn't restart audio to reload the device list ({type(exc).__name__}: {exc}) "
-                        "— recording is paused until the next device change or Refresh devices."
+                        "— recording is paused until audio can be restarted; retrying."
                     )
+                    self._stream_failed.set()
                     return
 
             for stream in streams:
@@ -1270,6 +1416,7 @@ class Recorder:
                     device_info = resolve(getattr(self, name_attr))
                 except Exception as exc:  # e.g. every output device unplugged: nothing to loop back from
                     self._record_capture_failure(label, exc)
+                    self._stream_failed.set()  # try again shortly; the device may be back by then
                     continue
                 previous = getattr(self, active_attr)
                 setattr(self, active_attr, device_info["name"])
@@ -1349,6 +1496,18 @@ class Recorder:
                 else:
                     with _pyaudio_lifecycle_lock:
                         self._pyaudio.terminate()
+            # A stream whose device couldn't be reopened after a reload has no thread left to close its
+            # writer, which would leave its last part open. close() is idempotent, so closing every
+            # writer here is safe for the ones a thread already closed.
+            for label, thread, writer in (
+                ("Microphone", self._mic_thread, self._mic_writer),
+                ("System audio", self._system_thread, self._system_writer),
+            ):
+                if writer is not None and label not in stuck_labels and (thread is None or not thread.is_alive()):
+                    try:
+                        writer.close()
+                    except Exception as exc:
+                        self._record_capture_failure(label, exc)
         # The GUI may already have flagged these live; recording them here too is what puts them in
         # front of whoever reads the finished meeting, who wasn't necessarily watching at the time.
         for problem in self.input_problems():
@@ -1481,6 +1640,8 @@ class Recorder:
         # stop — so switching away from it, or ending the meeting, had to give up on it.
         poll = bool(device_info.get("isLoopbackDevice"))
 
+        bytes_per_frame = channels * SAMPLE_WIDTH_BYTES
+
         def run() -> None:
             nonlocal poll
             polled_once = False
@@ -1494,7 +1655,9 @@ class Recorder:
                     input_device_index=device_info["index"],
                     frames_per_buffer=CHUNK_FRAMES,
                 )
-                monitor.stream_opened(time.monotonic())
+                opened_at = last_data_at = time.monotonic()
+                frames_written = 0
+                monitor.stream_opened(opened_at)
                 while not (stop_event.is_set() or retired.is_set()):
                     if poll:
                         try:
@@ -1506,6 +1669,21 @@ class Recorder:
                             continue
                         polled_once = True
                         if not data:
+                            # See _LOOPBACK_GAP_SECONDS: nothing is playing, so write the silence
+                            # WASAPI doesn't, up to now.
+                            now = time.monotonic()
+                            if now - last_data_at >= _LOOPBACK_GAP_SECONDS:
+                                missing = int((now - opened_at) * rate) - frames_written
+                                if missing > rate * _MAX_LOOPBACK_FILL_SECONDS:
+                                    # Far more than one pass of this loop can fall behind: the machine
+                                    # was asleep. The microphone recorded nothing then either, so
+                                    # carry on from here rather than write that out as silence.
+                                    frames_written += missing
+                                    missing = 0
+                                if missing > 0 and not retired.is_set():
+                                    writer.write(bytes(missing * bytes_per_frame))
+                                    frames_written += missing
+                                    setattr(self, level_attr, 0.0)
                             stop_event.wait(0.01)
                             continue
                     else:
@@ -1513,6 +1691,8 @@ class Recorder:
                     if retired.is_set():
                         break  # replaced while blocked in read(); the writer belongs to the new thread now
                     writer.write(data)
+                    frames_written += len(data) // bytes_per_frame
+                    last_data_at = time.monotonic()
                     stats = _analyze_pcm16(data)
                     setattr(self, level_attr, stats.level)
                     monitor.observe(stats, time.monotonic())
@@ -1520,6 +1700,8 @@ class Recorder:
                 # Nothing is watching this thread, so an escaping exception would be invisible; record
                 # it for the GUI and for RecordedAudio.notices, and still close everything below.
                 self._record_capture_failure(label, exc)
+                if not (stop_event.is_set() or retired.is_set() or self._stopping):
+                    self._stream_failed.set()  # the device watcher reopens it — see _recover_failed_streams
             finally:
                 for close in (
                     getattr(stream, "stop_stream", None),

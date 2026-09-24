@@ -360,3 +360,62 @@ def test_ocr_region_once_returns_empty_string_for_no_readable_text():
                                Image=FakeImage, pytesseract=tess)
 
     assert result == ""
+
+
+def test_a_frame_that_never_settles_is_read_anyway_after_a_couple_of_tries():
+    # The field case: a Teams window with someone's camera on is never pixel-identical between two
+    # grabs, so on-screen capture used to read nothing for as long as the video was on.
+    events = []
+    watcher = _watcher(on_text=events.append)
+    sct = FakeSct([b"v1", b"v2", b"v3", b"v4"])
+    tess = FakePytesseract(["Agenda: Q3 review"])
+
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
+    assert watcher._pending_lines == []  # first unsettled frame: give it a chance to settle
+    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
+    assert watcher._pending_lines == ["Agenda: Q3 review"]
+
+
+def test_a_capture_that_fails_is_skipped_and_capture_carries_on(monkeypatch):
+    import sys
+    import threading
+    import types
+
+    class Sct:
+        monitors = [{"left": 0, "top": 0, "width": 2, "height": 2}]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setitem(sys.modules, "mss", types.SimpleNamespace(mss=Sct))
+    monkeypatch.setitem(sys.modules, "pytesseract", types.SimpleNamespace(pytesseract=types.SimpleNamespace()))
+    monkeypatch.setitem(sys.modules, "PIL", types.SimpleNamespace(Image=FakeImage))
+
+    watcher = _watcher(on_text=lambda event: None)
+    attempts = []
+    done = threading.Event()
+
+    def capture(sct, region, Image, pytesseract):
+        attempts.append(region)
+        if len(attempts) == 1:
+            raise RuntimeError("ScreenShotError: region is off-screen")
+        watcher._stop_event.set()
+        done.set()
+
+    monkeypatch.setattr(watcher, "_capture_once", capture)
+    monkeypatch.setattr("meeting_scribe.screen.capture._MAX_FAILURE_BACKOFF_SECONDS", 0.01)
+    watcher._run()
+
+    assert done.is_set() and len(attempts) == 2
+    assert any("skipped a frame" in notice for notice in watcher.notices())
+
+
+def test_retargeting_forgets_the_last_frame_so_the_new_window_is_read():
+    watcher = _watcher(on_text=lambda event: None)
+    watcher._last_frame_hash = "abc"
+    target = RegionTarget(left=0, top=0, width=10, height=10)
+    watcher.set_target(target)
+    assert watcher.target is target and watcher._last_frame_hash is None

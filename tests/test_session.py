@@ -52,6 +52,17 @@ def _recordings_have_audio(monkeypatch):
     monkeypatch.setattr("meeting_scribe.session.wav_duration_seconds", lambda path: 60.0)
 
 
+@pytest.fixture(autouse=True)
+def _no_meetings_in_progress():
+    """Every test's database numbers its meetings from 1, so a session one test leaves unstopped would
+    otherwise look like a meeting still in progress to the next."""
+    from meeting_scribe import session
+
+    session._meetings_in_progress.clear()
+    yield
+    session._meetings_in_progress.clear()
+
+
 @pytest.fixture
 def _real_durations(monkeypatch):
     from meeting_scribe.transcription.engine import wav_duration_seconds
@@ -89,7 +100,8 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
             session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
 
             # Simulate the screen watcher having captured one slide during the meeting.
-            session._screen_events.append(ScreenTextEvent(timestamp_seconds=0.5, text="Slide: Agenda"))
+            on_text = MockScreenWatcher.call_args.kwargs["on_text"]
+            on_text(ScreenTextEvent(timestamp_seconds=0.5, text="Slide: Agenda"))
 
             session.start()
             recorder_instance.start.assert_called_once()
@@ -112,7 +124,7 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
 
 def test_session_wires_the_screen_watcher_to_collect_speaker_name_events(tmp_path):
     """ScreenWatcher is constructed with on_speaker_name pointed at _speaker_name_events, the same way
-    on_text is pointed at _screen_events — so a badge sighting the watcher reports actually gets kept."""
+    on_text is pointed at the on-screen text log — so a badge sighting the watcher reports actually gets kept."""
     with (
         patch("meeting_scribe.session.Recorder"),
         patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
@@ -1051,3 +1063,145 @@ def test_retry_with_only_empty_tracks_says_so(tmp_path, _real_durations):
 
         with pytest.raises(FileNotFoundError, match="is empty"):
             retry_meeting_transcription(settings, db, meeting_id)
+
+
+# --- a meeting still in progress can't be retried ------------------------------------------------------
+
+
+def test_a_meeting_that_is_still_recording_cannot_be_retried(tmp_path):
+    # The field case: the Projects tab offered Retry for the meeting being recorded (its row looks just
+    # like one whose transcription failed), which sent the audio so far to Runpod mid-call and marked
+    # the meeting finished with a partial transcript.
+    with (
+        patch("meeting_scribe.session.Recorder"),
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        from meeting_scribe.session import MeetingSession, meeting_in_progress, retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            session = MeetingSession(settings, db, "Test Project", "Kickoff")
+            session.start()
+            (settings.meeting_dir(session.meeting_id) / "mic.wav").write_bytes(b"fake mic audio")
+
+            assert meeting_in_progress(session.meeting_id)
+            with pytest.raises(ValueError, match="still being recorded"):
+                retry_meeting_transcription(settings, db, session.meeting_id)
+            MockTranscriber.return_value.transcribe_parts.assert_not_called()
+            assert db.get_meeting(session.meeting_id).ended_at is None
+
+            MockTranscriber.return_value.transcribe_parts.return_value = []
+            session.stop()
+            assert not meeting_in_progress(session.meeting_id)
+
+
+def test_a_meeting_is_released_even_when_finishing_it_fails(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession, meeting_in_progress
+
+        MockRecorder.return_value.stop.side_effect = RuntimeError("boom")
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+            with pytest.raises(RuntimeError):
+                session.stop()
+            assert not meeting_in_progress(session.meeting_id)
+
+
+def test_a_meeting_that_failed_to_start_is_not_left_in_progress(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession, meeting_in_progress
+
+        MockRecorder.return_value.start.side_effect = OSError("no microphone")
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            with pytest.raises(OSError):
+                session.start()
+            assert not meeting_in_progress(session.meeting_id)
+
+
+# --- on-screen text is kept on disk as it's captured -----------------------------------------------------
+
+
+def test_on_screen_text_is_written_to_disk_as_it_arrives(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder"),
+        patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession, load_screen_text_events
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            session = MeetingSession(settings, db, "Test Project", "Kickoff")
+            on_text = MockScreenWatcher.call_args.kwargs["on_text"]
+            on_text(ScreenTextEvent(timestamp_seconds=1.5, text="Slide: Agenda"))
+            on_text(ScreenTextEvent(timestamp_seconds=9.0, text="Q3 numbers\nRevenue up"))
+
+            assert load_screen_text_events(settings.meeting_dir(session.meeting_id)) == [
+                ScreenTextEvent(1.5, "Slide: Agenda"),
+                ScreenTextEvent(9.0, "Q3 numbers\nRevenue up"),
+            ]
+
+
+def test_a_cut_off_last_line_of_on_screen_text_is_skipped(tmp_path):
+    from meeting_scribe.session import SCREEN_TEXT_FILENAME, load_screen_text_events
+
+    (tmp_path / SCREEN_TEXT_FILENAME).write_text('{"t": 1.0, "text": "kept"}\n{"t": 2.0, "te', encoding="utf-8")
+    assert load_screen_text_events(tmp_path) == [ScreenTextEvent(1.0, "kept")]
+    assert load_screen_text_events(tmp_path / "missing") == []
+
+
+def test_retry_brings_back_the_on_screen_text_saved_during_the_meeting(tmp_path):
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.side_effect = (
+            lambda paths, source: [TranscriptLine(1.0, source, f"{source} speech")]
+        )
+        from meeting_scribe.session import SCREEN_TEXT_FILENAME, retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            _project, meeting_id = _stuck_meeting(settings, db)
+            (settings.meeting_dir(meeting_id) / SCREEN_TEXT_FILENAME).write_text(
+                '{"t": 0.5, "text": "Slide: Agenda"}\n', encoding="utf-8"
+            )
+
+            result = retry_meeting_transcription(settings, db, meeting_id)
+
+            assert "Slide: Agenda" in result
+            assert {row["source"] for row in db.get_segments(meeting_id)} == {"mic", "system", "screen_ocr"}
+
+
+def test_on_screen_capture_can_follow_the_call_to_a_new_window(tmp_path):
+    from meeting_scribe.screen.region_picker import WindowRegionTarget
+    from meeting_scribe.screen.window_picker import WindowTarget
+
+    with (
+        patch("meeting_scribe.session.Recorder"),
+        patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
+        patch("meeting_scribe.session.WhisperTranscriber"),
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        watcher = MockScreenWatcher.return_value
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+
+            watcher.target = WindowTarget(hwnd=1, title="Meeting | Microsoft Teams")
+            session.follow_screen_window(2)
+            watcher.set_target.assert_called_with(WindowTarget(hwnd=2, title="Meeting | Microsoft Teams"))
+
+            area = WindowRegionTarget(1, "Teams", 0.1, 0.8, 0.8, 0.1, 800, 60)
+            watcher.target = area
+            session.follow_screen_window(3, "Weekly sync")
+            moved = watcher.set_target.call_args.args[0]
+            assert (moved.hwnd, moved.window_title, moved.offset_top_frac) == (3, "Weekly sync", 0.8)
