@@ -15,7 +15,7 @@ from meeting_scribe.hotkeys import HotkeyCombo
 
 USER_CONFIG_FILENAME = "settings.json"
 
-# The sizes offered in the Settings tab's model dropdown, smallest/fastest first. faster-whisper also
+# The sizes offered in the Settings page's model dropdown, smallest/fastest first. faster-whisper also
 # supports .en (English-only) and distil-* (distilled, English-only) variants, but those are left out
 # here to keep the dropdown to one choice per accuracy/memory tradeoff rather than a long list most users
 # won't need — MEETING_SCRIBE_WHISPER_MODEL can still be set to any faster-whisper model name directly for
@@ -81,7 +81,7 @@ class Settings:
     # Global (system-wide) keyboard shortcuts for starting/stopping a meeting without switching focus to
     # this app — see hotkeys.py. Either can be None to leave that action mouse-only, which is the default:
     # a hotkey that fires on every launch with no setup could collide with a combo already in use
-    # elsewhere, so this is opt-in from the Settings tab rather than assigned automatically.
+    # elsewhere, so this is opt-in from the Settings page rather than assigned automatically.
     start_meeting_hotkey: HotkeyCombo | None = None
     stop_meeting_hotkey: HotkeyCombo | None = None
     # Opt-in: sends the system-audio track to a Runpod-hosted WhisperX endpoint for speaker diarization
@@ -89,7 +89,7 @@ class Settings:
     # reasoning as the meeting hotkeys above: turning this on sends meeting audio to third parties, so it
     # shouldn't happen without the user explicitly choosing it.
     diarize_system_audio: bool = False
-    # Credentials for the above, entered on the Settings tab and persisted to settings.json like every
+    # Credentials for the above, entered on the Settings page and persisted to settings.json like every
     # other preference here — plaintext either way, so a settings field isn't meaningfully less secure
     # than an environment variable would have been for a single-user desktop app; it's just easier to set.
     # None means "not configured yet"; runpod_huggingface_token can also be left unset if HF_TOKEN was
@@ -133,7 +133,7 @@ def _user_config_path(data_dir: Path) -> Path:
 
 
 def _load_user_config(data_dir: Path) -> dict:
-    """Reads the GUI Settings tab's saved preferences, if any. Missing or corrupt is treated the same
+    """Reads the GUI Settings page's saved preferences, if any. Missing or corrupt is treated the same
     as "nothing saved yet" — this is a soft preference, not something to crash startup over."""
     path = _user_config_path(data_dir)
     if not path.exists():
@@ -160,7 +160,7 @@ def _hotkey_from_json(data: object) -> HotkeyCombo | None:
 def save_user_config(settings: Settings) -> None:
     """Persists the user-editable settings (Copilot sync folder, chosen audio devices, Whisper model
     size, meeting shortcuts) so they survive a restart without the user needing to set environment
-    variables — the GUI's Settings tab calls this after Save."""
+    variables — the GUI's Settings page calls this after Save."""
     path = _user_config_path(settings.data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -181,89 +181,32 @@ def save_user_config(settings: Settings) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def update_copilot_settings(settings: Settings, *, copilot_sync_dir: str | None) -> Settings:
-    """Applies and persists the Copilot Studio push-folder edit from the Settings tab. A blank
-    `copilot_sync_dir` disables pushing entirely — meetings are still recorded and saved locally."""
-    updated = replace(settings, copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None)
-    save_user_config(updated)
-    return updated
+# Text fields where a blank entry means "not set" — see update_settings.
+_BLANK_MEANS_UNSET = (
+    "mic_device_name",
+    "system_device_name",
+    "headset_microphone_name",
+    "runpod_api_key",
+    "runpod_endpoint_id",
+    "runpod_huggingface_token",
+)
 
 
-def update_audio_devices(
-    settings: Settings, *, mic_device_name: str | None, system_device_name: str | None
-) -> Settings:
-    """Applies and persists a microphone / system-audio device choice from the Settings tab. None means
-    "use whatever Windows currently considers the default" for that device."""
-    updated = replace(settings, mic_device_name=mic_device_name, system_device_name=system_device_name)
-    save_user_config(updated)
-    return updated
+def update_settings(settings: Settings, **changes) -> Settings:
+    """Applies and persists edits from the GUI, returning the updated Settings. Takes the same field
+    names as Settings; a blank text field is stored as None ("not set"), and copilot_sync_dir may be given
+    as a string (blank disables pushing — meetings are still recorded and saved locally).
 
-
-def update_audio_automation(
-    settings: Settings, *, auto_switch_audio_devices: bool, headset_microphone_name: str | None
-) -> Settings:
-    """Applies and persists the Settings tab's automatic device switching choices. Like the device
-    choices themselves, these are read when a meeting starts."""
-    updated = replace(
-        settings,
-        auto_switch_audio_devices=auto_switch_audio_devices,
-        headset_microphone_name=headset_microphone_name or None,
-    )
-    save_user_config(updated)
-    return updated
-
-
-def update_diarize_system_audio(settings: Settings, *, diarize_system_audio: bool) -> Settings:
-    """Applies and persists the Settings tab's cloud-speaker-diarization opt-in checkbox. Only affects
-    meetings whose transcription hasn't started yet — like whisper_model_size, a MeetingSession reads this
-    once at construction time (see session.py)."""
-    updated = replace(settings, diarize_system_audio=diarize_system_audio)
-    save_user_config(updated)
-    return updated
-
-
-def update_runpod_settings(
-    settings: Settings,
-    *,
-    runpod_api_key: str | None,
-    runpod_endpoint_id: str | None,
-    runpod_huggingface_token: str | None,
-) -> Settings:
-    """Applies and persists the Settings tab's Runpod/HuggingFace credential fields. Blank fields are
-    stored as None, same convention as update_copilot_settings' sync folder."""
-    updated = replace(
-        settings,
-        runpod_api_key=runpod_api_key or None,
-        runpod_endpoint_id=runpod_endpoint_id or None,
-        runpod_huggingface_token=runpod_huggingface_token or None,
-    )
-    save_user_config(updated)
-    return updated
-
-
-def update_whisper_model_size(settings: Settings, *, whisper_model_size: str) -> Settings:
-    """Applies and persists the Settings tab's Whisper model-size choice. Only affects meetings started
-    after this is saved — a MeetingSession builds its own WhisperTranscriber once, at construction time
-    (see session.py), so one already recording or finishing up keeps using whatever size was in effect
-    when it started."""
-    updated = replace(settings, whisper_model_size=whisper_model_size)
-    save_user_config(updated)
-    return updated
-
-
-def update_meeting_hotkeys(
-    settings: Settings, *, start: HotkeyCombo | None, stop: HotkeyCombo | None
-) -> Settings:
-    """Applies and persists the Settings tab's Start/Stop meeting shortcut choices. Either can be None to
-    leave that action mouse-only."""
-    updated = replace(settings, start_meeting_hotkey=start, stop_meeting_hotkey=stop)
-    save_user_config(updated)
-    return updated
-
-
-def update_ocr_area(settings: Settings, *, ocr_area: tuple[int, int, int, int] | None) -> Settings:
-    """Applies and persists where the OCR box was left (see Settings.ocr_area)."""
-    updated = replace(settings, ocr_area=ocr_area)
+    Whisper model size and diarization are read once when a meeting starts, so a change only affects
+    meetings started after it; device choices are also applied live to a recording in progress by the
+    GUI (see MeetingScribeApp.switch_active_recording)."""
+    for field in _BLANK_MEANS_UNSET:
+        if field in changes:
+            changes[field] = changes[field] or None
+    if "copilot_sync_dir" in changes:
+        sync_dir = changes["copilot_sync_dir"]
+        changes["copilot_sync_dir"] = Path(sync_dir) if sync_dir else None
+    updated = replace(settings, **changes)
     save_user_config(updated)
     return updated
 

@@ -13,16 +13,14 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
 from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
 from meeting_scribe.audio.recorder import Recorder, discover_wav_parts
 from meeting_scribe.config import Settings
-from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher, SpeakerNameEvent
-from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
-from meeting_scribe.screen.window_picker import WindowTarget
+from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
+from meeting_scribe.screen.region_picker import RegionTarget
 from meeting_scribe.storage.database import Database
 from meeting_scribe.transcription.engine import (
     TranscriptLine,
@@ -43,7 +41,7 @@ SCREEN_TEXT_FILENAME = "screen_text.jsonl"
 
 # Meetings being recorded, finished (transcribed, pushed, saved) or retried right now. Until one of these
 # is done, its database row looks exactly like a meeting whose transcription failed (no end time, no
-# transcript) — which is what the Projects tab offers Retry for. Retrying a meeting that's still being
+# transcript) — which is what the Library offers Retry for. Retrying a meeting that's still being
 # recorded transcribed the audio captured so far, sent it to Runpod partway through the call, and marked
 # the meeting finished with that partial transcript; so a meeting in here can't be retried.
 _meetings_in_progress: set[int] = set()
@@ -113,53 +111,36 @@ def load_screen_text_events(meeting_dir: Path) -> list[ScreenTextEvent]:
     return events
 
 
-@dataclass(frozen=True)
-class _SystemTranscripts:
-    local: list[TranscriptLine]
-    # None when cloud diarization is off, or failed.
-    runpod: list[TranscriptLine] | None
-
-    @property
-    def primary(self) -> list[TranscriptLine]:
-        """The one used for the meeting's own transcript and the Copilot push: Runpod's when there is
-        one, since its speaker labels are the point of opting in."""
-        return self.runpod if self.runpod is not None else self.local
-
-
 def _transcribe_system_track(
     settings: Settings,
     local_transcriber: WhisperTranscriber,
     system_paths: Sequence[Path],
     report: Callable[[str], None],
-) -> _SystemTranscripts:
-    """Transcribes the system-audio track — everyone but the meeting owner — on this PC, and also with
-    cloud speaker diarization when opted into (Settings.diarize_system_audio), so the two can be
-    compared side by side on the Projects tab. A cloud failure is reported rather than raised: a
-    third-party outage or a missing API key shouldn't cost a meeting its transcript, just the per-speaker
-    labels."""
+) -> tuple[list[TranscriptLine], str]:
+    """(lines, engine) for the system-audio track — everyone but the meeting owner. With cloud speaker
+    diarization opted into (Settings.diarize_system_audio) it goes to Runpod, so lines carry speaker
+    labels; otherwise, or if Runpod fails, it's transcribed on this PC. A cloud failure is reported rather
+    than raised: a third-party outage or a missing API key shouldn't cost a meeting its transcript, just
+    the per-speaker labels."""
     if not system_paths:
-        return _SystemTranscripts(local=[], runpod=None)
-    runpod_lines = None
+        return [], "local"
     if settings.diarize_system_audio:
-        try:
-            from meeting_scribe.transcription.runpod_whisperx import (
-                RunpodWhisperXError,
-                RunpodWhisperXTranscriber,
-            )
+        from meeting_scribe.transcription.runpod_whisperx import (
+            RunpodWhisperXError,
+            RunpodWhisperXTranscriber,
+        )
 
+        try:
             transcriber = RunpodWhisperXTranscriber(
                 api_key=settings.runpod_api_key,
                 endpoint_id=settings.runpod_endpoint_id,
                 huggingface_token=settings.runpod_huggingface_token,
                 on_progress=report,
             )
-            runpod_lines = transcriber.transcribe_parts(system_paths, source="system")
+            return transcriber.transcribe_parts(system_paths, source="system"), "runpod"
         except RunpodWhisperXError as error:
-            report(f"Cloud speaker diarization failed ({error}) — using the local transcript only.")
-        else:
-            report("Transcribing system audio on this PC too, for comparison…")
-    local_lines = local_transcriber.transcribe_parts(system_paths, source="system")
-    return _SystemTranscripts(local=local_lines, runpod=runpod_lines)
+            report(f"Cloud speaker diarization failed ({error}) — transcribing on this PC instead.")
+    return local_transcriber.transcribe_parts(system_paths, source="system"), "local"
 
 
 def _parts_with_audio(paths: Sequence[Path], label: str, report: Callable[[str], None]) -> tuple[Path, ...]:
@@ -175,23 +156,95 @@ def _parts_with_audio(paths: Sequence[Path], label: str, report: Callable[[str],
     return tuple(kept)
 
 
-def _save_segments(
+def _finish_meeting(
+    settings: Settings,
     db: Database,
     meeting_id: int,
-    mic_lines: list[TranscriptLine],
-    system: _SystemTranscripts,
+    *,
+    transcriber: WhisperTranscriber,
+    mic_paths: Sequence[Path],
+    system_paths: Sequence[Path],
+    screen_events: Sequence[ScreenTextEvent],
+    report: Callable[[str], None],
+) -> str:
+    """The shared back half of finishing a meeting — MeetingSession.stop() and
+    retry_meeting_transcription() both end here: transcribe both tracks, save every line, push the
+    package to Copilot Studio if a sync folder is set, and mark the meeting finished. Returns the merged
+    transcript."""
+    mic_paths = _parts_with_audio(mic_paths, "Microphone", report)
+    system_paths = _parts_with_audio(system_paths, "System audio", report)
+    with transcription_slot(on_wait=lambda: report(_WAITING_FOR_TRANSCRIPTION_MESSAGE)):
+        # Checked right before the expensive part starts, not any earlier — a warning here is what a
+        # `mkl_malloc: failed to allocate memory` crash further down would otherwise give no advance
+        # notice of at all (see transcription.engine.low_memory_warning).
+        warning = low_memory_warning(settings.whisper_model_size, available_memory_mb())
+        if warning is not None:
+            report(warning)
+        try:
+            mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")
+            system_lines, system_engine = _transcribe_system_track(settings, transcriber, system_paths, report)
+        finally:
+            transcriber.unload()
+    report("Transcription complete.")
+
+    screen_lines = [TranscriptLine(e.timestamp_seconds, "screen_ocr", e.text) for e in screen_events]
+    # The Copilot push hands off the spoken and on-screen text as two separate files; the local record
+    # keeps them merged by timestamp.
+    audio_lines = merge_transcript_lines(mic_lines, system_lines)
+    transcript_text = render_transcript(merge_transcript_lines(audio_lines, screen_lines))
+
+    # Clears whatever an earlier, partially-successful attempt left behind (one that transcribed fine but
+    # then failed pushing, say) so a retry doesn't leave two attempts' lines side by side.
+    db.clear_transcript_segments(meeting_id)
+    for lines, engine in ((screen_lines, None), (mic_lines, "local"), (system_lines, system_engine)):
+        for line in lines:
+            db.add_transcript_segment(
+                meeting_id, line.source, line.timestamp_seconds, line.text, speaker=line.speaker, engine=engine
+            )
+
+    if settings.copilot_sync_dir is not None:
+        _push_to_copilot(settings, db, meeting_id, audio_lines, screen_lines)
+        report("Pushed to Copilot Studio.")
+    else:
+        report("Copilot sync folder not configured — nothing pushed.")
+
+    db.finish_meeting(meeting_id, transcript_text=transcript_text)
+    report("Meeting saved.")
+    return transcript_text
+
+
+def _push_to_copilot(
+    settings: Settings,
+    db: Database,
+    meeting_id: int,
+    audio_lines: list[TranscriptLine],
     screen_lines: list[TranscriptLine],
 ) -> None:
-    """Saves every line, tagged with the transcriber that produced it, so the Projects tab can show the
-    local and Runpod versions of the system audio side by side (each alongside the same mic lines)."""
-    for line in screen_lines:
-        db.add_transcript_segment(meeting_id, line.source, line.timestamp_seconds, line.text)
-    for line in mic_lines + system.local:
-        db.add_transcript_segment(meeting_id, line.source, line.timestamp_seconds, line.text, engine="local")
-    for line in system.runpod or []:
-        db.add_transcript_segment(
-            meeting_id, line.source, line.timestamp_seconds, line.text, speaker=line.speaker, engine="runpod"
-        )
+    meeting = db.get_meeting(meeting_id)
+    project = db.get_project(meeting.project_id)
+    # Manual notes and the OCR'd attendee list aren't uploaded files, but they're handed off the same
+    # reference-doc-style way as one — same naming, same manifest shape — rather than being folded into
+    # either transcript, since neither is really "audio" or "on-screen text".
+    text_reference_documents = [
+        TextReferenceDocument(original_filename=filename, content=content)
+        for filename, content in (("meeting-notes.txt", meeting.manual_notes), ("attendees.txt", meeting.attendees))
+        if content and content.strip()
+    ]
+    reference_documents = [
+        ReferenceDocument(original_filename=row["filename"], source_path=Path(row["source_path"]))
+        for row in db.list_documents_for_meeting(meeting_id)
+        if row["source_path"]
+    ]
+    push_meeting_package(
+        meeting_code=meeting.meeting_code,
+        project_name=project.name,
+        meeting_title=meeting.title,
+        audio_transcript_text=render_transcript(audio_lines),
+        screen_transcript_text=render_transcript(screen_lines),
+        reference_documents=reference_documents,
+        text_reference_documents=text_reference_documents,
+        inbox_dir=settings.copilot_inbox_dir,
+    )
 
 
 class MeetingSession:
@@ -201,15 +254,12 @@ class MeetingSession:
         db: Database,
         project_name: str,
         title: str,
-        screen_target: WindowTarget | RegionTarget | WindowRegionTarget | None = None,
+        screen_target: RegionTarget | None = None,
         *,
         read_screen: bool = True,
     ):
-        """`screen_target` selects a single window, a fixed user-drawn rectangle, or a user-drawn
-        rectangle pinned to a window's current position, to OCR instead of the whole screen — e.g. just
-        the Teams/Zoom window, just a captions bar, or just a corner of the Teams window that keeps
-        capturing that same corner even if the window is moved to another monitor. Leave it None to
-        capture the whole screen.
+        """`screen_target` is the screen rectangle to OCR (where the OCR box is); None captures the whole
+        screen.
 
         `read_screen=False` starts the meeting without reading anything on screen yet — the OCR box's
         flow (see screen.ocr_box): the box is put in place first, then its Start button calls
@@ -235,13 +285,8 @@ class MeetingSession:
             headset_microphone_name=settings.headset_microphone_name,
         )
         self._screen_text = _ScreenTextLog(meeting_dir / SCREEN_TEXT_FILENAME)
-        # Timestamped speaker-name-badge sightings, kept alongside the caption stream — not used for
-        # anything yet, but this is the raw material a future system-audio diarization pass would line up
-        # against WhisperX speaker clusters to turn "SPEAKER_00" into a real name.
-        self._speaker_name_events: list[SpeakerNameEvent] = []
         self._screen_watcher = ScreenWatcher(
             on_text=self._screen_text.append,
-            on_speaker_name=self._speaker_name_events.append,
             interval_seconds=settings.screen_capture_interval_seconds,
             tesseract_cmd=settings.tesseract_cmd,
             target=screen_target,
@@ -372,74 +417,16 @@ class MeetingSession:
         for message in recorded.notices:
             report(message)
 
-        mic_paths = _parts_with_audio(recorded.mic_paths, "Microphone", report)
-        system_paths = _parts_with_audio(recorded.system_paths, "System audio", report)
-        with transcription_slot(on_wait=lambda: report(_WAITING_FOR_TRANSCRIPTION_MESSAGE)):
-            # Checked right before the expensive part starts, not any earlier — a warning here is what a
-            # `mkl_malloc: failed to allocate memory` crash further down would otherwise give no advance
-            # notice of at all (see transcription.engine.low_memory_warning).
-            warning = low_memory_warning(self._settings.whisper_model_size, available_memory_mb())
-            if warning is not None:
-                report(warning)
-
-            try:
-                mic_lines = self._transcriber.transcribe_parts(mic_paths, source="mic")
-                system = _transcribe_system_track(self._settings, self._transcriber, system_paths, report)
-            finally:
-                self._transcriber.unload()
-        screen_lines = [
-            TranscriptLine(event.timestamp_seconds, "screen_ocr", event.text)
-            for event in self._screen_text.snapshot()
-        ]
-        report("Transcription complete.")
-
-        # The Copilot push package (see ai/copilot_push.py) hands off the spoken and on-screen text as
-        # two separate files, not one merged one — audio_lines covers both directions of the call (mic
-        # and system), screen_lines is the OCR stream. The combined `merged` rendering is still what's
-        # kept in this app's own local record (finish_meeting below), where mixing sources by timestamp
-        # is exactly the point.
-        audio_lines = merge_transcript_lines(mic_lines, system.primary)
-        merged = merge_transcript_lines(audio_lines, screen_lines)
-        transcript_text = render_transcript(merged)
-
-        _save_segments(self._db, self.meeting_id, mic_lines, system, screen_lines)
-
-        if self._settings.copilot_sync_dir is not None:
-            meeting = self._db.get_meeting(self.meeting_id)
-            # Manual notes and the OCR'd attendee list aren't uploaded files, but they're handed off the
-            # same reference-doc-style way as one — same naming, same manifest shape — rather than being
-            # folded into either transcript, since neither is really "audio" or "on-screen text".
-            text_reference_documents = []
-            if meeting.manual_notes and meeting.manual_notes.strip():
-                text_reference_documents.append(
-                    TextReferenceDocument(original_filename="meeting-notes.txt", content=meeting.manual_notes)
-                )
-            if meeting.attendees and meeting.attendees.strip():
-                text_reference_documents.append(
-                    TextReferenceDocument(original_filename="attendees.txt", content=meeting.attendees)
-                )
-            reference_documents = [
-                ReferenceDocument(original_filename=row["filename"], source_path=Path(row["source_path"]))
-                for row in self._db.list_documents_for_meeting(self.meeting_id)
-                if row["source_path"]
-            ]
-            push_meeting_package(
-                meeting_code=self.meeting_code,
-                project_name=self.project.name,
-                meeting_title=self.title,
-                audio_transcript_text=render_transcript(audio_lines),
-                screen_transcript_text=render_transcript(screen_lines),
-                reference_documents=reference_documents,
-                text_reference_documents=text_reference_documents,
-                inbox_dir=self._settings.copilot_inbox_dir,
-            )
-            report("Pushed to Copilot Studio.")
-        else:
-            report("Copilot sync folder not configured — nothing pushed.")
-
-        self._db.finish_meeting(self.meeting_id, transcript_text=transcript_text)
-        report("Meeting saved.")
-        return transcript_text
+        return _finish_meeting(
+            self._settings,
+            self._db,
+            self.meeting_id,
+            transcriber=self._transcriber,
+            mic_paths=recorded.mic_paths,
+            system_paths=recorded.system_paths,
+            screen_events=self._screen_text.snapshot(),
+            report=report,
+        )
 
 
 def retry_meeting_transcription(
@@ -505,61 +492,13 @@ def _retry_meeting_transcription(
             f'The recorded audio for "{meeting.title}" in {meeting_dir} is empty — nothing to retranscribe.'
         )
 
-    with transcription_slot(on_wait=lambda: report(_WAITING_FOR_TRANSCRIPTION_MESSAGE)):
-        warning = low_memory_warning(settings.whisper_model_size, available_memory_mb())
-        if warning is not None:
-            report(warning)
-
-        transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
-        try:
-            mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")
-            system = _transcribe_system_track(settings, transcriber, system_paths, report)
-        finally:
-            transcriber.unload()
-    report("Transcription complete.")
-
-    screen_lines = [
-        TranscriptLine(event.timestamp_seconds, "screen_ocr", event.text)
-        for event in load_screen_text_events(meeting_dir)
-    ]
-    audio_lines = merge_transcript_lines(mic_lines, system.primary)
-    transcript_text = render_transcript(merge_transcript_lines(audio_lines, screen_lines))
-
-    # Clears any segments a previous, partially-successful retry left behind (e.g. one that transcribed
-    # fine but then failed pushing to Copilot Studio) before inserting this attempt's — otherwise a
-    # second retry would leave both attempts' segments sitting side by side.
-    db.clear_transcript_segments(meeting_id)
-    _save_segments(db, meeting_id, mic_lines, system, screen_lines)
-
-    if settings.copilot_sync_dir is not None:
-        text_reference_documents = []
-        if meeting.manual_notes and meeting.manual_notes.strip():
-            text_reference_documents.append(
-                TextReferenceDocument(original_filename="meeting-notes.txt", content=meeting.manual_notes)
-            )
-        if meeting.attendees and meeting.attendees.strip():
-            text_reference_documents.append(
-                TextReferenceDocument(original_filename="attendees.txt", content=meeting.attendees)
-            )
-        reference_documents = [
-            ReferenceDocument(original_filename=row["filename"], source_path=Path(row["source_path"]))
-            for row in db.list_documents_for_meeting(meeting_id)
-            if row["source_path"]
-        ]
-        push_meeting_package(
-            meeting_code=meeting.meeting_code,
-            project_name=project.name,
-            meeting_title=meeting.title,
-            audio_transcript_text=render_transcript(audio_lines),
-            screen_transcript_text=render_transcript(screen_lines),
-            reference_documents=reference_documents,
-            text_reference_documents=text_reference_documents,
-            inbox_dir=settings.copilot_inbox_dir,
-        )
-        report("Pushed to Copilot Studio.")
-    else:
-        report("Copilot sync folder not configured — nothing pushed.")
-
-    db.finish_meeting(meeting_id, transcript_text=transcript_text)
-    report("Meeting saved.")
-    return transcript_text
+    return _finish_meeting(
+        settings,
+        db,
+        meeting_id,
+        transcriber=WhisperTranscriber(model_size=settings.whisper_model_size),
+        mic_paths=mic_paths,
+        system_paths=system_paths,
+        screen_events=load_screen_text_events(meeting_dir),
+        report=report,
+    )

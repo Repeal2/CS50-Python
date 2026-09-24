@@ -9,7 +9,7 @@ Needs a Runpod API key and the id of a deployed WhisperX-with-diarization server
 do anything (see is_configured); a HuggingFace access token that has accepted pyannote's gated model terms
 is also needed for diarization itself to work, though the underlying worker may fail with its own error
 rather than this module catching that case specifically. These come from config.Settings
-(runpod_api_key/runpod_endpoint_id/runpod_huggingface_token, entered on the Settings tab and persisted to
+(runpod_api_key/runpod_endpoint_id/runpod_huggingface_token, entered on the Settings page and persisted to
 settings.json like the app's other preferences) — the environment variables below are a fallback for
 anyone who'd rather set them that way instead (or not set a HuggingFace token here at all, if HF_TOKEN was
 set directly as an environment variable on the Runpod endpoint itself).

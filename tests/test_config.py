@@ -1,17 +1,7 @@
 import sys
 from pathlib import Path
 
-from meeting_scribe.config import (
-    load_settings,
-    resolve_tesseract_cmd,
-    update_audio_automation,
-    update_audio_devices,
-    update_copilot_settings,
-    update_diarize_system_audio,
-    update_meeting_hotkeys,
-    update_runpod_settings,
-    update_whisper_model_size,
-)
+from meeting_scribe.config import load_settings, resolve_tesseract_cmd, update_settings
 from meeting_scribe.hotkeys import MOD_ALT, MOD_CONTROL, MOD_SHIFT, HotkeyCombo
 
 
@@ -51,7 +41,7 @@ def test_load_settings_defaults_to_no_device_override(tmp_path, monkeypatch):
 def test_update_audio_devices_persists_and_reloads(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_audio_devices(
+    update_settings(
         load_settings(), mic_device_name="USB Mic", system_device_name="Speakers (Realtek)"
     )
 
@@ -63,8 +53,8 @@ def test_update_audio_devices_persists_and_reloads(tmp_path, monkeypatch):
 def test_update_audio_devices_can_reset_to_system_default(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
-    cleared = update_audio_devices(load_settings(), mic_device_name=None, system_device_name=None)
+    update_settings(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    cleared = update_settings(load_settings(), mic_device_name=None, system_device_name=None)
 
     assert cleared.mic_device_name is None
     assert cleared.system_device_name is None
@@ -95,7 +85,7 @@ def test_documents_dir_is_a_subfolder_of_the_data_dir(tmp_path, monkeypatch):
 def test_copilot_inbox_dir_is_a_subfolder_of_the_sync_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    settings = update_copilot_settings(load_settings(), copilot_sync_dir=str(tmp_path / "Bridge"))
+    settings = update_settings(load_settings(), copilot_sync_dir=str(tmp_path / "Bridge"))
 
     assert settings.copilot_inbox_dir == tmp_path / "Bridge" / "Inbox"
 
@@ -103,7 +93,7 @@ def test_copilot_inbox_dir_is_a_subfolder_of_the_sync_dir(tmp_path, monkeypatch)
 def test_update_copilot_settings_persists_and_reloads(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_copilot_settings(load_settings(), copilot_sync_dir=str(tmp_path / "Bridge"))
+    update_settings(load_settings(), copilot_sync_dir=str(tmp_path / "Bridge"))
 
     reloaded = load_settings()
     assert reloaded.copilot_sync_dir == Path(tmp_path / "Bridge")
@@ -112,8 +102,8 @@ def test_update_copilot_settings_persists_and_reloads(tmp_path, monkeypatch):
 def test_update_copilot_settings_can_clear_the_sync_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_copilot_settings(load_settings(), copilot_sync_dir=str(tmp_path / "Bridge"))
-    cleared = update_copilot_settings(load_settings(), copilot_sync_dir=None)
+    update_settings(load_settings(), copilot_sync_dir=str(tmp_path / "Bridge"))
+    cleared = update_settings(load_settings(), copilot_sync_dir=None)
 
     assert cleared.copilot_sync_dir is None
     assert load_settings().copilot_sync_dir is None
@@ -122,8 +112,8 @@ def test_update_copilot_settings_can_clear_the_sync_dir(tmp_path, monkeypatch):
 def test_update_copilot_settings_does_not_clobber_audio_devices(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
-    update_copilot_settings(settings, copilot_sync_dir=str(tmp_path / "Bridge"))
+    settings = update_settings(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_settings(settings, copilot_sync_dir=str(tmp_path / "Bridge"))
 
     reloaded = load_settings()
     assert reloaded.mic_device_name == "USB Mic"
@@ -147,7 +137,7 @@ def test_load_settings_uses_the_whisper_model_env_var(tmp_path, monkeypatch):
 def test_update_whisper_model_size_persists_and_reloads(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_whisper_model_size(load_settings(), whisper_model_size="large-v3")
+    update_settings(load_settings(), whisper_model_size="large-v3")
 
     assert load_settings().whisper_model_size == "large-v3"
 
@@ -159,7 +149,7 @@ def test_update_whisper_model_size_persisted_choice_wins_over_the_env_var(tmp_pa
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("MEETING_SCRIBE_WHISPER_MODEL", "tiny")
 
-    update_whisper_model_size(load_settings(), whisper_model_size="medium")
+    update_settings(load_settings(), whisper_model_size="medium")
 
     assert load_settings().whisper_model_size == "medium"
 
@@ -167,8 +157,8 @@ def test_update_whisper_model_size_persisted_choice_wins_over_the_env_var(tmp_pa
 def test_update_whisper_model_size_does_not_clobber_other_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
-    update_whisper_model_size(settings, whisper_model_size="medium")
+    settings = update_settings(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_settings(settings, whisper_model_size="medium")
 
     reloaded = load_settings()
     assert reloaded.mic_device_name == "USB Mic"
@@ -191,7 +181,7 @@ def test_update_meeting_hotkeys_persists_and_reloads(tmp_path, monkeypatch):
     start = HotkeyCombo(modifiers=MOD_CONTROL | MOD_ALT, vk=0x53)  # Ctrl+Alt+S
     stop = HotkeyCombo(modifiers=MOD_CONTROL | MOD_ALT | MOD_SHIFT, vk=0x53)  # Ctrl+Alt+Shift+S
 
-    update_meeting_hotkeys(load_settings(), start=start, stop=stop)
+    update_settings(load_settings(), start_meeting_hotkey=start, stop_meeting_hotkey=stop)
 
     reloaded = load_settings()
     assert reloaded.start_meeting_hotkey == start
@@ -202,8 +192,8 @@ def test_update_meeting_hotkeys_can_clear_either_one(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
     start = HotkeyCombo(modifiers=MOD_CONTROL, vk=0x53)
 
-    update_meeting_hotkeys(load_settings(), start=start, stop=start)
-    cleared = update_meeting_hotkeys(load_settings(), start=start, stop=None)
+    update_settings(load_settings(), start_meeting_hotkey=start, stop_meeting_hotkey=start)
+    cleared = update_settings(load_settings(), start_meeting_hotkey=start, stop_meeting_hotkey=None)
 
     assert cleared.start_meeting_hotkey == start
     assert cleared.stop_meeting_hotkey is None
@@ -214,8 +204,8 @@ def test_update_meeting_hotkeys_does_not_clobber_other_settings(tmp_path, monkey
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
     start = HotkeyCombo(modifiers=MOD_CONTROL, vk=0x53)
 
-    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
-    update_meeting_hotkeys(settings, start=start, stop=None)
+    settings = update_settings(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_settings(settings, start_meeting_hotkey=start, stop_meeting_hotkey=None)
 
     reloaded = load_settings()
     assert reloaded.mic_device_name == "USB Mic"
@@ -246,7 +236,7 @@ def test_load_settings_defaults_diarize_system_audio_to_off(tmp_path, monkeypatc
 def test_update_diarize_system_audio_persists_and_reloads(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_diarize_system_audio(load_settings(), diarize_system_audio=True)
+    update_settings(load_settings(), diarize_system_audio=True)
 
     assert load_settings().diarize_system_audio is True
 
@@ -254,8 +244,8 @@ def test_update_diarize_system_audio_persists_and_reloads(tmp_path, monkeypatch)
 def test_update_diarize_system_audio_does_not_clobber_other_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
-    update_diarize_system_audio(settings, diarize_system_audio=True)
+    settings = update_settings(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_settings(settings, diarize_system_audio=True)
 
     reloaded = load_settings()
     assert reloaded.mic_device_name == "USB Mic"
@@ -275,7 +265,7 @@ def test_load_settings_defaults_runpod_settings_to_none(tmp_path, monkeypatch):
 def test_update_runpod_settings_persists_and_reloads(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_runpod_settings(
+    update_settings(
         load_settings(),
         runpod_api_key="rp-key",
         runpod_endpoint_id="rp-endpoint",
@@ -291,7 +281,7 @@ def test_update_runpod_settings_persists_and_reloads(tmp_path, monkeypatch):
 def test_update_runpod_settings_treats_blank_strings_as_unset(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_runpod_settings(
+    update_settings(
         load_settings(), runpod_api_key="", runpod_endpoint_id="", runpod_huggingface_token=""
     )
 
@@ -304,8 +294,8 @@ def test_update_runpod_settings_treats_blank_strings_as_unset(tmp_path, monkeypa
 def test_update_runpod_settings_does_not_clobber_other_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    settings = update_audio_devices(load_settings(), mic_device_name="USB Mic", system_device_name=None)
-    update_runpod_settings(
+    settings = update_settings(load_settings(), mic_device_name="USB Mic", system_device_name=None)
+    update_settings(
         settings, runpod_api_key="rp-key", runpod_endpoint_id="rp-endpoint", runpod_huggingface_token=None
     )
 
@@ -341,8 +331,8 @@ def test_automatic_device_switching_is_on_by_default(tmp_path, monkeypatch):
 def test_update_audio_automation_persists_and_reloads(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    settings = update_audio_devices(load_settings(), mic_device_name="Laptop Mic", system_device_name=None)
-    update_audio_automation(
+    settings = update_settings(load_settings(), mic_device_name="Laptop Mic", system_device_name=None)
+    update_settings(
         settings, auto_switch_audio_devices=False, headset_microphone_name="Jabra Evolve2 65"
     )
 
@@ -355,7 +345,7 @@ def test_update_audio_automation_persists_and_reloads(tmp_path, monkeypatch):
 def test_a_blank_headset_means_recognize_one_by_name(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_audio_automation(load_settings(), auto_switch_audio_devices=True, headset_microphone_name="")
+    update_settings(load_settings(), auto_switch_audio_devices=True, headset_microphone_name="")
 
     assert load_settings().headset_microphone_name is None
 
@@ -367,7 +357,7 @@ def test_the_ocr_box_position_is_saved_and_loaded(tmp_path, monkeypatch):
     settings = config.load_settings()
     assert settings.ocr_area is None
 
-    config.update_ocr_area(settings, ocr_area=(-1500, 700, 900, 140))
+    config.update_settings(settings, ocr_area=(-1500, 700, 900, 140))
     assert config.load_settings().ocr_area == (-1500, 700, 900, 140)
 
 

@@ -70,44 +70,6 @@ def test_no_mic_signal_ignores_other_kinds_of_mic_and_system_problems():
     assert gui_app._has_no_mic_signal(problems) is False
 
 
-def test_hwnd_to_watch_for_auto_stop_finds_a_whole_window_targets_handle():
-    gui_app = pytest.importorskip("meeting_scribe.gui.app")
-    from meeting_scribe.screen.window_picker import WindowTarget
-
-    target = WindowTarget(hwnd=4242, title="Microsoft Teams")
-    assert gui_app._hwnd_to_watch_for_auto_stop(target) == 4242
-
-
-def test_hwnd_to_watch_for_auto_stop_finds_a_window_pinned_areas_handle():
-    gui_app = pytest.importorskip("meeting_scribe.gui.app")
-    from meeting_scribe.screen.region_picker import WindowRegionTarget
-
-    target = WindowRegionTarget(
-        hwnd=4242,
-        window_title="Microsoft Teams",
-        offset_left_frac=0.1,
-        offset_top_frac=0.1,
-        width_frac=0.5,
-        height_frac=0.2,
-        picked_width=300,
-        picked_height=100,
-    )
-    assert gui_app._hwnd_to_watch_for_auto_stop(target) == 4242
-
-
-def test_hwnd_to_watch_for_auto_stop_is_none_for_the_whole_screen():
-    gui_app = pytest.importorskip("meeting_scribe.gui.app")
-    assert gui_app._hwnd_to_watch_for_auto_stop(None) is None
-
-
-def test_hwnd_to_watch_for_auto_stop_is_none_for_a_fixed_position_area():
-    gui_app = pytest.importorskip("meeting_scribe.gui.app")
-    from meeting_scribe.screen.region_picker import RegionTarget
-
-    target = RegionTarget(left=10, top=10, width=200, height=150)
-    assert gui_app._hwnd_to_watch_for_auto_stop(target) is None
-
-
 def test_hotkey_label_shows_not_set_for_none():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     assert gui_app._hotkey_label(None) == "Not set"
@@ -146,7 +108,8 @@ def _segment_row(timestamp, source, text, *, speaker=None, engine=None):
     return {"timestamp_seconds": timestamp, "source": source, "text": text, "speaker": speaker, "engine": engine}
 
 
-def test_meeting_transcripts_puts_each_system_version_beside_the_same_mic_lines():
+def test_meeting_transcripts_prefers_runpods_system_lines_when_both_were_saved():
+    # Older meetings saved the system track twice (this PC and Runpod) for comparison.
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     rows = [
         _segment_row(0.0, "mic", "let's start", engine="local"),
@@ -155,19 +118,71 @@ def test_meeting_transcripts_puts_each_system_version_beside_the_same_mic_lines(
         _segment_row(3.0, "screen_ocr", "Slide: Agenda"),
     ]
 
-    screen, local, runpod = gui_app._meeting_transcripts(rows)
+    screen, audio = gui_app._meeting_transcripts(rows)
 
     assert screen == "[00:03] Screen: Slide: Agenda"
-    assert local == "[00:00] You: let's start\n[00:02] Others: sounds could"
-    assert runpod == "[00:00] You: let's start\n[00:02] SPEAKER_00: sounds good"
+    assert audio == "[00:00] You: let's start\n[00:02] SPEAKER_00: sounds good"
 
 
-def test_meeting_transcripts_has_no_runpod_version_when_runpod_was_not_used():
+def test_meeting_transcripts_uses_local_lines_without_runpod():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     # Includes a line saved before lines were tagged by engine, which counts as this PC's.
     rows = [_segment_row(0.0, "mic", "hello", engine="local"), _segment_row(1.0, "system", "hi")]
 
-    _screen, local, runpod = gui_app._meeting_transcripts(rows)
+    _screen, audio = gui_app._meeting_transcripts(rows)
 
-    assert local == "[00:00] You: hello\n[00:01] Others: hi"
-    assert runpod == ""
+    assert audio == "[00:00] You: hello\n[00:01] Others: hi"
+
+
+def test_format_elapsed_shows_minutes_then_hours():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._format_elapsed(0) == "00:00"
+    assert gui_app._format_elapsed(249.9) == "04:09"
+    assert gui_app._format_elapsed(3723) == "1:02:03"
+
+
+def test_notes_timestamp_matches_the_transcript_clock():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._notes_timestamp(754) == "[12:34] "
+    assert gui_app._notes_timestamp(3725) == "[62:05] "  # the transcript's minutes don't roll into hours
+
+
+def test_format_duration():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    start = "2026-07-25T10:00:00+00:00"
+    assert gui_app._format_duration(start, "2026-07-25T10:42:10+00:00") == "42 min"
+    assert gui_app._format_duration(start, "2026-07-25T11:05:00+00:00") == "1 h 05 min"
+    assert gui_app._format_duration(start, None) == ""
+    assert gui_app._format_duration(start, "garbage") == ""
+
+
+def test_device_from_choice_maps_the_default_label_to_none():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._device_from_choice(gui_app.SYSTEM_DEFAULT_LABEL) is None
+    assert gui_app._device_from_choice("Jabra Evolve") == "Jabra Evolve"
+    assert gui_app._device_from_choice(gui_app.AUTO_HEADSET_LABEL, gui_app.AUTO_HEADSET_LABEL) is None
+
+
+def test_meeting_export_text_includes_every_recorded_section_and_skips_empty_ones():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    from meeting_scribe.storage.database import Meeting
+
+    meeting = Meeting(
+        id=1, project_id=1, title="Kickoff", started_at="2026-07-25T10:00:00+00:00",
+        ended_at="2026-07-25T10:30:00+00:00", transcript_text=None, notes_markdown=None,
+        manual_notes="- follow up", attendees=None, meeting_code="20260725-1000",
+    )
+
+    text = gui_app._meeting_export_text(meeting, "Acme", "[00:01] You: hi", "")
+
+    assert text.startswith("Kickoff\nProject: Acme\nDate: ")
+    assert "(30 min)" in text
+    assert "Transcript\n----------\n[00:01] You: hi" in text
+    assert "Notes\n-----\n- follow up" in text
+    assert "On-screen text" not in text and "Attendees" not in text
+
+
+def test_safe_filename_replaces_characters_windows_rejects():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._safe_filename('Q3: plan/"final"?') == "Q3 plan final"
+    assert gui_app._safe_filename("???") == "meeting"

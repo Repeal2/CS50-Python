@@ -4,15 +4,12 @@ import pytest
 
 from meeting_scribe.screen.window_picker import (
     TeamsMeetingWindow,
-    WindowTarget,
     _best_teams_meeting_window,
     _meeting_name_from_title,
     find_teams_meeting_name,
     find_teams_meeting_window,
     get_monitor_work_area,
     get_window_region,
-    list_capturable_windows,
-    window_exists,
 )
 
 # The functions guard on sys.platform, so what's testable differs by platform: off Windows we can only
@@ -20,21 +17,9 @@ from meeting_scribe.screen.window_picker import (
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the platform guard only triggers off Windows")
-def test_list_capturable_windows_requires_windows():
-    with pytest.raises(RuntimeError):
-        list_capturable_windows()
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="the platform guard only triggers off Windows")
 def test_get_window_region_requires_windows():
     with pytest.raises(RuntimeError):
         get_window_region(12345)
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="the platform guard only triggers off Windows")
-def test_window_exists_requires_windows():
-    with pytest.raises(RuntimeError):
-        window_exists(12345)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the platform guard only triggers off Windows")
@@ -138,18 +123,6 @@ def test_meeting_name_from_title_is_none_when_only_a_view_label_and_an_email_rem
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="exercises real win32gui calls")
-def test_list_capturable_windows_returns_window_targets_on_windows():
-    windows = list_capturable_windows()
-    assert isinstance(windows, list)
-    assert all(isinstance(w, WindowTarget) for w in windows)
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="exercises real win32gui calls")
 def test_get_window_region_returns_none_for_nonexistent_window_on_windows():
     # A window handle this large is essentially guaranteed not to exist.
     assert get_window_region(999_999_999) is None
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="exercises real win32gui calls")
-def test_window_exists_is_false_for_a_nonexistent_window_on_windows():
-    assert window_exists(999_999_999) is False

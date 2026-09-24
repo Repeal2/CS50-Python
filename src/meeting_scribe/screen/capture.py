@@ -17,9 +17,7 @@ growing — see `_reconcile_lines`. Events are timestamped relative to when watc
 interleaved with the audio transcript by `transcription.engine`.
 
 The speaker name badge Teams renders alongside each caption line (see `_looks_like_speaker_badge`) is
-filtered out of that caption text as chrome, but it's independently useful: unlike the caption sentence
-next to it, a name badge is short and doesn't need to "settle" across captures, so it's reported as its own
-`SpeakerNameEvent` as soon as it's read rather than going through the pending/growth machinery above.
+filtered out of that caption text as chrome.
 """
 
 from __future__ import annotations
@@ -31,8 +29,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
-from meeting_scribe.screen.window_picker import WindowTarget
+from meeting_scribe.screen.region_picker import RegionTarget
 
 # Tuned to reject short/symbol-heavy OCR misreads of UI chrome (avatar initials like "MB", icon rows
 # like "@ B x") without also rejecting genuinely short spoken/chat lines ("On T3."). Not reliable against
@@ -89,17 +86,6 @@ def _looks_like_speaker_badge(line: str) -> bool:
     return bool(_NAME_BADGE_RE.match(line))
 
 
-def _speaker_badge_lines(text: str) -> list[str]:
-    """Every line in one OCR capture that looks like a Teams-style speaker name badge. Deliberately not
-    deduped against anything already seen, unlike `_new_lines` — the same name reappearing capture after
-    capture while someone keeps talking is the point, not noise to filter out."""
-    return [
-        line
-        for raw_line in text.splitlines()
-        if (line := raw_line.strip()) and not _looks_like_ui_noise(line) and _looks_like_speaker_badge(line)
-    ]
-
-
 def _new_lines(text: str, already_seen: set[str], *, filter_speaker_badges: bool = True) -> list[str]:
     """Splits one capture's OCR text into lines and returns only the ones that are new: not blank, not
     UI noise, not (when `filter_speaker_badges`) a speaker name badge, and not in `already_seen` (or
@@ -145,28 +131,20 @@ class ScreenTextEvent:
     text: str
 
 
-@dataclass(frozen=True)
-class SpeakerNameEvent:
-    timestamp_seconds: float
-    name: str
-
-
 class ScreenWatcher:
     def __init__(
         self,
         on_text: Callable[[ScreenTextEvent], None],
         interval_seconds: float = 3.0,
         tesseract_cmd: str | None = None,
-        target: WindowTarget | RegionTarget | WindowRegionTarget | None = None,
+        target: RegionTarget | None = None,
         settle_seconds: float = 0.15,
-        on_speaker_name: Callable[[SpeakerNameEvent], None] | None = None,
         reading: bool = True,
     ):
         """`reading=False` starts the watcher with its clock running but nothing read, until
         set_reading(True) — the OCR box's Start button (see screen.ocr_box). The clock starts with the
         meeting either way, so what's read later still lines up with the audio."""
         self._on_text = on_text
-        self._on_speaker_name = on_speaker_name
         self._interval = interval_seconds
         self._tesseract_cmd = tesseract_cmd
         self._target = target
@@ -187,12 +165,12 @@ class ScreenWatcher:
         self._notices_lock = threading.Lock()
 
     @property
-    def target(self) -> WindowTarget | RegionTarget | WindowRegionTarget | None:
+    def target(self) -> RegionTarget | None:
         return self._target
 
-    def set_target(self, target: WindowTarget | RegionTarget | WindowRegionTarget | None) -> None:
-        """Changes what's captured from the next cycle on — see session.MeetingSession.follow_screen_window.
-        A plain attribute swap: the capture thread reads it once per cycle."""
+    def set_target(self, target: RegionTarget | None) -> None:
+        """Changes what's captured from the next cycle on — the OCR box having been moved or resized. A
+        plain attribute swap: the capture thread reads it once per cycle."""
         self._target = target
         self._last_frame_hash = None
 
@@ -261,9 +239,7 @@ class ScreenWatcher:
                         self._stop_event.wait(min(self._interval, 0.25))
                         continue
                     try:
-                        region = self._resolve_region(sct)
-                        if region is not None:
-                            self._capture_once(sct, region, Image, pytesseract)
+                        self._capture_once(sct, self._resolve_region(sct), Image, pytesseract)
                         failures = 0
                     except Exception as exc:
                         failures += 1
@@ -280,22 +256,11 @@ class ScreenWatcher:
         finally:
             self._flush_pending()
 
-    def _resolve_region(self, sct) -> dict | None:
-        """Returns the mss region to capture: the whole virtual screen, a fixed user-drawn rectangle, a
-        user-drawn rectangle pinned to a window's current position, or the selected window's current
-        bounds — None if a selected window (pinned-area or whole-window) has since closed or been
-        minimized, in which case the caller skips that capture cycle rather than falling back to the
-        whole screen."""
+    def _resolve_region(self, sct) -> dict:
+        """The mss region to capture: the OCR box's rectangle, or the whole virtual screen without one."""
         if self._target is None:
             return sct.monitors[0]  # index 0 == a single virtual monitor spanning all displays
-        if isinstance(self._target, RegionTarget):
-            return self._target.mss_region
-        from meeting_scribe.screen.window_picker import get_window_region
-
-        if isinstance(self._target, WindowRegionTarget):
-            window_rect = get_window_region(self._target.hwnd)
-            return None if window_rect is None else self._target.mss_region(window_rect)
-        return get_window_region(self._target.hwnd)
+        return self._target.mss_region
 
     def _grab_stable_frame(self, sct, region, Image):
         """Grabs two frames `_settle_seconds` apart and returns the image only if they're pixel-identical.
@@ -330,17 +295,6 @@ class ScreenWatcher:
 
         text = pytesseract.image_to_string(image)
         self._reconcile_lines(text)
-        self._emit_speaker_names(text)
-
-    def _emit_speaker_names(self, text: str) -> None:
-        """Reports every speaker name badge found in one capture's OCR text, if anyone wants them (see
-        `on_speaker_name`) — a name recurs for as long as its badge stays on screen, which is what lets a
-        caller later line these timestamped sightings up against a diarized transcript's speaker turns."""
-        if self._on_speaker_name is None:
-            return
-        elapsed = time.monotonic() - self._started_at
-        for name in _speaker_badge_lines(text):
-            self._on_speaker_name(SpeakerNameEvent(timestamp_seconds=elapsed, name=name))
 
     def _reconcile_lines(self, text: str) -> None:
         """Folds one capture's OCR text into `_pending_lines`. A candidate that looks like a previous

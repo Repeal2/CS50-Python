@@ -18,7 +18,7 @@ SOURCE_LABELS = {"mic": "You", "system": "Others", "screen_ocr": "Screen"}
 # enough to catch "this is very likely to fail" before it does, not a precise measurement (actual usage
 # depends on audio length, thread count, and everything else the process is holding at the time). Adapted
 # from whisper.cpp's published memory table, scaled down somewhat for int8's smaller footprint relative
-# to that table's fp16-class numbers. See config.WHISPER_MODEL_SIZES for the sizes the Settings tab
+# to that table's fp16-class numbers. See config.WHISPER_MODEL_SIZES for the sizes the Settings page
 # actually offers.
 _APPROXIMATE_MODEL_MEMORY_MB = {
     "tiny": 300,
@@ -29,7 +29,7 @@ _APPROXIMATE_MODEL_MEMORY_MB = {
     "large-v3-turbo": 1800,
 }
 # Used for a model name that isn't in the table above (e.g. a distil-*/.en variant set directly via
-# MEETING_SCRIBE_WHISPER_MODEL rather than picked from the Settings tab) — assumes something in the
+# MEETING_SCRIBE_WHISPER_MODEL rather than picked from the Settings page) — assumes something in the
 # "small" ballpark rather than skipping the check entirely for an unrecognized name.
 _DEFAULT_APPROXIMATE_MODEL_MEMORY_MB = 700
 
@@ -122,8 +122,7 @@ class TranscriptLine:
     source: str  # "mic" | "system" | "screen_ocr"
     text: str
     # Set only for a diarized system-track line (see transcription.runpod_whisperx) — a per-line speaker
-    # id ("SPEAKER_00", or eventually a real name once something resolves it against screen.capture's
-    # SpeakerNameEvents) that render_transcript prefers over the flat per-source SOURCE_LABELS lookup.
+    # id ("SPEAKER_00") that render_transcript prefers over the flat per-source SOURCE_LABELS lookup.
     # None for every other line, including a system-track line transcribed locally, where there's no
     # per-speaker distinction to carry.
     speaker: str | None = None

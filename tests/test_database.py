@@ -391,3 +391,30 @@ def test_list_documents_for_meeting_scopes_to_that_meeting(tmp_path):
 
         assert [d["filename"] for d in meeting_a_docs] == ["invite.png"]
         assert meeting_b_docs == []
+
+
+def test_search_meetings_matches_title_transcript_notes_and_attendees_across_projects(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        acme = db.create_project("Acme")
+        beta = db.create_project("Beta")
+        by_title = db.create_meeting(acme.id, "Budget review")
+        by_transcript = db.create_meeting(beta.id, "Kickoff")
+        db.finish_meeting(by_transcript, transcript_text="[00:01] You: the BUDGET is approved")
+        by_notes = db.create_meeting(acme.id, "Standup")
+        db.set_manual_notes(by_notes, "- revisit budget")
+        unrelated = db.create_meeting(beta.id, "Retro")
+        db.set_attendees(unrelated, "Ada Lovelace")
+
+        found = {meeting.id for meeting in db.search_meetings("budget")}
+
+    assert found == {by_title, by_transcript, by_notes}
+
+
+def test_search_meetings_treats_like_wildcards_literally(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        project = db.create_project("Acme")
+        db.create_meeting(project.id, "Q3 plan")
+        literal = db.create_meeting(project.id, "100% done")
+
+        assert [meeting.id for meeting in db.search_meetings("%")] == [literal]
+        assert db.search_meetings("_3") == []

@@ -9,6 +9,7 @@ import tkinter as tk
 from dataclasses import dataclass
 from typing import Callable
 
+from meeting_scribe.gui.theme import windows_prefers_dark_apps
 from meeting_scribe.screen.meeting_detector import prompt_position
 from meeting_scribe.screen.region_picker import _position_window, _toplevel_hwnd
 
@@ -40,25 +41,6 @@ class _Style:
 
 _START_STYLE = _Style(accent="#5B5FC7", accent_hover="#4F52B2", icon="●", icon_color="#D13438")
 _STOP_STYLE = _Style(accent="#C4314B", accent_hover="#A72C40", icon="■", icon_color="#C4314B")
-
-_PERSONALIZE_KEY = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-
-
-def windows_prefers_dark_apps(winreg=None) -> bool:
-    """Whether Windows is set to dark mode for apps (Settings > Personalization > Colors), so the prompt
-    matches the rest of the desktop. Light off Windows or if the setting can't be read. `winreg` is
-    injectable for tests."""
-    if winreg is None:
-        if sys.platform != "win32":
-            return False
-        import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PERSONALIZE_KEY) as key:
-            value, _type = winreg.QueryValueEx(key, "AppsUseLightTheme")
-    except OSError:
-        return False
-    return value == 0
-
 
 def _font(size: int, *, strong: bool = False) -> tuple:
     if sys.platform == "win32":

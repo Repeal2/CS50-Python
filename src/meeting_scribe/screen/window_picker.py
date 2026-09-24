@@ -1,8 +1,8 @@
-"""Lets the user pick a specific window to OCR instead of the whole screen — e.g. just the Teams/Zoom
-window, so captions/chat from that app are captured without also picking up unrelated desktop content.
+"""Finds the Teams call window — its meeting name, and where it is on screen (for placing the meeting
+prompts and the OCR box next to it).
 
 Windows-only (wraps win32gui). Import is deferred so this module can be imported anywhere; calling
-either function off Windows raises RuntimeError, matching audio.recorder's pattern.
+these functions off Windows raises RuntimeError, matching audio.recorder's pattern.
 """
 
 from __future__ import annotations
@@ -13,41 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-@dataclass(frozen=True)
-class WindowTarget:
-    hwnd: int
-    title: str
-
-
-def list_capturable_windows() -> list[WindowTarget]:
-    """Lists visible, titled, non-empty top-level windows the user could pick as an OCR target."""
-    if sys.platform != "win32":
-        raise RuntimeError("Window selection requires Windows (win32gui)")
-    import win32gui
-
-    windows: list[WindowTarget] = []
-
-    def _on_window(hwnd: int, _extra: None) -> bool:
-        if not win32gui.IsWindowVisible(hwnd):
-            return True
-        title = win32gui.GetWindowText(hwnd).strip()
-        if not title:
-            return True
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-        if right - left <= 0 or bottom - top <= 0:
-            return True
-        windows.append(WindowTarget(hwnd=hwnd, title=title))
-        return True
-
-    win32gui.EnumWindows(_on_window, None)
-    return windows
-
-
 def get_window_region(hwnd: int) -> dict | None:
-    """Returns an mss-compatible capture region for the window, or None if it's been closed *or*
-    minimized since it was selected (the caller should skip that capture cycle either way — there's
-    nothing to grab a screenshot of). That conflation is fine for screen capture, but wrong for anything
-    that needs to tell "closed" apart from "temporarily minimized" — see window_exists for that."""
+    """Returns the window's bounds as an mss-style region, or None if it's been closed or minimized."""
     if sys.platform != "win32":
         raise RuntimeError("Window capture requires Windows (win32gui)")
     import win32gui
@@ -61,19 +28,6 @@ def get_window_region(hwnd: int) -> dict | None:
     return {"left": left, "top": top, "width": width, "height": height}
 
 
-def window_exists(hwnd: int) -> bool:
-    """Whether this window handle still refers to a real window at all — true even while it's minimized
-    or hidden, unlike get_window_region's None (which also covers "temporarily not capturable" and so
-    can't be used to tell a closed window from a merely minimized one). This is the right check for "has
-    the window actually closed" — see gui.app's "stop recording when the screen-source window closes",
-    where mistaking a minimized Teams call for an ended one would stop a meeting still in progress."""
-    if sys.platform != "win32":
-        raise RuntimeError("Window state requires Windows (win32gui)")
-    import win32gui
-
-    return bool(win32gui.IsWindow(hwnd))
-
-
 # Matches the "| Microsoft Teams" (or "- Microsoft Teams") suffix Teams appends to its main window's
 # title — "<name> | Microsoft Teams" while in a call, but also "<tab name> | Microsoft Teams" on any
 # ordinary tab (Chat, Calendar, ...), which is exactly why a suffix match alone isn't enough to tell a
@@ -84,7 +38,7 @@ _TEAMS_TITLE_SUFFIX_RE = re.compile(r"\s*[|–-]\s*Microsoft Teams\s*$", re.IGNO
 # "| Microsoft Teams" suffix, if present) is the main app sitting on that tab, not an active meeting.
 # Inevitably incomplete (Teams' exact labels vary by version and locale), but a wrong guess here only
 # ever means a pre-filled title field the user can still freely edit, never something acted on
-# irreversibly — see gui.app.RecordTab._detect_meeting_title.
+# irreversibly — see gui.app.RecordPage._detect_meeting_title.
 _GENERIC_TEAMS_TITLES = frozenset(
     {
         "teams", "microsoft teams", "chat", "chats", "calendar", "calls", "activity", "apps", "files",
@@ -198,8 +152,8 @@ def find_teams_meeting_window() -> TeamsMeetingWindow | None:
 
 
 def find_teams_meeting_name() -> str | None:
-    """Best-effort detection of an active Teams meeting's name, for auto-filling the Record tab's title
-    field when it's still at its default (see gui.app.RecordTab._detect_meeting_title) — so starting a
+    """Best-effort detection of an active Teams meeting's name, for auto-filling the Record page's title
+    field when it's still at its default (see gui.app.RecordPage._detect_meeting_title) — so starting a
     meeting, including via the Start hotkey from inside Teams itself, doesn't leave the transcript filed
     under "Untitled meeting" when Teams already knows its real name.
 

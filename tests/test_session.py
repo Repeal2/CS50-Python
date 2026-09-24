@@ -6,7 +6,7 @@ import pytest
 
 from meeting_scribe.audio.recorder import RecordedAudio
 from meeting_scribe.config import Settings
-from meeting_scribe.screen.capture import ScreenTextEvent, SpeakerNameEvent
+from meeting_scribe.screen.capture import ScreenTextEvent
 from meeting_scribe.storage.database import Database
 from meeting_scribe.transcription.engine import TranscriptLine
 
@@ -122,32 +122,10 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
             assert len(segments) == 3
 
 
-def test_session_wires_the_screen_watcher_to_collect_speaker_name_events(tmp_path):
-    """ScreenWatcher is constructed with on_speaker_name pointed at _speaker_name_events, the same way
-    on_text is pointed at the on-screen text log — so a badge sighting the watcher reports actually gets kept."""
-    with (
-        patch("meeting_scribe.session.Recorder"),
-        patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
-        patch("meeting_scribe.session.WhisperTranscriber"),
-    ):
-        from meeting_scribe.session import MeetingSession
-
-        with Database(tmp_path / "test.db") as db:
-            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
-
-            on_speaker_name = MockScreenWatcher.call_args.kwargs["on_speaker_name"]
-            on_speaker_name(SpeakerNameEvent(timestamp_seconds=1.5, name="Jonathan Arnold"))
-
-            assert session._speaker_name_events == [
-                SpeakerNameEvent(timestamp_seconds=1.5, name="Jonathan Arnold")
-            ]
-
-
 def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_path):
-    """diarize_system_audio=True sends the system track to RunpodWhisperXTranscriber *and* transcribes it
-    locally, saving both for comparison; the Runpod version is the one used for the meeting's own
-    transcript. The mic track is only ever local — it's always a single speaker, so diarizing it can't
-    identify anyone new."""
+    """diarize_system_audio=True sends the system track to RunpodWhisperXTranscriber instead of
+    transcribing it locally. The mic track is only ever local — it's always a single speaker, so
+    diarizing it can't identify anyone new."""
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
@@ -192,14 +170,11 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
                 for row in db.get_segments(session.meeting_id)
             )
 
-        # Both versions of the system track are saved, tagged by engine, with Runpod's speaker labels —
-        # the Projects tab rebuilds its side-by-side tabs from these.
+        # Saved tagged by engine, with Runpod's speaker labels.
         assert saved == [
             ("local", "mic", None, "let's get started"),
-            ("local", "system", None, "sounds could"),
             ("runpod", "system", "SPEAKER_00", "sounds good"),
         ]
-        assert "Transcribing system audio on this PC too, for comparison…" in progress
         # Credentials come from Settings, not environment variables.
         kwargs = MockRunpod.call_args.kwargs
         assert (kwargs["api_key"], kwargs["endpoint_id"], kwargs["huggingface_token"]) == (
@@ -213,12 +188,10 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
         MockRunpod.return_value.transcribe_parts.assert_called_once_with(
             recorder_instance.stop.return_value.system_paths, source="system"
         )
-        # Both tracks went through local transcription too.
+        # Only the mic track was transcribed locally — the system track isn't transcribed twice.
         assert MockTranscriber.return_value.transcribe_parts.call_args_list == [
             (((tmp_path / "mic.wav",),), {"source": "mic"}),
-            (((tmp_path / "system.wav",),), {"source": "system"}),
         ]
-        # The meeting's own transcript uses the Runpod version.
         assert "SPEAKER_00: sounds good" in result
         assert "sounds could" not in result
 
@@ -258,7 +231,7 @@ def test_session_falls_back_to_local_transcription_when_cloud_diarization_fails(
             progress_messages = []
             result = session.stop(on_progress=progress_messages.append)
 
-        assert any("using the local transcript only" in message for message in progress_messages)
+        assert any("transcribing on this PC instead" in message for message in progress_messages)
         assert "Others: sounds good" in result  # local transcriber's flat "Others" label, not a speaker id
         # Local transcription still ran for both tracks despite the cloud attempt failing.
         assert MockTranscriber.return_value.transcribe_parts.call_count == 2

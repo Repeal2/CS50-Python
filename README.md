@@ -7,81 +7,49 @@ saves everything locally, and pushes.
 
 ## What it does
 
-- **Records audio** from the microphone *and* the system output (WASAPI loopback), so it captures both
-  sides of a call even when remote participants' audio never touches the mic. If a machine has more than
-  one mic or speaker, a dropdown right on the Record tab (also in Settings) lets you pick which one gets
-  recorded instead of always trusting whatever Windows currently calls "default" — and a live input-level
-  meter for each confirms it's actually picking up audio rather than guessing. The meters use a
-  logarithmic (dBFS) scale rather than a plain linear ratio, since normal microphone volume is often only
-  a few percent of full scale and would otherwise barely move a linear meter.
+The window has three pages, picked from the sidebar: **Record**, **Library** and **Settings**. It follows
+Windows' light/dark app setting.
+
+- **Records audio** from the microphone *and* the system output (WASAPI loopback), so both sides of a
+  call are captured even when remote participants' audio never touches the mic. The Record page shows a
+  live level meter next to each device picker, and **Test mic** listens for three seconds and says what it
+  heard, right under the meters, without opening a dialog.
 - **Follows the devices Teams is using.** With "Switch devices automatically" on (Settings, on by
-  default), the app asks Windows which microphone and speaker Teams has open — the same per-app audio
-  sessions the Volume Mixer shows — and records those, switching mid-meeting if Teams does. Only when that
-  can't be told (Teams isn't in a call, or runs in a browser) does it fall back to guessing: the output
-  that's playing, and a headset microphone recognized by name. Silence on the system-audio track (WASAPI
-  delivers nothing while nothing plays) is written out as silence, so the track stays as long as the
-  meeting and in step with the microphone, and a capture stream that dies mid-meeting (a Bluetooth
-  headset switching profiles, say) is reopened rather than left dead.
-- **Checks the microphone is actually the right one.** "Test mic…" next to the device dropdown records
-  three seconds from the selected device and says what it heard — a peak level, or the specific reason it
-  heard nothing — which is the one moment when a silent mic is unambiguous (you know you're supposed to
-  be talking) and one dropdown away from being fixed. During a meeting the same analysis runs on both
-  tracks: a device Windows no longer has is named rather than silently substituted, an input producing
-  nothing but digital silence is called out on the spot (a working device always has *some* noise floor),
-  and an input that has heard nothing while the *other* track was busy is queried after a minute and a
-  half. That last one is a heuristic, not a verdict — it can't tell a wrong device from a muted one from
-  a meeting nobody has spoken in yet — so it appears as a warning line under the meters and in the
-  activity log, never as a dialog that steals focus from the call it's warning about.
-- **Reads on-screen text from a box you place.** When recording starts, an OCR box appears on screen —
-  over the bottom of the Teams call window the first time (where live captions show), and where you
-  left it after that. Drag its edge (or the ⠿ grip) to move it and its handles to resize it; nothing is
-  read until you press **Start OCR** on the button attached to its top-left corner, which then switches
-  to **Stop OCR** to pause. What's inside the frame is exactly what's read — the frame, handles and
-  button all sit outside it — and the inside is see-through and click-through, so the call underneath
-  stays usable. "Reset box position" on the Record tab puts it back if it ends up somewhere awkward. The
-  text read is saved to the meeting folder as it arrives, so it survives a crash and a Retry.
-- **Transcribes** the recorded audio locally (no audio ever leaves the machine) and merges it with the
-  OCR stream into one time-ordered transcript. This — plus the push to Copilot Studio below — happens in
-  the background after you hit Stop, so it doesn't block starting the next meeting right away; the
-  activity log tags each background job's lines with that meeting's title so back-to-back meetings
-  finishing up at the same time stay distinguishable.
-- **Pushes the finished meeting to Copilot Studio** as a named file package — separate audio and screen
-  transcripts, a copy of each reference document attached to that meeting, and a completion manifest,
-  all dropped into a folder OneDrive/SharePoint is already syncing (see "The Copilot push" below). This is
-  one-way and fire-and-forget: the app doesn't call an AI API directly (governance doesn't allow that for
-  this org) and doesn't wait for or ingest anything back. Whatever picks that package up from there — a
-  Power Automate flow, Copilot Studio, or however it's wired up — owns managing, summarizing, and parsing
-  the information; this app's job stops at the handoff.
-- **Keeps a running activity log** on the Record tab while a meeting is in progress (and while it's
-  finishing up) — timestamped lines for the meeting starting, stopping, transcription finishing, and the
-  push to Copilot Studio — so it's obvious something is happening, without dumping the live
-  transcript/OCR text into view.
-- **Takes manual notes** in a full-size, freely-editable box on the Record tab (roughly half its vertical
-  space, matching the activity log) — type continuously rather than adding one note at a time; Enter
-  continues whatever bullet/indent the current line has, and Tab / Shift+Tab indent or dedent it, so a
-  nested bulleted list is just typing. Saved to that meeting incrementally as you type (debounced, so
-  nothing is lost if the app closes mid-meeting) — shown afterward on the Projects & Search tab's
-  "Manual notes" tab, alongside the OCR and audio transcripts, and handed off in the Copilot push package
-  as a reference-doc-style entry (see below).
-- **Files the meeting under a project**, kept as a permanent local record — every meeting (transcript,
-  manual notes) and any documents attached to it (invites, agendas, screenshots) stays browsable in this
-  app under its project regardless of what happens to the copy pushed to Copilot Studio.
-- **Accepts context documents** — PDFs, Word docs, images, plain text — attached from the Record tab (to
-  the project, or to whichever meeting is currently in progress) at any time, not just during a meeting
-  (e.g. a screenshot of the calendar invite, a spec doc). Documents can also be attached *after* a meeting
-  has ended, from the Projects & Search tab's own "Upload Document…" button — to whichever past meeting is
-  selected there, or to the project generally if none is.
-- **Lets the meeting title be renamed any time before it ends** — it's a normal editable field on the
-  Record tab, not fixed once at Start, and every keystroke is saved immediately so the title shown
-  elsewhere in the app never lags behind. It's also a dropdown: typing a project name into the Project
-  field populates it with that project's previous meeting titles (most recently used first), so a
-  recurring meeting ("Weekly Client Meeting") is one click instead of retyping.
-- **Captures the attendee list via OCR** — a "Capture Attendees…" button on the Record tab (enabled while
-  a meeting is recording) opens the same drag-to-select overlay used for screen OCR, reads whatever
-  participants panel you draw a box around immediately (not on a delay, and not part of the continuous
-  screen watcher), and appends the result to that meeting's attendee list. Shown afterward in its own
-  "Attendees" tab on the Projects & Search tab, alongside the OCR/audio transcripts and manual notes, and
-  handed off in the Copilot push package as a reference-doc-style entry (see below).
+  default), the app records whichever microphone and speaker Teams has open, switching mid-meeting if
+  Teams does; when that can't be told, it falls back to the speaker that's playing and a headset mic
+  recognized by name. A capture stream that dies mid-meeting is reopened, and silence on the system
+  track is written out as silence so both tracks stay in step.
+- **Warns about bad input while it can still be fixed.** A device Windows no longer has, a mic producing
+  digital silence, or an input that has heard nothing while the other track was busy shows up as a
+  warning line under the meters and in the activity log. A dead-silent mic also flashes the OCR box red.
+- **Offers to start and stop recording on its own.** When a Teams call starts, a small prompt offers to
+  record it (pre-filling the meeting title from Teams); when a recorded call ends, one offers to stop.
+  Optional system-wide shortcuts (Settings) start and stop recording without leaving Teams.
+- **Reads on-screen text from a box you place.** When recording starts, an OCR box appears over the
+  bottom of the Teams call window (where live captions show), or wherever it was left last time. Drag it
+  to move, drag its handles to resize, and press **Start OCR** on it to begin reading. Its inside is
+  see-through and click-through, so the call underneath stays usable. The text read is saved to disk as
+  it arrives, so it survives a crash and a Retry.
+- **Takes notes as you go.** The Notes panel saves as you type. Enter continues a bullet, Tab / Shift+Tab
+  indent and outdent, and **Ctrl+T** stamps the recording time (`[12:34]`) using the same clock as the
+  transcript. The project and title stay editable for the whole meeting, and the title dropdown suggests
+  titles already used in the project.
+- **Captures attendees and documents.** "Capture attendees" reads a participants panel you drag a box
+  around. "Attach document" files a PDF, Word doc, image or text file under the project (and the meeting,
+  while one is recording, or the selected meeting in the Library).
+- **Transcribes locally in the background** after Stop, so the next meeting can start straight away. The
+  sidebar shows how many meetings are still finishing, and the running recording clock is shown on the
+  Record page and in the window title (so it's visible from the taskbar). Optionally, the system-audio
+  track goes to a Runpod WhisperX endpoint for speaker labels instead, and is transcribed locally if that
+  fails.
+- **Keeps a searchable local library.** The Library lists meetings by project, and its search box
+  (**Ctrl+F**) looks through every project's titles, transcripts, notes and attendees. Each meeting shows
+  its transcript, on-screen text, notes, attendees and documents, with **Copy**, **Export…** (one plain-text
+  file with every section), **Attach document** and **Open folder**. A meeting whose transcription didn't
+  finish keeps its recording and offers **Retry**.
+- **Pushes each finished meeting to Copilot Studio** as a named file package dropped into a folder
+  OneDrive/SharePoint is already syncing (see "The Copilot push" below). This is one-way: the app doesn't
+  call an AI API and doesn't wait for anything back.
 
 ## Why it's built this way
 
@@ -92,6 +60,7 @@ saves everything locally, and pushes.
 | System audio capture | [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) | A PyAudio fork with WASAPI loopback support, i.e. it can record "what the speakers are playing" on Windows without a virtual audio cable. |
 | Long recordings | Each track rolls over into numbered WAV parts (`mic.wav`, `mic.part2.wav`, …) just under 2 GiB | A WAV's RIFF header stores every chunk size as a 32-bit integer, so one file stops being describable somewhere under 4 GiB — and many readers treat those sizes as signed, which halves it. Writing past that point raises mid-write and kills the capture thread, silently ending the recording. Transcription stitches the parts back onto one clock. |
 | OCR area | An on-screen box (Tkinter, `-transparentcolor`) | One borderless, always-on-top window whose inside is see-through and click-through, so the area being read is visible and adjustable at all times without getting in the way of the call. |
+| Look and feel | Flat ttk styles on the built-in "clam" theme (`gui/theme.py`) | The native Windows ttk theme can't be recoloured. Styling clam gets a modern, dark-mode-aware look with no extra dependency to bundle. |
 | Multi-monitor DPI coordinates | Per-monitor DPI awareness (`shcore.SetProcessDpiAwareness`, set before any window is created) | Without this, Windows virtualizes window/monitor coordinates for the process on any monitor that isn't running the primary monitor's DPI scale, which would throw `GetWindowRect` and mss's screen capture out of sync with each other on a mixed-DPI multi-monitor setup. |
 | Handoff to Copilot Studio | One-way file drop (see below), no API call, no response | Governance doesn't allow calling a third-party AI API directly. This app's scope ends at recording and handing off; managing/parsing the information is Copilot Studio's job, not this app's. |
 | Packaging | PyInstaller, one-file build | Produces the standalone `.exe` the project requires. |
@@ -109,12 +78,15 @@ src/meeting_scribe/
   screen/ocr_box.py   # the on-screen OCR box: drag to move, handles to resize, Start/Stop OCR button
   screen/window_picker.py  # finds the Teams call window (meeting name, where to place prompts and the box)
   screen/region_picker.py  # drag-to-select a rectangle (used for Capture Attendees)
+  screen/meeting_detector.py  # notices a Teams call starting/ending, for the start/stop prompts
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
   ai/copilot_push.py    # one-way, named-file-package drop of a finished meeting to Copilot Studio
   storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents
   storage/documents.py  # Text extraction for uploaded PDFs/docx/images/text
-  gui/app.py             # Tkinter control panel
-  main.py                 # Entry point (GUI by default, --cli for scripting)
+  gui/app.py             # Tkinter window: Record, Library and Settings pages
+  gui/theme.py           # palette (light/dark), fonts and ttk styles
+  gui/meeting_prompt.py  # the "Teams meeting detected" / "Meeting ended" prompts
+  main.py                 # Entry point (GUI by default; `list-projects` for scripting)
 packaging/
   build.py               # Invokes PyInstaller with the right flags/data files
   meeting_scribe.spec     # PyInstaller spec (hidden imports, bundled tesseract data, etc.)
@@ -125,7 +97,7 @@ tests/                    # Unit tests for the parts that don't need Windows har
 
 - **Project** — a named bucket ("Acme Q3 Renewal", "Team Standups"). Everything below belongs to one.
 - **Meeting** — one recorded session: raw audio files, the merged transcript, the manual notes typed on
-  the Record tab while it was in progress, and any attendee list captured via OCR. Assigned a `meetingID`
+  the Record page while it was in progress, and any attendee list captured via OCR. Assigned a `meetingID`
   (`meeting_code` in the database, e.g. `20260728-1030`) once at creation — this is what the Copilot push
   package's file names are keyed on, not the database row id. This is the permanent local record,
   independent of the copy pushed to Copilot Studio.
@@ -136,9 +108,9 @@ tests/                    # Unit tests for the parts that don't need Windows har
   bytes are kept (the latter under a synthetic name — see `storage/documents.py::save_original_copy`), so
   a meeting-attached document can still be handed off under its real filename in the Copilot push package.
 
-Everything above is browsable in the app (Projects & Search tab: pick a project, pick a meeting, its
-transcripts/notes/documents are right there) — there's no in-app search/Ask feature, since querying and
-synthesizing across meetings is Copilot Studio's job once the data has been pushed to it, not this app's.
+Everything above is browsable and searchable in the app's Library (plain text search over titles,
+transcripts, notes and attendees). Summarizing or asking questions across meetings is Copilot Studio's job
+once the data has been pushed to it, not this app's.
 
 ## Setup (development)
 
@@ -149,7 +121,7 @@ pip install -r requirements.txt
 python -m meeting_scribe.main       # launches the GUI by default (equivalent to `... main.py gui`)
 ```
 
-Point the app at your Copilot push folder in the **Settings** tab (see below) — no environment variable
+Point the app at your Copilot push folder on the **Settings** page (see below) — no environment variable
 needed, though `MEETING_SCRIBE_COPILOT_SYNC_DIR` also works for scripted/CLI use. Recording, transcription,
 and screen OCR all work with no folder configured; the meeting is just recorded and saved locally, not
 pushed anywhere.
@@ -165,7 +137,7 @@ and even if there were, an unsigned desktop app making its own AI API calls is e
 ruled out. There's also nothing to wait for: this app's job is to record and hand off, not to consume a
 synthesized result. `ai/copilot_push.py` does the whole thing in two steps:
 
-1. **Settings tab → "Copilot sync folder"**: pick a folder that's inside a location OneDrive or SharePoint
+1. **Settings → Copilot Studio handoff → "Sync folder"**: pick a folder that's inside a location OneDrive or SharePoint
    is already syncing to this machine. The app creates an `Inbox/` subfolder under it.
 2. When a meeting finishes, the app writes that meeting's whole file package to `Inbox/` and returns
    immediately. OneDrive/SharePoint sync uploads it to the cloud from there.
@@ -295,15 +267,6 @@ everything together but likewise needs a Windows desktop session to click throug
 
 ## Roadmap / open decisions
 
-- Speaker diarization (who said what) — faster-whisper alone doesn't separate speakers; mic vs. system
-  audio gives a coarse "you" vs. "everyone else" split today.
-- Auto-detect meeting start (e.g. when Teams/Zoom is foregrounded) instead of a manual start button.
-- A selected window (or a custom area pinned to one) that's moved to another monitor, or resized, still
-  captures correctly (bounds are re-read every cycle, and a pinned area's offset/size scale with the
-  window rather than staying at fixed pixels), but there's no UI feedback yet if the selected/pinned
-  window closes mid-meeting — it just silently stops contributing screen text for the rest of the
-  meeting.
-- A pinned custom area's proportional scaling is a best-effort approximation, not real layout tracking:
-  it assumes whatever's inside the area moves/resizes in proportion to the window, which holds for a
-  simple corner/edge crop but not for UI an app clamps to a fixed size or recenters regardless of window
-  size — that could still need re-picking after a big resize.
+- Speaker names — local transcription only splits "you" (mic) from "everyone else" (system audio);
+  the optional Runpod path adds per-speaker labels (`SPEAKER_00`, …), but nothing yet maps those to real
+  names.

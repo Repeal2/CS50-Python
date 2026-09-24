@@ -4,9 +4,8 @@ from meeting_scribe.screen.capture import (
     _looks_like_ui_noise,
     _new_lines,
     _ocr_region_once,
-    _speaker_badge_lines,
 )
-from meeting_scribe.screen.region_picker import RegionTarget, WindowRegionTarget
+from meeting_scribe.screen.region_picker import RegionTarget
 
 
 class FakeShot:
@@ -69,31 +68,6 @@ def test_dedup_skips_unchanged_frames_and_repeated_text():
 
     assert events == []
     assert watcher._pending_lines == ["Slide 1"]
-
-
-def test_capture_once_reports_a_speaker_badge_separately_from_the_caption_text():
-    """The name badge next to a caption line should reach on_speaker_name even though _new_lines still
-    filters it out of on_text — the two streams see different things from the same OCR capture."""
-    text_events = []
-    name_events = []
-    watcher = _watcher(on_text=text_events.append, on_speaker_name=name_events.append)
-
-    sct = FakeSct([b"frame-a"] * 2)
-    tess = FakePytesseract(["Jonathan Arnold @\nTesting."])
-
-    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)
-
-    assert [e.name for e in name_events] == ["Jonathan Arnold @"]
-    assert watcher._pending_lines == ["Testing."]  # caption text still pending, badge filtered out of it
-
-
-def test_capture_once_without_on_speaker_name_does_not_report_badges():
-    watcher = _watcher(on_text=lambda e: None)  # on_speaker_name left at its default (None)
-
-    sct = FakeSct([b"frame-a"] * 2)
-    tess = FakePytesseract(["Jonathan Arnold @\nTesting."])
-
-    watcher._capture_once(sct, region=None, Image=FakeImage, pytesseract=tess)  # must not raise
 
 
 def test_a_line_is_emitted_once_a_later_capture_confirms_it_stopped_growing():
@@ -206,62 +180,6 @@ def test_resolve_region_returns_the_fixed_rectangle_for_a_region_target():
     assert watcher._resolve_region(sct=None) == {"left": 10, "top": 20, "width": 300, "height": 200}
 
 
-def _pinned_target(**overrides) -> WindowRegionTarget:
-    fields = dict(
-        hwnd=42,
-        window_title="Microsoft Teams",
-        offset_left_frac=0.1,
-        offset_top_frac=0.2,
-        width_frac=1 / 3,
-        height_frac=0.1,
-        picked_width=300,
-        picked_height=70,
-    )
-    fields.update(overrides)
-    return WindowRegionTarget(**fields)
-
-
-def test_resolve_region_tracks_a_window_pinned_custom_area_to_its_current_position(monkeypatch):
-    """A WindowRegionTarget's absolute position should follow the pinned window wherever it currently
-    is — including a move to another monitor — rather than staying at the screen coordinates it was
-    drawn at."""
-    import meeting_scribe.screen.window_picker as window_picker
-
-    watcher = ScreenWatcher(on_text=lambda e: None, target=_pinned_target())
-
-    current_rect = {"left": 100, "top": 200, "width": 900, "height": 700}
-    monkeypatch.setattr(window_picker, "get_window_region", lambda hwnd: current_rect)
-    assert watcher._resolve_region(sct=None) == {"left": 190, "top": 340, "width": 300, "height": 70}
-
-    # The window moved to a second monitor to the left of the primary one (negative coordinates) -> the
-    # captured rectangle moves by the same amount, staying pinned to the same spot on the window.
-    current_rect = {"left": -1920, "top": 50, "width": 900, "height": 700}
-    assert watcher._resolve_region(sct=None) == {"left": -1830, "top": 190, "width": 300, "height": 70}
-
-
-def test_resolve_region_scales_a_window_pinned_custom_area_when_the_window_is_resized(monkeypatch):
-    """Resizing the pinned window (dragging it wider/taller, or Windows re-laying it out at a different
-    DPI scale) should scale the captured rectangle proportionally, not just translate it — otherwise it
-    drifts away from whatever it was pinned to as soon as the window's size changes."""
-    import meeting_scribe.screen.window_picker as window_picker
-
-    watcher = ScreenWatcher(on_text=lambda e: None, target=_pinned_target())
-
-    # Window doubled in size in place (same top-left corner).
-    current_rect = {"left": 100, "top": 200, "width": 1800, "height": 1400}
-    monkeypatch.setattr(window_picker, "get_window_region", lambda hwnd: current_rect)
-    assert watcher._resolve_region(sct=None) == {"left": 280, "top": 480, "width": 600, "height": 140}
-
-
-def test_resolve_region_returns_none_when_the_pinned_window_has_closed(monkeypatch):
-    import meeting_scribe.screen.window_picker as window_picker
-
-    watcher = ScreenWatcher(on_text=lambda e: None, target=_pinned_target())
-    monkeypatch.setattr(window_picker, "get_window_region", lambda hwnd: None)
-
-    assert watcher._resolve_region(sct=None) is None
-
-
 def test_resolve_region_returns_the_whole_virtual_screen_with_no_target():
     class FakeSctWithMonitors:
         monitors = ["whole-virtual-screen"]
@@ -323,21 +241,6 @@ def test_new_lines_can_keep_speaker_badges_when_asked_to():
     text = "John Smith\nTesting."
 
     assert _new_lines(text, set(), filter_speaker_badges=False) == ["John Smith", "Testing."]
-
-
-def test_speaker_badge_lines_extracts_names_and_drops_noise_and_dialogue():
-    text = "MB\nJonathan Arnold @\nWhich we are happy with and we are now onboarding them.\nJohn Smith"
-
-    assert _speaker_badge_lines(text) == ["Jonathan Arnold @", "John Smith"]
-
-
-def test_speaker_badge_lines_does_not_dedup_a_name_repeated_across_calls():
-    """Unlike _new_lines, repeats matter here: the same name showing up capture after capture is the
-    timestamped "still talking" signal a later speaker-identification pass would rely on."""
-    text = "John Smith\nTesting."
-
-    assert _speaker_badge_lines(text) == ["John Smith"]
-    assert _speaker_badge_lines(text) == ["John Smith"]
 
 
 def test_ocr_region_once_keeps_names_but_still_drops_ui_noise():

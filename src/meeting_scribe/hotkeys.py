@@ -31,7 +31,7 @@ MOD_NOREPEAT = 0x4000
 _WM_HOTKEY = 0x0312
 _WM_QUIT = 0x0012
 
-# Virtual-key codes for the "main" (non-modifier) keys the Settings tab's capture UI accepts — letters,
+# Virtual-key codes for the "main" (non-modifier) keys the Settings page's capture UI accepts — letters,
 # digits, and function keys cover every realistic choice for a meeting shortcut without needing a full
 # Win32 virtual-key table. '0'-'9' and 'A'-'Z' happen to share ASCII's code points with their VK
 # constants, which is what makes this table cheap to build.
