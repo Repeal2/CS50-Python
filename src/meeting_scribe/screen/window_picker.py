@@ -86,17 +86,36 @@ _TEAMS_TITLE_SUFFIX_RE = re.compile(r"\s*[|–-]\s*Microsoft Teams\s*$", re.IGNO
 # ever means a pre-filled title field the user can still freely edit, never something acted on
 # irreversibly — see gui.app.RecordTab._detect_meeting_title.
 _GENERIC_TEAMS_TITLES = frozenset(
-    {"teams", "microsoft teams", "chat", "chats", "calendar", "calls", "activity", "apps", "files"}
+    {
+        "teams", "microsoft teams", "chat", "chats", "calendar", "calls", "activity", "apps", "files",
+        "meeting join", "meeting", "call",
+    }
 )
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _meeting_name_from_title(title: str) -> str | None:
     """Extracts a plausible meeting name from a Teams window's title, or None if it looks like the main
-    app sitting on some non-call tab rather than an actual meeting."""
+    app sitting on some non-call tab rather than an actual meeting.
+
+    The new Teams client titles its windows "<view> | <subject> | <organization> | <account email>",
+    plus the "| Microsoft Teams" suffix — e.g. "Meeting join | Weekly sync | Contoso | me@contoso.com" —
+    and only the subject is wanted: the leading view label, the signed-in account's email address, and the
+    organization name just before it are all dropped. The organization is only recognizable by sitting
+    right before the email, so a title with no email keeps whatever's there."""
     stripped = _TEAMS_TITLE_SUFFIX_RE.sub("", title).strip()
-    if not stripped or stripped.lower() in _GENERIC_TEAMS_TITLES:
-        return None
-    return stripped
+    parts = [part.strip() for part in stripped.split("|") if part.strip()]
+    email_at = next((i for i, part in enumerate(parts) if _EMAIL_RE.match(part)), None)
+    before_email = parts[email_at - 1] if email_at else None
+    parts = [part for part in parts if not _EMAIL_RE.match(part)]
+    while parts and parts[0].lower() in _GENERIC_TEAMS_TITLES:
+        parts.pop(0)
+    # Only dropped when something else is left — "Weekly sync | me@contoso.com" is a subject and an
+    # email with no organization in between, not an organization to throw away.
+    if before_email is not None and len(parts) > 1 and parts[-1] == before_email:
+        parts.pop()
+    return " | ".join(parts) or None
 
 
 def _is_teams_process(hwnd: int) -> bool:

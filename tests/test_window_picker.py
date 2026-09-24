@@ -108,6 +108,35 @@ def test_meeting_name_from_title_is_case_insensitive_for_the_generic_check():
     assert _meeting_name_from_title("chat | microsoft teams") is None
 
 
+def test_meeting_name_from_title_keeps_only_the_subject_of_a_new_teams_title():
+    # A real title from the new Teams client's pre-join screen.
+    title = "Meeting join | Test meeting | AMERESCO | mbrookes@ameresco.com"
+    assert _meeting_name_from_title(title) == "Test meeting"
+    assert _meeting_name_from_title(title + " | Microsoft Teams") == "Test meeting"
+
+
+def test_meeting_name_from_title_drops_the_view_label_of_an_in_meeting_title():
+    assert _meeting_name_from_title("Meeting | Weekly sync | Contoso | me@contoso.com") == "Weekly sync"
+
+
+def test_meeting_name_from_title_keeps_a_subject_with_an_email_but_no_organization():
+    assert _meeting_name_from_title("Weekly sync | me@contoso.com") == "Weekly sync"
+
+
+def test_meeting_name_from_title_keeps_pipes_inside_the_subject_itself():
+    title = "Meeting join | Q3 review | Finance | Contoso | me@contoso.com"
+    assert _meeting_name_from_title(title) == "Q3 review | Finance"
+
+
+def test_meeting_name_from_title_keeps_a_lone_remaining_segment_rather_than_nothing():
+    # With only one segment left there's no telling an organization from a subject, so it's kept.
+    assert _meeting_name_from_title("Meeting join | Contoso | me@contoso.com") == "Contoso"
+
+
+def test_meeting_name_from_title_is_none_when_only_a_view_label_and_an_email_remain():
+    assert _meeting_name_from_title("Calendar | me@contoso.com | Microsoft Teams") is None
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="exercises real win32gui calls")
 def test_list_capturable_windows_returns_window_targets_on_windows():
     windows = list_capturable_windows()
