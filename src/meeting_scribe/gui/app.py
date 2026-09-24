@@ -1556,7 +1556,10 @@ class ProjectsTab(ttk.Frame):
             return
 
         segments = self.app.db.get_segments(meeting.id)
-        lines = [TranscriptLine(row["timestamp_seconds"], row["source"], row["text"]) for row in segments]
+        lines = [
+            TranscriptLine(row["timestamp_seconds"], row["source"], row["text"], speaker=row["speaker"])
+            for row in segments
+        ]
         ocr_lines = [line for line in lines if line.source == "screen_ocr"]
         audio_lines = [line for line in lines if line.source in ("mic", "system")]
 

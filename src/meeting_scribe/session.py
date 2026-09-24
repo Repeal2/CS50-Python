@@ -231,7 +231,7 @@ class MeetingSession:
 
         for line in merged:
             self._db.add_transcript_segment(
-                self.meeting_id, line.source, line.timestamp_seconds, line.text
+                self.meeting_id, line.source, line.timestamp_seconds, line.text, speaker=line.speaker
             )
 
         if self._settings.copilot_sync_dir is not None:
@@ -335,7 +335,7 @@ def retry_meeting_transcription(
     # second retry would leave both attempts' segments sitting side by side.
     db.clear_transcript_segments(meeting_id)
     for line in audio_lines:
-        db.add_transcript_segment(meeting_id, line.source, line.timestamp_seconds, line.text)
+        db.add_transcript_segment(meeting_id, line.source, line.timestamp_seconds, line.text, speaker=line.speaker)
 
     if settings.copilot_sync_dir is not None:
         text_reference_documents = []

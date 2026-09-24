@@ -158,7 +158,10 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
             session.start()
             progress = []
             result = session.stop(on_progress=progress.append)
+            saved = [(row["source"], row["speaker"], row["text"]) for row in db.get_segments(session.meeting_id)]
 
+        # The speaker label is saved with each line — the Projects tab rebuilds the transcript from these.
+        assert saved == [("mic", None, "let's get started"), ("system", "SPEAKER_00", "sounds good")]
         # Credentials come from Settings, not environment variables.
         kwargs = MockRunpod.call_args.kwargs
         assert (kwargs["api_key"], kwargs["endpoint_id"], kwargs["huggingface_token"]) == (

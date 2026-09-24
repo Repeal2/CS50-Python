@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
     source TEXT NOT NULL CHECK (source IN ('mic', 'system', 'screen_ocr')),
     timestamp_seconds REAL NOT NULL,
-    text TEXT NOT NULL
+    text TEXT NOT NULL,
+    speaker TEXT
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -76,6 +77,10 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
     documents_columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
     if "source_path" not in documents_columns:
         conn.execute("ALTER TABLE documents ADD COLUMN source_path TEXT")
+
+    segment_columns = {row["name"] for row in conn.execute("PRAGMA table_info(transcript_segments)")}
+    if "speaker" not in segment_columns:
+        conn.execute("ALTER TABLE transcript_segments ADD COLUMN speaker TEXT")
 
 
 def _slugify(name: str) -> str:
@@ -210,15 +215,21 @@ class Database:
             return cur.lastrowid
 
     def add_transcript_segment(
-        self, meeting_id: int, source: str, timestamp_seconds: float, text: str
+        self,
+        meeting_id: int,
+        source: str,
+        timestamp_seconds: float,
+        text: str,
+        speaker: str | None = None,
     ) -> None:
+        """`speaker` is a diarized line's label (see TranscriptLine.speaker) — None for everything else."""
         if not text.strip():
             return
         with self._lock:
             self._conn.execute(
-                "INSERT INTO transcript_segments (meeting_id, source, timestamp_seconds, text) "
-                "VALUES (?, ?, ?, ?)",
-                (meeting_id, source, timestamp_seconds, text),
+                "INSERT INTO transcript_segments (meeting_id, source, timestamp_seconds, text, speaker) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (meeting_id, source, timestamp_seconds, text, speaker),
             )
             self._conn.commit()
 

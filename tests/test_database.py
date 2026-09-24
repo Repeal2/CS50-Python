@@ -162,6 +162,55 @@ def test_meetings_created_before_manual_notes_existed_get_the_column_via_migrati
         assert db.get_meeting(meeting_id).manual_notes == "Works after migration."
 
 
+def test_a_segments_speaker_label_is_saved_and_defaults_to_none(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        project = db.create_project("Speakers")
+        meeting_id = db.create_meeting(project.id, "Kickoff")
+        db.add_transcript_segment(meeting_id, "system", 1.0, "Diarized line.", speaker="SPEAKER_00")
+        db.add_transcript_segment(meeting_id, "mic", 2.0, "My own line.")
+
+        assert [(row["text"], row["speaker"]) for row in db.get_segments(meeting_id)] == [
+            ("Diarized line.", "SPEAKER_00"),
+            ("My own line.", None),
+        ]
+
+
+def test_segments_created_before_speaker_existed_get_the_column_via_migration(tmp_path):
+    # A database from before diarization: transcript_segments has no speaker column, and already holds
+    # a line. Opening it must add the column (old lines read back as None) rather than fail on insert.
+    db_path = tmp_path / "legacy.db"
+    with Database(db_path) as db:
+        project = db.create_project("Legacy")
+        meeting_id = db.create_meeting(project.id, "Before diarization")
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP TABLE transcript_segments")
+    conn.execute(
+        """
+        CREATE TABLE transcript_segments (
+            id INTEGER PRIMARY KEY,
+            meeting_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            timestamp_seconds REAL NOT NULL,
+            text TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO transcript_segments (meeting_id, source, timestamp_seconds, text) VALUES (?, ?, ?, ?)",
+        (meeting_id, "system", 0.0, "An old line."),
+    )
+    conn.commit()
+    conn.close()
+
+    with Database(db_path) as db:
+        db.add_transcript_segment(meeting_id, "system", 1.0, "A new line.", speaker="SPEAKER_01")
+
+        assert [(row["text"], row["speaker"]) for row in db.get_segments(meeting_id)] == [
+            ("An old line.", None),
+            ("A new line.", "SPEAKER_01"),
+        ]
+
+
 def test_set_attendees_persists_and_can_be_overwritten(tmp_path):
     with Database(tmp_path / "test.db") as db:
         project = db.create_project("Attendees")
