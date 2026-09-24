@@ -3,9 +3,13 @@ import sys
 import pytest
 
 from meeting_scribe.screen.window_picker import (
+    TeamsMeetingWindow,
     WindowTarget,
+    _best_teams_meeting_window,
     _meeting_name_from_title,
     find_teams_meeting_name,
+    find_teams_meeting_window,
+    get_monitor_work_area,
     get_window_region,
     list_capturable_windows,
     window_exists,
@@ -37,6 +41,37 @@ def test_window_exists_requires_windows():
 def test_find_teams_meeting_name_requires_windows():
     with pytest.raises(RuntimeError):
         find_teams_meeting_name()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the platform guard only triggers off Windows")
+def test_find_teams_meeting_window_requires_windows():
+    with pytest.raises(RuntimeError):
+        find_teams_meeting_window()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the platform guard only triggers off Windows")
+def test_get_monitor_work_area_requires_windows():
+    with pytest.raises(RuntimeError):
+        get_monitor_work_area(None)
+
+
+def test_best_teams_meeting_window_prefers_a_bare_call_window_title():
+    windows = [(1, "Chat | Alice Smith | Microsoft Teams"), (2, "Weekly sync")]
+    assert _best_teams_meeting_window(windows) == TeamsMeetingWindow(2, "Weekly sync")
+
+
+def test_best_teams_meeting_window_keeps_z_order_among_suffixed_titles():
+    windows = [(1, "Weekly sync | Microsoft Teams"), (2, "Design review | Microsoft Teams")]
+    assert _best_teams_meeting_window(windows) == TeamsMeetingWindow(1, "Weekly sync")
+
+
+def test_best_teams_meeting_window_falls_back_to_an_unnamed_teams_window():
+    windows = [(7, "Chat | Microsoft Teams"), (8, "Microsoft Teams")]
+    assert _best_teams_meeting_window(windows) == TeamsMeetingWindow(7, None)
+
+
+def test_best_teams_meeting_window_is_none_with_no_teams_windows():
+    assert _best_teams_meeting_window([]) is None
 
 
 def test_meeting_name_from_title_strips_the_pipe_suffix():

@@ -30,6 +30,7 @@ from meeting_scribe.config import (
     update_whisper_model_size,
 )
 from meeting_scribe.audio.device_watch import device_signature
+from meeting_scribe.gui.meeting_prompt import MeetingPrompt
 from meeting_scribe.hotkeys import (
     GlobalHotkeyListener,
     HotkeyCombo,
@@ -38,6 +39,7 @@ from meeting_scribe.hotkeys import (
     key_name,
 )
 from meeting_scribe.screen.capture import ocr_region
+from meeting_scribe.screen.meeting_detector import DetectedMeeting, MeetingPromptTracker, detect_teams_meeting
 from meeting_scribe.screen.region_picker import (
     RegionOutline,
     RegionTarget,
@@ -185,6 +187,8 @@ def _enable_per_monitor_dpi_awareness() -> None:
 class MeetingScribeApp(tk.Tk):
     # How often the mic/system-audio dropdowns check for devices being connected or disconnected.
     _DEVICE_POLL_MS = 2000
+    # How often to check whether a Teams call has started (see _poll_teams_meeting).
+    _MEETING_POLL_MS = 2000
 
     def __init__(self, settings: Settings | None = None):
         _enable_per_monitor_dpi_awareness()
@@ -224,6 +228,12 @@ class MeetingScribeApp(tk.Tk):
         self._idle_device_signature = device_signature()
         self._seen_device_list: tuple[MeetingSession | None, int] = (None, 0)
         self.after(self._DEVICE_POLL_MS, self._poll_devices)
+
+        self._meeting_prompt_tracker = MeetingPromptTracker()
+        self._meeting_prompt: MeetingPrompt | None = None
+        self._detected_meeting: DetectedMeeting | None = None
+        if sys.platform == "win32":
+            self.after(self._MEETING_POLL_MS, self._poll_teams_meeting)
 
     def apply_hotkeys(self) -> None:
         """(Re)starts the global-hotkey listener from self.settings' current start/stop combos — called
@@ -315,6 +325,74 @@ class MeetingScribeApp(tk.Tk):
                     self._idle_device_signature = signature
         finally:
             self.after(self._DEVICE_POLL_MS, self._poll_devices)
+
+    def _poll_teams_meeting(self) -> None:
+        """Checks for a Teams call on a background thread (it enumerates every window, too slow to do on
+        the GUI thread every couple of seconds), then hands the result back here. The next check is only
+        scheduled once this one has reported, so checks never pile up."""
+
+        def worker() -> None:
+            try:
+                meeting = detect_teams_meeting()
+            except Exception:  # a win32/registry call failing is never worth more than a missed check
+                meeting = None
+            try:
+                self.after(0, self._on_teams_meeting_polled, meeting)
+            except (RuntimeError, tk.TclError):
+                pass  # the app closed while this was running
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_teams_meeting_polled(self, meeting: DetectedMeeting | None) -> None:
+        try:
+            self._detected_meeting = meeting
+            show = self._meeting_prompt_tracker.update(
+                in_call=meeting is not None, recording=self._session is not None
+            )
+            if not show or meeting is None:
+                self.close_meeting_prompt()
+                return
+            if self._meeting_prompt is None:
+                self._meeting_prompt = MeetingPrompt(
+                    self,
+                    meeting.name,
+                    on_start=self._start_from_meeting_prompt,
+                    on_dismiss=self._dismiss_meeting_prompt,
+                )
+            self._place_meeting_prompt(meeting)
+        finally:
+            self.after(self._MEETING_POLL_MS, self._poll_teams_meeting)
+
+    def _place_meeting_prompt(self, meeting: DetectedMeeting) -> None:
+        from meeting_scribe.screen.window_picker import get_monitor_work_area, get_window_region
+
+        hwnd = meeting.window.hwnd if meeting.window is not None else None
+        try:
+            window_rect = get_window_region(hwnd) if hwnd is not None else None
+            work_area = get_monitor_work_area(hwnd)
+        except Exception:
+            return  # the call window closed since the check ran; the next check sorts it out
+        self._meeting_prompt.place(window_rect, work_area)
+
+    def close_meeting_prompt(self) -> None:
+        if self._meeting_prompt is not None:
+            self._meeting_prompt.close()
+            self._meeting_prompt = None
+
+    def _dismiss_meeting_prompt(self) -> None:
+        self._meeting_prompt_tracker.dismiss()
+        self.close_meeting_prompt()
+
+    def _start_from_meeting_prompt(self) -> None:
+        meeting = self._detected_meeting
+        self._dismiss_meeting_prompt()
+        if self._session is not None:
+            return
+        # Uses the name detection already found rather than letting _start look it up again.
+        if meeting is not None and meeting.name:
+            if self._record_tab.title_var.get().strip() in ("", DEFAULT_MEETING_TITLE):
+                self._record_tab.title_var.set(meeting.name)
+        self._record_tab._start()
 
     def refresh_project_lists(self) -> None:
         self._record_tab.refresh_projects()
@@ -1008,6 +1086,7 @@ class RecordTab(ttk.Frame):
             return
 
         self.app._session = session
+        self.app.close_meeting_prompt()
         # Reflects the DEFAULT_PROJECT_NAME/detected-title fallbacks back into their fields, so what's
         # shown always matches what the meeting is actually recording under — same reasoning either way:
         # a placeholder that isn't reflected in the field it stands in for isn't actually saved anywhere.
