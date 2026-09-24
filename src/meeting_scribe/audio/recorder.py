@@ -88,6 +88,32 @@ _NO_ACTIVITY_GRACE_SECONDS = 90.0
 # at all isn't a quiet meeting — for system audio it means nothing is playing through that output device.
 _NO_DATA_GRACE_SECONDS = 30.0
 
+# Automatic device selection (see Recorder's auto_* arguments). A chunk louder than _AUDIBLE_DBFS is
+# carrying sound someone could hear; a quiet stream never gets there. An output device another one is
+# switched to has to be clearly playing, not merely above that line — a switch is a guess about where
+# the call is, and it should only be made on good evidence.
+_AUDIBLE_DBFS = -60.0
+_PLAYING_DBFS = -50.0
+# How often the automation looks at the two streams, and how long it listens to a device it's
+# considering. A probe opens its own stream beside the one recording, so recording never pauses for it.
+_AUTO_DEVICE_POLL_SECONDS = 2.0
+_PROBE_SECONDS = 1.0
+# Nothing audible through the recorded output for this long means the call is probably coming out of a
+# different one. Long enough to ride out an ordinary pause in a conversation.
+_SYSTEM_QUIET_BEFORE_SEARCH_SECONDS = 8.0
+# How often, at most, the other outputs are listened to while the recorded one stays quiet.
+_SYSTEM_SEARCH_INTERVAL_SECONDS = 4.0
+# A connected headset whose microphone hands over nothing but digital silence for this long is muted at
+# the headset or switched off, so the laptop's microphone takes over.
+_HEADSET_SILENT_BEFORE_FALLBACK_SECONDS = 10.0
+# While on the laptop microphone, how often the headset is checked for having come back to life.
+_HEADSET_RECHECK_SECONDS = 15.0
+# How a headset microphone is recognized by name when Settings doesn't name one. Windows' own names for
+# them ("Headset Microphone (…)", "Headset (… Hands-Free)") nearly always say so.
+_HEADSET_NAME_HINTS = ("headset", "headphone", "hands-free", "handsfree", "earbud", "earphone", "airpods")
+# Inputs that are really the computer's output looped back — never a sensible microphone fallback.
+_NOT_A_MICROPHONE_HINTS = ("stereo mix", "what u hear", "wave out", "loopback")
+
 
 @dataclass(frozen=True)
 class _ChunkStats:
@@ -149,6 +175,11 @@ class StreamHealth:
     # that output device, so a system-audio stream that stays at this for long means the call is coming
     # out of a different device than the one being recorded (and its thread sits blocked in read()).
     seconds_without_data: float | None = None
+    # How long since the stream last carried audible sound (a chunk above _AUDIBLE_DBFS) / any signal at
+    # all (a non-zero sample) — counted from when it (last) opened if it hasn't since, and None if it
+    # never opened. What automatic device selection goes on: a quiet output device, a dead headset.
+    seconds_without_sound: float | None = None
+    seconds_without_signal: float | None = None
 
     @classmethod
     def idle(cls) -> StreamHealth:
@@ -180,6 +211,7 @@ class _StreamActivityMonitor:
         self._last_observed_at: float | None = None
         self._last_activity_at: float | None = None
         self._last_nonzero_at: float | None = None
+        self._last_audible_at: float | None = None
         self._last_clip_at: float | None = None
         self._clipped_chunks = 0
         self._peak_dbfs = _SILENT_DBFS
@@ -199,6 +231,8 @@ class _StreamActivityMonitor:
             self._peak_dbfs = max(self._peak_dbfs, stats.rms_dbfs)
             if not stats.all_zero:
                 self._last_nonzero_at = now
+            if stats.rms_dbfs >= _AUDIBLE_DBFS:
+                self._last_audible_at = now
             if stats.rms_dbfs >= self._activity_dbfs:
                 self._last_activity_at = now
             if stats.clipped:
@@ -212,8 +246,15 @@ class _StreamActivityMonitor:
                 self._last_observed_at is None or self._last_observed_at < self._opened_at
             ):
                 waiting = now - self._opened_at
+            without_sound = self._seconds_since(self._last_audible_at, now)
+            without_signal = self._seconds_since(self._last_nonzero_at, now)
             if self._first_observed_at is None:
-                return replace(StreamHealth.idle(), seconds_without_data=waiting)
+                return replace(
+                    StreamHealth.idle(),
+                    seconds_without_data=waiting,
+                    seconds_without_sound=without_sound,
+                    seconds_without_signal=without_signal,
+                )
             seconds_captured = max(0.0, now - self._first_observed_at)
             return StreamHealth(
                 seconds_captured=seconds_captured,
@@ -229,7 +270,16 @@ class _StreamActivityMonitor:
                     and now - self._last_clip_at <= _CLIP_HOLD_SECONDS
                 ),
                 seconds_without_data=waiting,
+                seconds_without_sound=without_sound,
+                seconds_without_signal=without_signal,
             )
+
+    def _seconds_since(self, last_at: float | None, now: float) -> float | None:
+        """Time since `last_at`, or since the stream opened if that's later — what happened on the
+        device before a switch says nothing about the one now open. Caller holds the lock."""
+        if self._opened_at is None:
+            return None
+        return now - max(self._opened_at, last_at if last_at is not None else self._opened_at)
 
 
 def _describe_stream_problem(health: StreamHealth, label: str, other_heard_activity: bool) -> str | None:
@@ -401,6 +451,166 @@ def check_input_device(device_name: str | None = None, seconds: float = 3.0) -> 
         digital_silence=health.digital_silence,
         clipping=health.clipping,
     )
+
+
+def _read_what_is_available(stream) -> bytes:
+    """Reads whatever `stream` already has buffered, without waiting for more — b"" when it has nothing.
+    A blocking read() on a WASAPI loopback stream waits for as long as nothing plays through that output
+    device, which can be the whole meeting; this never does, so whoever is reading can still notice it's
+    been asked to stop."""
+    available = stream.get_read_available()
+    if available <= 0:
+        return b""
+    return stream.read(min(available, CHUNK_FRAMES), exception_on_overflow=False)
+
+
+@dataclass(frozen=True)
+class DeviceProbe:
+    """What a short listen to one device heard — see _probe_devices."""
+
+    name: str
+    peak_dbfs: float
+    heard_signal: bool  # any non-zero sample at all: the device is live, whether or not it's loud
+
+
+class _ProbeStream:
+    def __init__(self, name: str, stream):
+        self.name = name
+        self.stream = stream
+        self.peak_dbfs = _SILENT_DBFS
+        self.heard_signal = False
+
+
+def _probe_devices(
+    pyaudio_instance, pyaudio_module, devices, seconds: float, stop_event: threading.Event
+) -> list[DeviceProbe]:
+    """Listens to every device in `devices` at once for `seconds`, each on a stream of its own opened
+    beside whatever is recording, and reports what each heard. Reads only what's buffered (see
+    _read_what_is_available), so a silent loopback device can't hang it, and it returns early once
+    `stop_event` is set. A device that won't open, or fails mid-listen, is reported as having heard
+    nothing rather than failing the rest."""
+    probes: list[_ProbeStream] = []
+    try:
+        for info in devices:
+            try:
+                stream = pyaudio_instance.open(
+                    format=pyaudio_module.paInt16,
+                    channels=int(info["maxInputChannels"]),
+                    rate=int(info["defaultSampleRate"]),
+                    input=True,
+                    input_device_index=info["index"],
+                    frames_per_buffer=CHUNK_FRAMES,
+                )
+            except Exception:
+                stream = None
+            probes.append(_ProbeStream(str(info["name"]), stream))
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not stop_event.is_set():
+            for probe in probes:
+                if probe.stream is None:
+                    continue
+                try:
+                    data = _read_what_is_available(probe.stream)
+                except Exception:
+                    data = b""
+                if data:
+                    stats = _analyze_pcm16(data)
+                    probe.peak_dbfs = max(probe.peak_dbfs, stats.rms_dbfs)
+                    probe.heard_signal = probe.heard_signal or not stats.all_zero
+            stop_event.wait(0.02)
+    finally:
+        for probe in probes:
+            for close in (getattr(probe.stream, "stop_stream", None), getattr(probe.stream, "close", None)):
+                try:
+                    if close is not None:
+                        close()
+                except Exception:
+                    pass
+    return [DeviceProbe(probe.name, probe.peak_dbfs, probe.heard_signal) for probe in probes]
+
+
+def looks_like_headset(name: str) -> bool:
+    lowered = name.lower()
+    return any(hint in lowered for hint in _HEADSET_NAME_HINTS)
+
+
+def _same_device(a: str, b: str) -> bool:
+    """Windows lists each device once per audio API, and the oldest (MME) cuts names off at 31
+    characters — "Headset Microphone (Jabra Evol" is the same headset as the full name."""
+    shorter, longer = sorted((a, b), key=len)
+    return a == b or (len(shorter) >= 16 and longer.startswith(shorter))
+
+
+def find_headset_microphone(input_names, configured: str | None) -> str | None:
+    """The headset microphone that's connected right now, or None. `configured` is the one picked in
+    Settings; without one, the first input whose name says it's a headset (see looks_like_headset)."""
+    if configured:
+        return configured if configured in input_names else None
+    return next((name for name in input_names if looks_like_headset(name)), None)
+
+
+def choose_fallback_microphone(
+    input_names, *, configured: str | None, default_name: str | None, headset: str | None
+) -> str | None:
+    """The microphone to use when the headset can't be: the one chosen in Settings, else the Windows
+    default, else the first input that isn't a headset — never the headset itself (Windows tends to make
+    a newly connected headset its default) or a loopback input like Stereo Mix."""
+
+    def usable(name: str | None) -> bool:
+        return (
+            bool(name)
+            and name in input_names
+            and not (headset is not None and _same_device(name, headset))
+            and not looks_like_headset(name)
+            and not any(hint in name.lower() for hint in _NOT_A_MICROPHONE_HINTS)
+        )
+
+    for candidate in (configured, default_name, *input_names):
+        if usable(candidate):
+            return candidate
+    return None
+
+
+def next_microphone(
+    *,
+    active: str | None,
+    headset: str | None,
+    fallback: str | None,
+    active_seconds_without_signal: float | None,
+    headset_is_live: bool | None,
+) -> str | None:
+    """Which microphone to switch to now, or None to stay put. The headset whenever it's connected and
+    live; the fallback once the headset has handed over nothing but digital silence for a while (muted
+    at the headset, or switched off with its dongle still plugged in) — silence a working microphone
+    never produces, so it's safe to act on. `headset_is_live` is the result of listening to the headset
+    while on the fallback, or None if it wasn't checked this time."""
+    if headset is None or fallback is None or fallback == headset:
+        return None
+    if active is not None and _same_device(active, headset):
+        if (
+            active_seconds_without_signal is not None
+            and active_seconds_without_signal >= _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS
+        ):
+            return fallback
+        return None
+    return headset if headset_is_live else None
+
+
+def next_system_device(
+    *, active: str | None, active_seconds_without_sound: float | None, probes
+) -> str | None:
+    """Which output device to record instead, or None to stay put. Only one device plays the call, so
+    once the recorded one has been quiet for a while, whichever other output is clearly playing
+    something is the one to follow — the loudest, if more than one is."""
+    if (
+        active_seconds_without_sound is None
+        or active_seconds_without_sound < _SYSTEM_QUIET_BEFORE_SEARCH_SECONDS
+    ):
+        return None
+    playing = [probe for probe in probes if probe.name != active and probe.peak_dbfs >= _PLAYING_DBFS]
+    if not playing:
+        return None
+    return max(playing, key=lambda probe: probe.peak_dbfs).name
 
 
 class _SegmentedWavWriter:
@@ -576,6 +786,16 @@ class Recorder:
 
     `mic_health()` / `system_health()` and `input_problems()` go a step further and say whether what's
     being captured looks like a working input at all — see StreamHealth and describe_input_problems.
+
+    `auto_system_device` and `auto_microphone` hand the choice of device to the recorder, for someone
+    who'd otherwise have to remember to change it for every call. A background thread checks every
+    `_AUTO_DEVICE_POLL_SECONDS`: once the recorded output device has been quiet for a while, it listens
+    to the other outputs and follows whichever is playing (only one plays the call); and the
+    microphone is the headset (`headset_microphone_name`, or one recognized by name) whenever one is
+    connected and live, the usual microphone otherwise — see next_system_device / next_microphone.
+    Listening is done on separate streams, so recording carries on throughout, and every switch lands
+    in capture_notices() with its reason. Picking a device by hand mid-meeting turns that stream's
+    automation off for the rest of the meeting — the person has decided.
     """
 
     # How often the background thread checks whether the set of audio devices, or the Windows default,
@@ -588,11 +808,29 @@ class Recorder:
         output_dir: Path,
         mic_device_name: str | None = None,
         system_device_name: str | None = None,
+        *,
+        auto_system_device: bool = False,
+        auto_microphone: bool = False,
+        headset_microphone_name: str | None = None,
     ):
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._mic_device_name = mic_device_name
         self._system_device_name = system_device_name
+        # The microphone chosen in Settings, which _mic_device_name stops being after a switch — kept as
+        # the one to fall back to when the headset goes quiet.
+        self._configured_mic_name = mic_device_name
+        self._auto_system = auto_system_device
+        self._auto_mic = auto_microphone
+        self._headset_microphone_name = headset_microphone_name
+        self._auto_thread: threading.Thread | None = None
+        self._next_system_search = 0.0
+        self._next_headset_check = 0.0
+        # Held while a probe has streams open on self._pyaudio, so reload_devices() can't terminate it
+        # under them. Never held while taking _lifecycle_lock, so the two can't deadlock.
+        self._probe_lock = threading.Lock()
+        # Set by stop(): nothing may open a new capture stream after that.
+        self._stopping = False
         # The device actually in use right now, as opposed to _mic_device_name/_system_device_name above
         # (the requested name, which stays None for "follow the Windows default") — what the default-
         # device watcher compares Windows' current default against to notice it changed.
@@ -648,6 +886,11 @@ class Recorder:
         self._system_stop_event.clear()
         self._started_at = time.monotonic()
 
+        if self._auto_mic:
+            headset = self._connected_headset()
+            if headset is not None and headset != self._mic_device_name:
+                self._mic_device_name = headset
+                self._record_switch(f"Microphone set to {headset!r} — a headset is connected.")
         mic_info = self._resolve_input_device(self._mic_device_name)
         system_info = self._resolve_loopback_device(pyaudio, self._system_device_name)
         self._mic_active_device_name = mic_info["name"]
@@ -676,12 +919,26 @@ class Recorder:
             target=self._watch_devices, daemon=True, name="recorder-device-watch"
         )
         self._watcher_thread.start()
+        if self._auto_system or self._auto_mic:
+            self._auto_thread = threading.Thread(
+                target=self._auto_select_devices, daemon=True, name="recorder-auto-device"
+            )
+            self._auto_thread.start()
 
-    def switch_mic_device(self, device_name: str | None, *, reason: str | None = None) -> None:
+    def switch_mic_device(
+        self, device_name: str | None, *, reason: str | None = None, automatic: bool = False
+    ) -> None:
         """Moves the microphone stream to a different device without stopping the meeting. The system-
         audio stream is untouched. `device_name` follows the same convention as the constructor: None
         means "whatever Windows currently considers the default". `reason`, if given, replaces the
-        generic wording in the notice this records."""
+        generic wording in the notice this records. A switch that isn't `automatic` is someone's own
+        choice, and turns automatic microphone selection off for the rest of the meeting."""
+        if not automatic and self._auto_mic:
+            self._auto_mic = False
+            self._record_notice(
+                "Automatic microphone selection is off for the rest of this meeting, since a microphone "
+                "was picked by hand."
+            )
         with self._lifecycle_lock:
             self._switch_stream(
                 stop_event=self._mic_stop_event,
@@ -697,9 +954,17 @@ class Recorder:
                 reason=reason,
             )
 
-    def switch_system_device(self, device_name: str | None, *, reason: str | None = None) -> None:
+    def switch_system_device(
+        self, device_name: str | None, *, reason: str | None = None, automatic: bool = False
+    ) -> None:
         """Moves the system-audio (loopback) stream to a different device without stopping the meeting.
-        The microphone stream is untouched. See switch_mic_device for `reason`."""
+        The microphone stream is untouched. See switch_mic_device for `reason` and `automatic`."""
+        if not automatic and self._auto_system:
+            self._auto_system = False
+            self._record_notice(
+                "Automatic system-audio selection is off for the rest of this meeting, since a device "
+                "was picked by hand."
+            )
         with self._lifecycle_lock:
             self._switch_stream(
                 stop_event=self._system_stop_event,
@@ -734,6 +999,8 @@ class Recorder:
             raise RuntimeError("Recorder.start() was never called")
         if writer is None:
             raise RuntimeError(f"{label} stream was never started")
+        if self._stopping:
+            raise RuntimeError("the recording has already stopped")
 
         # Stop only this stream's capture thread — the other one is left running, which is the whole
         # point of switching one device without restarting the meeting.
@@ -798,6 +1065,100 @@ class Recorder:
                     self._record_capture_failure("Audio devices", exc)
             last = current
 
+    def _auto_select_devices(self) -> None:
+        """Runs on its own thread for the life of the meeting when either automation is on — see the
+        class docstring. Exits promptly on stop(), same as _watch_devices; a probe in progress is cut
+        short by the same event."""
+        while not self._watch_stop_event.wait(_AUTO_DEVICE_POLL_SECONDS):
+            for step in (self._auto_select_system_device, self._auto_select_microphone):
+                try:
+                    step(time.monotonic())
+                except Exception as exc:  # a background check must never take the meeting down
+                    self._record_notice(
+                        f"Automatic device selection skipped a check ({type(exc).__name__}: {exc})."
+                    )
+
+    def _auto_select_system_device(self, now: float) -> None:
+        if not self._auto_system or now < self._next_system_search:
+            return
+        quiet = self.system_health().seconds_without_sound
+        if quiet is None or quiet < _SYSTEM_QUIET_BEFORE_SEARCH_SECONDS:
+            return
+        self._next_system_search = now + _SYSTEM_SEARCH_INTERVAL_SECONDS
+        active = self._system_active_device_name
+        with self._probe_lock:
+            pyaudio_instance = self._pyaudio
+            if pyaudio_instance is None:
+                return
+            candidates = [
+                info for info in pyaudio_instance.get_loopback_device_info_generator()
+                if info.get("name") != active
+            ]
+            probes = _probe_devices(
+                pyaudio_instance, self._pyaudio_module, candidates, _PROBE_SECONDS, self._watch_stop_event
+            )
+        choice = next_system_device(active=active, active_seconds_without_sound=quiet, probes=probes)
+        if choice is not None and self._auto_system and not self._watch_stop_event.is_set():
+            self.switch_system_device(choice, reason="the call's sound is playing through it", automatic=True)
+
+    def _auto_select_microphone(self, now: float) -> None:
+        if not self._auto_mic:
+            return
+        with self._probe_lock:
+            pyaudio_instance = self._pyaudio
+            if pyaudio_instance is None:
+                return
+            from meeting_scribe.audio.device_picker import input_devices_from
+
+            names = [device.name for device in input_devices_from(pyaudio_instance)]
+            headset = find_headset_microphone(names, self._headset_microphone_name)
+            try:
+                default_name = pyaudio_instance.get_default_input_device_info().get("name")
+            except Exception:  # no default input at all
+                default_name = None
+            fallback = choose_fallback_microphone(
+                names, configured=self._configured_mic_name, default_name=default_name, headset=headset
+            )
+            active = self._mic_active_device_name
+            headset_is_live = None
+            if (
+                headset is not None
+                and fallback is not None
+                and not (active is not None and _same_device(active, headset))
+                and now >= self._next_headset_check
+            ):
+                self._next_headset_check = now + _HEADSET_RECHECK_SECONDS
+                headset_info = _find_input_device(pyaudio_instance, headset)
+                probes = _probe_devices(
+                    pyaudio_instance, self._pyaudio_module, [headset_info] if headset_info else [],
+                    _PROBE_SECONDS, self._watch_stop_event,
+                )
+                headset_is_live = any(probe.heard_signal for probe in probes)
+        choice = next_microphone(
+            active=active,
+            headset=headset,
+            fallback=fallback,
+            active_seconds_without_signal=self.mic_health().seconds_without_signal,
+            headset_is_live=headset_is_live,
+        )
+        if choice is None or not self._auto_mic or self._watch_stop_event.is_set():
+            return
+        if choice == headset:
+            reason = "the headset is connected and picking up sound"
+        else:
+            reason = "the headset microphone has gone silent (muted, or switched off?)"
+            self._next_headset_check = now + _HEADSET_RECHECK_SECONDS
+        self.switch_mic_device(choice, reason=reason, automatic=True)
+
+    def _connected_headset(self) -> str | None:
+        from meeting_scribe.audio.device_picker import input_devices_from
+
+        try:
+            names = [device.name for device in input_devices_from(self._pyaudio)]
+        except Exception:
+            return None
+        return find_headset_microphone(names, self._headset_microphone_name)
+
     def _safe_device_signature(self):
         # Swallows everything: this is a background poll, not something a transient enumeration hiccup
         # should ever be allowed to take the meeting down over. It just tries again next tick.
@@ -847,7 +1208,7 @@ class Recorder:
                 )
             else:
                 try:
-                    with _pyaudio_lifecycle_lock:
+                    with self._probe_lock, _pyaudio_lifecycle_lock:
                         if self._pyaudio is not None:
                             self._pyaudio.terminate()
                         self._pyaudio = None
@@ -909,7 +1270,10 @@ class Recorder:
         self._watch_stop_event.set()
         if self._watcher_thread is not None:
             self._watcher_thread.join(timeout=5)
+        if self._auto_thread is not None:
+            self._auto_thread.join(timeout=10)
         with self._lifecycle_lock:
+            self._stopping = True
             self._mic_stop_event.set()
             self._system_stop_event.set()
             stuck_labels = []
@@ -1075,8 +1439,14 @@ class Recorder:
         rate = int(device_info["defaultSampleRate"])
         # Set by _switch_stream when this thread is being replaced — see there.
         retired = threading.Event()
+        # A loopback stream is read only as far as it has data (see _read_what_is_available): a blocking
+        # read there waits for as long as the output device is silent, which left the thread unable to
+        # stop — so switching away from it, or ending the meeting, had to give up on it.
+        poll = bool(device_info.get("isLoopbackDevice"))
 
         def run() -> None:
+            nonlocal poll
+            polled_once = False
             stream = None
             try:
                 stream = self._pyaudio.open(
@@ -1089,7 +1459,20 @@ class Recorder:
                 )
                 monitor.stream_opened(time.monotonic())
                 while not (stop_event.is_set() or retired.is_set()):
-                    data = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
+                    if poll:
+                        try:
+                            data = _read_what_is_available(stream)
+                        except Exception:
+                            if polled_once:
+                                raise
+                            poll = False  # this stream can't say what it has buffered; read normally
+                            continue
+                        polled_once = True
+                        if not data:
+                            stop_event.wait(0.01)
+                            continue
+                    else:
+                        data = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
                     if retired.is_set():
                         break  # replaced while blocked in read(); the writer belongs to the new thread now
                     writer.write(data)
