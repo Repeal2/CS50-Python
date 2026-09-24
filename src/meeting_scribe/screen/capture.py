@@ -160,7 +160,11 @@ class ScreenWatcher:
         target: WindowTarget | RegionTarget | WindowRegionTarget | None = None,
         settle_seconds: float = 0.15,
         on_speaker_name: Callable[[SpeakerNameEvent], None] | None = None,
+        reading: bool = True,
     ):
+        """`reading=False` starts the watcher with its clock running but nothing read, until
+        set_reading(True) — the OCR box's Start button (see screen.ocr_box). The clock starts with the
+        meeting either way, so what's read later still lines up with the audio."""
         self._on_text = on_text
         self._on_speaker_name = on_speaker_name
         self._interval = interval_seconds
@@ -175,6 +179,10 @@ class ScreenWatcher:
         # Lines seen in the last capture that hadn't stopped growing yet — see module docstring.
         self._pending_lines: list[str] = []
         self._unsettled_captures = 0
+        self._reading = threading.Event()
+        if reading:
+            self._reading.set()
+        self._ever_read = reading
         self._notices: list[str] = []
         self._notices_lock = threading.Lock()
 
@@ -187,6 +195,26 @@ class ScreenWatcher:
         A plain attribute swap: the capture thread reads it once per cycle."""
         self._target = target
         self._last_frame_hash = None
+
+    @property
+    def reading(self) -> bool:
+        return self._reading.is_set()
+
+    @property
+    def ever_read(self) -> bool:
+        """Whether reading was on at any point — a meeting where the box's Start was never pressed has no
+        on-screen text, and should say why."""
+        return self._ever_read
+
+    def set_reading(self, reading: bool) -> None:
+        """Switches reading on or off without stopping the watcher. Turning it off lets the lines still
+        settling on screen through (on the capture thread's next pass), rather than dropping them."""
+        if reading:
+            self._ever_read = True
+            self._last_frame_hash = None  # read what's there now, even if it looks like the last frame
+            self._reading.set()
+        else:
+            self._reading.clear()
 
     def notices(self) -> tuple[str, ...]:
         """Anything that went wrong with on-screen capture, as ready-to-show sentences — each distinct
@@ -228,6 +256,10 @@ class ScreenWatcher:
                 failures = 0
                 while not self._stop_event.is_set():
                     loop_start = time.monotonic()
+                    if not self._reading.is_set():
+                        self._flush_pending()
+                        self._stop_event.wait(min(self._interval, 0.25))
+                        continue
                     try:
                         region = self._resolve_region(sct)
                         if region is not None:

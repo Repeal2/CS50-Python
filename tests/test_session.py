@@ -1181,9 +1181,8 @@ def test_retry_brings_back_the_on_screen_text_saved_during_the_meeting(tmp_path)
             assert {row["source"] for row in db.get_segments(meeting_id)} == {"mic", "system", "screen_ocr"}
 
 
-def test_on_screen_capture_can_follow_the_call_to_a_new_window(tmp_path):
-    from meeting_scribe.screen.region_picker import WindowRegionTarget
-    from meeting_scribe.screen.window_picker import WindowTarget
+def test_on_screen_reading_can_start_later_and_follow_the_box(tmp_path):
+    from meeting_scribe.screen.region_picker import RegionTarget
 
     with (
         patch("meeting_scribe.session.Recorder"),
@@ -1194,14 +1193,34 @@ def test_on_screen_capture_can_follow_the_call_to_a_new_window(tmp_path):
 
         watcher = MockScreenWatcher.return_value
         with Database(tmp_path / "test.db") as db:
-            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            assert MockScreenWatcher.call_args.kwargs["reading"] is True
 
-            watcher.target = WindowTarget(hwnd=1, title="Meeting | Microsoft Teams")
-            session.follow_screen_window(2)
-            watcher.set_target.assert_called_with(WindowTarget(hwnd=2, title="Meeting | Microsoft Teams"))
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Standup", read_screen=False)
+            assert MockScreenWatcher.call_args.kwargs["reading"] is False
 
-            area = WindowRegionTarget(1, "Teams", 0.1, 0.8, 0.8, 0.1, 800, 60)
-            watcher.target = area
-            session.follow_screen_window(3, "Weekly sync")
-            moved = watcher.set_target.call_args.args[0]
-            assert (moved.hwnd, moved.window_title, moved.offset_top_frac) == (3, "Weekly sync", 0.8)
+            session.set_screen_area({"left": -1200, "top": 40, "width": 800, "height": 120})
+            watcher.set_target.assert_called_with(RegionTarget(left=-1200, top=40, width=800, height=120))
+            session.set_screen_reading(True)
+            watcher.set_reading.assert_called_with(True)
+
+
+def test_a_meeting_where_ocr_was_never_started_says_so(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        from meeting_scribe.session import MeetingSession
+
+        MockRecorder.return_value.stop.return_value = RecordedAudio((), (), 0.0)
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+        MockScreenWatcher.return_value.ever_read = False
+        MockScreenWatcher.return_value.notices.return_value = ()
+        messages = []
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff", read_screen=False)
+            session.start()
+            session.stop(on_progress=messages.append)
+
+        assert any("Start OCR was never pressed" in message for message in messages)

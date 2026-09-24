@@ -98,6 +98,10 @@ class Settings:
     runpod_api_key: str | None = None
     runpod_endpoint_id: str | None = None
     runpod_huggingface_token: str | None = None
+    # Where the on-screen OCR box was last left — (left, top, width, height) in screen pixels — so the
+    # next meeting's box appears in the same place instead of needing to be set up again. None until
+    # the box has been moved or resized once. See screen.ocr_box.
+    ocr_area: tuple[int, int, int, int] | None = None
 
     @property
     def db_path(self) -> Path:
@@ -172,6 +176,7 @@ def save_user_config(settings: Settings) -> None:
         "runpod_api_key": settings.runpod_api_key,
         "runpod_endpoint_id": settings.runpod_endpoint_id,
         "runpod_huggingface_token": settings.runpod_huggingface_token,
+        "ocr_area": list(settings.ocr_area) if settings.ocr_area else None,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -256,6 +261,23 @@ def update_meeting_hotkeys(
     return updated
 
 
+def update_ocr_area(settings: Settings, *, ocr_area: tuple[int, int, int, int] | None) -> Settings:
+    """Applies and persists where the OCR box was left (see Settings.ocr_area)."""
+    updated = replace(settings, ocr_area=ocr_area)
+    save_user_config(updated)
+    return updated
+
+
+def _ocr_area_from_json(data: object) -> tuple[int, int, int, int] | None:
+    if not isinstance(data, (list, tuple)) or len(data) != 4:
+        return None
+    try:
+        left, top, width, height = (int(value) for value in data)
+    except (TypeError, ValueError):
+        return None
+    return (left, top, width, height) if width > 0 and height > 0 else None
+
+
 def load_settings() -> Settings:
     data_dir = _default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -284,4 +306,5 @@ def load_settings() -> Settings:
         runpod_api_key=user_config.get("runpod_api_key"),
         runpod_endpoint_id=user_config.get("runpod_endpoint_id"),
         runpod_huggingface_token=user_config.get("runpod_huggingface_token"),
+        ocr_area=_ocr_area_from_json(user_config.get("ocr_area")),
     )

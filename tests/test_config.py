@@ -358,3 +358,23 @@ def test_a_blank_headset_means_recognize_one_by_name(tmp_path, monkeypatch):
     update_audio_automation(load_settings(), auto_switch_audio_devices=True, headset_microphone_name="")
 
     assert load_settings().headset_microphone_name is None
+
+
+def test_the_ocr_box_position_is_saved_and_loaded(tmp_path, monkeypatch):
+    from meeting_scribe import config
+
+    monkeypatch.setattr(config, "_default_data_dir", lambda: tmp_path)
+    settings = config.load_settings()
+    assert settings.ocr_area is None
+
+    config.update_ocr_area(settings, ocr_area=(-1500, 700, 900, 140))
+    assert config.load_settings().ocr_area == (-1500, 700, 900, 140)
+
+
+def test_a_malformed_saved_ocr_box_position_is_ignored():
+    from meeting_scribe.config import _ocr_area_from_json
+
+    assert _ocr_area_from_json([1, 2, 3]) is None
+    assert _ocr_area_from_json([1, 2, 0, 5]) is None
+    assert _ocr_area_from_json("nope") is None
+    assert _ocr_area_from_json([1, 2, "3", 4]) == (1, 2, 3, 4)

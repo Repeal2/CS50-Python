@@ -419,3 +419,48 @@ def test_retargeting_forgets_the_last_frame_so_the_new_window_is_read():
     target = RegionTarget(left=0, top=0, width=10, height=10)
     watcher.set_target(target)
     assert watcher.target is target and watcher._last_frame_hash is None
+
+
+def test_nothing_is_read_until_reading_is_switched_on(monkeypatch):
+    import sys
+    import threading
+    import time
+    import types
+
+    class Sct:
+        monitors = [{"left": 0, "top": 0, "width": 2, "height": 2}]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setitem(sys.modules, "mss", types.SimpleNamespace(mss=Sct))
+    monkeypatch.setitem(sys.modules, "pytesseract", types.SimpleNamespace(pytesseract=types.SimpleNamespace()))
+    monkeypatch.setitem(sys.modules, "PIL", types.SimpleNamespace(Image=FakeImage))
+
+    watcher = _watcher(on_text=lambda event: None, reading=False)
+    captures = []
+    monkeypatch.setattr(watcher, "_capture_once", lambda *args: captures.append(1))
+    thread = threading.Thread(target=watcher._run)
+    thread.start()
+    time.sleep(0.3)
+    assert captures == [] and not watcher.ever_read
+
+    watcher.set_reading(True)
+    deadline = time.monotonic() + 2
+    while not captures and time.monotonic() < deadline:
+        time.sleep(0.01)
+    watcher._stop_event.set()
+    thread.join(timeout=2)
+    assert captures and watcher.ever_read
+
+
+def test_pausing_lets_the_lines_still_on_screen_through():
+    events = []
+    watcher = _watcher(on_text=events.append)
+    watcher._pending_lines = ["Last caption before the pause."]
+    watcher.set_reading(False)
+    watcher._flush_pending()  # what the capture thread does on its next pass while paused
+    assert [event.text for event in events] == ["Last caption before the pause."]

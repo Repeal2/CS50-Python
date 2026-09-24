@@ -11,7 +11,6 @@ doesn't wait for the previous one to finish transcribing/saving.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import threading
 from dataclasses import dataclass
@@ -203,12 +202,18 @@ class MeetingSession:
         project_name: str,
         title: str,
         screen_target: WindowTarget | RegionTarget | WindowRegionTarget | None = None,
+        *,
+        read_screen: bool = True,
     ):
         """`screen_target` selects a single window, a fixed user-drawn rectangle, or a user-drawn
         rectangle pinned to a window's current position, to OCR instead of the whole screen — e.g. just
         the Teams/Zoom window, just a captions bar, or just a corner of the Teams window that keeps
         capturing that same corner even if the window is moved to another monitor. Leave it None to
-        capture the whole screen."""
+        capture the whole screen.
+
+        `read_screen=False` starts the meeting without reading anything on screen yet — the OCR box's
+        flow (see screen.ocr_box): the box is put in place first, then its Start button calls
+        set_screen_reading(True)."""
         self._settings = settings
         self._db = db
         self.project = db.get_or_create_project(project_name)
@@ -240,6 +245,7 @@ class MeetingSession:
             interval_seconds=settings.screen_capture_interval_seconds,
             tesseract_cmd=settings.tesseract_cmd,
             target=screen_target,
+            reading=read_screen,
         )
         self._transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
 
@@ -253,21 +259,19 @@ class MeetingSession:
         self._screen_watcher.start()
 
     @property
-    def screen_target(self):
-        return self._screen_watcher.target
+    def screen_reading(self) -> bool:
+        return self._screen_watcher.reading
 
-    def follow_screen_window(self, hwnd: int, title: str | None = None) -> None:
-        """Points on-screen text capture at a different window, keeping any custom area within it —
-        for when the call moves to a new window mid-meeting (Teams replaces its call window when the
-        meeting moves from the lobby into the call, or is popped out). Capture otherwise stops for good
-        the moment the window it was pointed at closes. A no-op for the whole screen or a fixed area."""
-        target = self._screen_watcher.target
-        if isinstance(target, WindowTarget):
-            self._screen_watcher.set_target(WindowTarget(hwnd=hwnd, title=title or target.title))
-        elif isinstance(target, WindowRegionTarget):
-            self._screen_watcher.set_target(
-                dataclasses.replace(target, hwnd=hwnd, window_title=title or target.window_title)
-            )
+    def set_screen_reading(self, reading: bool) -> None:
+        """Starts or pauses reading on-screen text (the OCR box's Start/Stop button)."""
+        self._screen_watcher.set_reading(reading)
+
+    def set_screen_area(self, area: dict) -> None:
+        """Reads from a different screen rectangle (an mss-style {left, top, width, height}) from the next
+        capture on — the OCR box having been moved or resized."""
+        self._screen_watcher.set_target(
+            RegionTarget(left=area["left"], top=area["top"], width=area["width"], height=area["height"])
+        )
 
     def switch_mic_device(self, device_name: str | None) -> None:
         """Moves the mic recording to a different device mid-meeting instead of the old silent no-op
@@ -355,6 +359,8 @@ class MeetingSession:
 
     def _stop(self, report: Callable[[str], None]) -> str:
         self._screen_watcher.stop()
+        if not self._screen_watcher.ever_read:
+            report("On-screen text wasn't read — Start OCR was never pressed on the OCR box.")
         for message in self._screen_watcher.notices():
             report(message)
         recorded = self._recorder.stop()
