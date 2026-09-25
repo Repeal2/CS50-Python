@@ -270,7 +270,9 @@ def apply_theme(root: tk.Tk) -> tuple[Palette, Fonts]:
         darkcolor=p.field, padding=px(5), arrowcolor=p.muted, insertcolor=p.text,
     )
     style.configure("TEntry", **field_options)
-    style.configure("TCombobox", **field_options, background=p.field)
+    # A noticeably bigger dropdown arrow than clam's default (~12px) — easy to spot as "this opens a
+    # list" at a glance, not just a sliver of pixels in the corner of the field.
+    style.configure("TCombobox", **field_options, background=p.field, arrowsize=px(18))
     style.configure("Placeholder.TEntry", **{**field_options, "foreground": p.muted})
     for name in ("TEntry", "Placeholder.TEntry", "TCombobox"):
         style.map(

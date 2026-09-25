@@ -259,6 +259,21 @@ def _wrap_to_width(label: ttk.Label, container: tk.Misc, *, margin: int) -> None
     container.bind("<Configure>", lambda e: label.configure(wraplength=max(120, e.width - margin)), add="+")
 
 
+def _open_dropdown_on_click(combo: ttk.Combobox) -> None:
+    """An editable combobox (project/title) only opens its suggestion list when the narrow arrow is
+    clicked — everywhere else in the field, a click just places the text cursor. Bind a click anywhere
+    in the field to also post the dropdown, so it behaves like a normal dropdown to click into, while a
+    second click (or typing) still edits the text underneath exactly as before. Bound at the instance
+    level, which Tk dispatches before the combobox's own class-level click binding, so this only adds
+    the extra "also post" behavior rather than replacing cursor placement or text selection."""
+
+    def on_click(event: tk.Event) -> None:
+        if "textarea" in combo.identify(event.x, event.y) and str(combo.cget("state")) != "disabled":
+            combo.tk.call("ttk::combobox::Post", combo)
+
+    combo.bind("<Button-1>", on_click, add="+")
+
+
 def _set_readonly_text(widget: tk.Text, content: str) -> None:
     widget.configure(state="normal")
     widget.delete("1.0", "end")
@@ -788,6 +803,7 @@ class RecordPage(ttk.Frame):
         self.project_combo.grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 0))
         for sequence in ("<<ComboboxSelected>>", "<FocusOut>", "<Return>"):
             self.project_combo.bind(sequence, self._on_project_field_committed)
+        _open_dropdown_on_click(self.project_combo)
         ttk.Button(meeting, text="New…", style="Link.TButton", command=self._new_project).grid(
             row=1, column=2, padx=(6, 18), pady=(2, 0)
         )
@@ -798,6 +814,7 @@ class RecordPage(ttk.Frame):
         self.title_combo = ttk.Combobox(meeting, textvariable=self.title_var)
         self.title_combo.grid(row=1, column=3, columnspan=2, sticky="we", pady=(2, 0))
         self.title_var.trace_add("write", self._on_title_changed)
+        _open_dropdown_on_click(self.title_combo)
 
         actions = ttk.Frame(meeting, style="Card.TFrame", borderwidth=0)
         actions.grid(row=2, column=0, columnspan=5, sticky="we", pady=(16, 0))
