@@ -21,6 +21,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
 from meeting_scribe import __version__
+from meeting_scribe.ai.minutes_import import MinutesImporter
 from meeting_scribe.audio.device_watch import device_signature
 from meeting_scribe.config import WHISPER_MODEL_SIZES, Settings, default_data_dir, load_settings, update_settings
 from meeting_scribe.gui.meeting_prompt import PromptCard, start_recording_prompt, stop_recording_prompt
@@ -89,7 +90,10 @@ _NO_PREVIOUS_MINUTES = (
     "When this is a recurring meeting — the same title in the same project — the last meeting's minutes "
     "show here."
 )
-_NO_MINUTES = "No minutes have been written for this meeting yet."
+_NO_MINUTES = (
+    "No minutes yet. They appear here once Copilot Studio has written them to the sync folder "
+    "(Settings) — the app checks every minute."
+)
 
 _DOCUMENT_FILETYPES = [
     ("Supported documents", "*.pdf *.docx *.txt *.md *.png *.jpg *.jpeg *.bmp *.tiff"),
@@ -486,6 +490,7 @@ class MeetingScribeApp(tk.Tk):
     _DEVICE_POLL_MS = 2000  # how often device dropdowns check for devices coming and going
     _MEETING_POLL_MS = 2000  # how often to check whether a Teams call has started
     _CLOCK_MS = 500
+    _MINUTES_POLL_MS = 60_000  # how often to look for minutes Copilot Studio has written
     _NAV_LABELS = {
         "record": "●   Record",
         "library": "▤   Library",
@@ -539,6 +544,10 @@ class MeetingScribeApp(tk.Tk):
         self._meeting_work_area: dict | None = None
         if sys.platform == "win32":
             self.after(self._MEETING_POLL_MS, self._poll_teams_meeting)
+
+        self._minutes_importer = MinutesImporter(self.db)
+        self._minutes_check_running = False
+        self.after(1000, self._poll_minutes)
 
     # -- layout / navigation ----------------------------------------------------------------------
 
@@ -676,6 +685,51 @@ class MeetingScribeApp(tk.Tk):
         thread = threading.Thread(target=target, daemon=True)
         self._background_threads.append(thread)
         thread.start()
+
+    # -- minutes from Copilot Studio ---------------------------------------------------------------
+
+    def _poll_minutes(self) -> None:
+        self.check_for_minutes()
+        self.after(self._MINUTES_POLL_MS, self._poll_minutes)
+
+    def check_for_minutes(self, *, report: bool = False) -> None:
+        """Files any new or changed minutes Copilot Studio has written to the sync folder against their
+        meetings (see ai/minutes_import.py), on a background thread since the folder is on OneDrive.
+        With `report`, says how it went even when nothing new turned up."""
+        root = self.settings.copilot_sync_dir
+        if root is None:
+            if report:
+                self.toast("Set a Copilot sync folder in Settings first")
+            return
+        if self._minutes_check_running:
+            return
+        self._minutes_check_running = True
+
+        def worker() -> None:
+            updated, error = [], None
+            try:
+                updated = self._minutes_importer.import_from(root)
+            except Exception as exc:  # a folder problem mustn't stop later checks
+                error = exc
+            try:
+                self.after(0, self._on_minutes_checked, updated, error, report)
+            except (RuntimeError, tk.TclError):
+                pass  # the window closed while checking
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_minutes_checked(self, updated: list[int], error: Exception | None, report: bool) -> None:
+        self._minutes_check_running = False
+        if error is not None:
+            if report:
+                self.toast(f"Couldn't check for minutes: {error}")
+            return
+        if updated:
+            self.library_page.on_minutes_updated(updated)
+            self.record_page.refresh_previous_minutes()
+            self.toast(f"Minutes added for {len(updated)} meeting{'' if len(updated) == 1 else 's'}")
+        elif report:
+            self.toast("No new minutes")
 
     # -- devices ------------------------------------------------------------------------------------
 
@@ -1069,7 +1123,7 @@ class RecordPage(ttk.Frame):
         self.manual_notes_editor.bind("<Control-i>", lambda _e: self._toggle_inline("_"))
         panes.add(notes_card, weight=3)
 
-        # The last occurrence's minutes, for a recurring meeting — see _refresh_previous_minutes.
+        # The last occurrence's minutes, for a recurring meeting — see refresh_previous_minutes.
         minutes_card, minutes = _card(panes, padding=0)
         minutes_header = ttk.Frame(minutes, style="Card.TFrame", borderwidth=0, padding=(14, 8, 10, 4))
         minutes_header.pack(fill="x")
@@ -1094,7 +1148,7 @@ class RecordPage(ttk.Frame):
         body.add(log_card, weight=1)
 
         self.refresh_projects()
-        self._refresh_previous_minutes()
+        self.refresh_previous_minutes()
         self.apply_device_lists(*_enumerate_devices())
         self._poll_audio_levels()
 
@@ -1136,7 +1190,7 @@ class RecordPage(ttk.Frame):
         than on every keystroke — moving a meeting creates the project, which mustn't happen per letter.
         Refreshes the title suggestions and, mid-meeting, moves the meeting to this project."""
         self._refresh_title_suggestions()
-        self._refresh_previous_minutes()
+        self.refresh_previous_minutes()
         session = self.app._session
         project_name = self.project_var.get().strip()
         if session is None or not project_name or project_name == session.project.name:
@@ -1150,9 +1204,9 @@ class RecordPage(ttk.Frame):
         if session is not None:
             session.title = self.title_var.get()
             self.app.db.update_meeting_title(session.meeting_id, session.title)
-        self._refresh_previous_minutes()
+        self.refresh_previous_minutes()
 
-    def _refresh_previous_minutes(self) -> None:
+    def refresh_previous_minutes(self) -> None:
         """Shows the minutes of the last meeting with this project and title — a recurring meeting's
         previous occurrence — so they can be read before and during the next one."""
         session = self.app._session
@@ -1454,7 +1508,7 @@ class RecordPage(ttk.Frame):
         self.manual_notes_editor.focus_set()
         for button in self._format_buttons:
             button.configure(state="normal")
-        self._refresh_previous_minutes()
+        self.refresh_previous_minutes()
 
         # The log isn't cleared: a previous meeting may still be logging its finish-up, and the [title]
         # prefix keeps overlapping meetings' lines apart.
@@ -1752,6 +1806,7 @@ class LibraryPage(ttk.Frame):
             ("Export…", self._export),
             ("Attach document", self._upload_document),
             ("Open folder", self._open_folder),
+            ("Check for minutes", lambda: self.app.check_for_minutes(report=True)),
             ("Delete…", self._delete_meeting),
         ):
             button = ttk.Button(toolbar, text=text, style="Link.TButton", command=command, state="disabled")
@@ -1976,6 +2031,11 @@ class LibraryPage(ttk.Frame):
         elif in_progress:
             self._show_banner(_TRANSCRIBING_AGAIN_NOTICE, retry=False)
         self.detail_notebook.pack(fill="both", expand=True, padx=(8, 2), pady=(0, 2))
+
+    def on_minutes_updated(self, meeting_ids: list[int]) -> None:
+        """Shows freshly imported minutes if one of those meetings is open."""
+        if self._current is not None and self._current.id in meeting_ids:
+            self._show_meeting(self._current)
 
     def _load_documents(self, meeting_id: int | None) -> None:
         self._documents = self.app.db.list_documents_for_meeting(meeting_id) if meeting_id is not None else []

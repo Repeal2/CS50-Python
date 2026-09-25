@@ -68,8 +68,12 @@ Windows' light/dark app setting.
   the meeting, its recording and its attached documents from this PC after asking. A meeting whose transcription didn't
   finish keeps its recording and offers **Retry**.
 - **Pushes each finished meeting to Copilot Studio** as a named file package dropped into a folder
-  OneDrive/SharePoint is already syncing (see "The Copilot push" below). This is one-way: the app doesn't
-  call an AI API and doesn't wait for anything back.
+  OneDrive/SharePoint is already syncing (see "The Copilot push" below). The app doesn't call an AI API
+  and doesn't wait for anything back.
+- **Picks up the minutes Copilot Studio writes back.** Once a minute (and on **Check for minutes** in the
+  Library) it looks in the sync folder's project subfolders for the AI minutes files and files each one
+  against its meeting, where it shows in the Library's **Meeting Minutes** tab and, for a recurring
+  meeting, beside the notes next time (see "Minutes coming back" below).
 
 ## Why it's built this way
 
@@ -102,6 +106,7 @@ src/meeting_scribe/
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
   transcription/jobs.py    # running transcriptions: stage, percentage, estimate — for the Transcriptions page
   ai/copilot_push.py    # one-way, named-file-package drop of a finished meeting to Copilot Studio
+  ai/minutes_import.py  # files the minutes Copilot Studio writes back against their meetings
   storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents, transcription runs
   storage/documents.py  # Text extraction for uploaded PDFs/docx/images/text
   gui/app.py             # Tkinter window: Record, Library, Transcriptions and Settings pages
@@ -255,6 +260,22 @@ owning that side (and whatever Copilot Studio capacity/licensing it needs) is ou
 that's a Power Platform admin/maker task, not something this app depends on to function. If nothing is
 configured to pick the package up at all, the meeting is still fully recorded and saved locally; nothing
 is lost, it just never gets pushed anywhere.
+
+### Minutes coming back
+
+The flow that writes the AI minutes saves them next to the Inbox, one folder per project, named from the
+`done.json` it was triggered by:
+
+```
+<sync folder>/<projectName>/DD-MM-YYYY HH.mm - <projectName> - <meetingTitle> - Minutes.txt
+```
+
+`DD-MM-YYYY` is the meetingID's date reordered; `HH.mm` is UK time when the flow ran. `ai/minutes_import.py`
+matches a file to the meeting with that date, project and title (ignoring case and the characters Windows
+rejects in a file name, and which project folder the file is in). Two same-titled meetings on one day are
+told apart by `HH.mm`: a file belongs to the latest of them that had started by then. If the flow ran more
+than once for a meeting, the newest file wins, and a file edited later is picked up again. A meeting
+renamed or moved to another project after it was pushed no longer matches its minutes.
 
 ## Building the .exe
 
