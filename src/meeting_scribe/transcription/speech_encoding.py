@@ -5,7 +5,9 @@ about 190 KB a second — so even a one-minute meeting is over the 10 MB a singl
 (see runpod_whisperx). Speech recognition and diarization models work at 16 kHz mono anyway, so
 converting to that and encoding as 16 kbps Opus (a codec built for speech) shrinks it roughly a
 hundredfold without losing anything they'd use. Long recordings are still split into chunks of at most
-`max_chunk_seconds`, each a self-contained Ogg file whose timestamps start at zero.
+`max_chunk_seconds`, each a self-contained Ogg file whose timestamps start at zero. Each chunk after the
+first can also repeat the last `overlap_seconds` of the one before it, so a service that labels speakers
+per chunk can have them matched up across chunks by who was talking in the stretch both heard.
 
 Uses PyAV, which faster-whisper already depends on, so this adds no new dependency.
 """
@@ -13,6 +15,7 @@ Uses PyAV, which faster-whisper already depends on, so this adds no new dependen
 from __future__ import annotations
 
 import io
+from collections import deque
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -29,6 +32,8 @@ class EncodedChunk:
     start_seconds: float  # where this chunk starts within the source file
     duration_seconds: float
     data: bytes  # a complete Ogg/Opus file
+    # How much of this chunk's start repeats the end of the previous chunk — 0 for the first.
+    overlap_seconds: float = 0.0
 
     @property
     def mime_type(self) -> str:
@@ -36,10 +41,11 @@ class EncodedChunk:
 
 
 class _ChunkEncoder:
-    def __init__(self, start_sample: int):
+    def __init__(self, start_sample: int, overlap_samples: int = 0):
         import av
 
         self.start_sample = start_sample
+        self.overlap_samples = overlap_samples
         self.samples = 0
         self._buffer = io.BytesIO()
         self._container = av.open(self._buffer, mode="w", format="ogg")
@@ -63,29 +69,62 @@ class _ChunkEncoder:
             start_seconds=self.start_sample / SAMPLE_RATE,
             duration_seconds=self.samples / SAMPLE_RATE,
             data=self._buffer.getvalue(),
+            overlap_seconds=self.overlap_samples / SAMPLE_RATE,
         )
 
 
-def encode_speech_chunks(wav_path: Path, *, max_chunk_seconds: float) -> list[EncodedChunk]:
-    """Decodes `wav_path`, converts it to 16 kHz mono, and encodes it as Opus in consecutive chunks of at
-    most `max_chunk_seconds` each. Streams through the file, so memory use stays small however long the
-    recording is. An empty recording gives an empty list."""
+def encode_speech_chunks(
+    wav_path: Path, *, max_chunk_seconds: float, overlap_seconds: float = 0.0
+) -> list[EncodedChunk]:
+    """Decodes `wav_path`, converts it to 16 kHz mono, and encodes it as Opus in consecutive chunks of
+    `max_chunk_seconds` of new audio each, every chunk after the first preceded by the last
+    `overlap_seconds` of the previous one. Streams through the file, so memory use stays small however
+    long the recording is. An empty recording gives an empty list."""
     import av
 
     samples_per_chunk = max(1, round(max_chunk_seconds * SAMPLE_RATE) // _FRAME_SAMPLES) * _FRAME_SAMPLES
+    overlap_samples = min(max(0, round(overlap_seconds * SAMPLE_RATE)), samples_per_chunk)
     resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
     fifo = av.AudioFifo()
     chunks: list[EncodedChunk] = []
     current: _ChunkEncoder | None = None
     total_samples = 0
+    # The most recent audio, as plain arrays (a frame can't be handed to a second encoder), kept only as
+    # far back as the next chunk will repeat.
+    tail: deque = deque()
+    tail_samples = 0
+
+    def remember(frame) -> None:
+        nonlocal tail_samples
+        samples = frame.to_ndarray().copy()
+        tail.append(samples)
+        tail_samples += samples.shape[-1]
+        while tail and tail_samples - tail[0].shape[-1] >= overlap_samples:
+            tail_samples -= tail.popleft().shape[-1]
+
+    def start_chunk() -> _ChunkEncoder:
+        repeat = min(tail_samples, overlap_samples) if chunks else 0
+        encoder = _ChunkEncoder(total_samples - repeat, overlap_samples=repeat)
+        skip = tail_samples - repeat  # the oldest remembered audio can run past what's repeated
+        for samples in tail:
+            if skip >= samples.shape[-1]:
+                skip -= samples.shape[-1]
+                continue
+            repeated = av.AudioFrame.from_ndarray(samples[:, skip:].copy(), format="s16", layout="mono")
+            repeated.sample_rate = SAMPLE_RATE
+            skip = 0
+            encoder.encode(repeated)
+        return encoder
 
     def encode(frame) -> None:
         nonlocal current, total_samples
         if current is None:
-            current = _ChunkEncoder(total_samples)
+            current = start_chunk()
+        if overlap_samples:
+            remember(frame)
         total_samples += frame.samples
         current.encode(frame)
-        if current.samples >= samples_per_chunk:
+        if current.samples - current.overlap_samples >= samples_per_chunk:
             chunks.append(current.finish())
             current = None
 

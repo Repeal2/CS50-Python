@@ -183,6 +183,7 @@ def test_transcribe_parts_sends_compressed_audio_and_parses_the_result(tmp_path,
 def test_a_long_recording_is_split_into_chunks_placed_on_the_meetings_clock(tmp_path, monkeypatch):
     _env(monkeypatch)
     monkeypatch.setattr(runpod_whisperx, "_MAX_CHUNK_SECONDS", 1.0)
+    monkeypatch.setattr(runpod_whisperx, "_CHUNK_OVERLAP_SECONDS", 0.0)
     audio = tmp_path / "system.wav"
     _write_wav(audio, seconds=2.5)
     runpod = FakeRunpod(
@@ -195,12 +196,105 @@ def test_a_long_recording_is_split_into_chunks_placed_on_the_meetings_clock(tmp_
     lines = transcriber.transcribe_parts([audio], source="system")
 
     assert len(runpod.submitted_payloads) == 3
-    # Each chunk is diarized separately, so its labels are kept apart rather than merged as if the same
-    # SPEAKER_00 in every chunk were one person.
+    # Each chunk is diarized separately and, with no overlap to match them by, later chunks' labels are
+    # kept apart rather than merged as if the same SPEAKER_00 in every chunk were one person.
     assert [(line.timestamp_seconds, line.speaker, line.text) for line in lines] == [
-        (0.2, "SPEAKER_00 (part 1)", "one"),
+        (0.2, "SPEAKER_00", "one"),
         (1.3, "SPEAKER_00 (part 2)", "two"),
         (2.4, "SPEAKER_01 (part 3)", "three"),
+    ]
+
+
+def _timed(*segments):
+    return {
+        "status": "COMPLETED",
+        "output": {
+            "segments": [
+                {"start": start, "end": end, "speaker": speaker, "text": text}
+                for start, end, speaker, text in segments
+            ]
+        },
+    }
+
+
+def test_overlapping_chunks_have_their_speakers_matched_by_who_spoke_in_the_overlap(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setattr(runpod_whisperx, "_MAX_CHUNK_SECONDS", 10.0)
+    monkeypatch.setattr(runpod_whisperx, "_CHUNK_OVERLAP_SECONDS", 6.0)
+    monkeypatch.setattr(runpod_whisperx, "_MIN_SHARED_SPEECH_SECONDS", 1.0)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=16.0, framerate=16000, channels=1)
+    # Chunk 1 covers 0-10 s; chunk 2 covers 4-16 s (so 4-10 s is heard by both) and names the same two
+    # people the other way round, plus someone new.
+    runpod = FakeRunpod(
+        [_timed((0.0, 3.0, "SPEAKER_00", "hello"), (4.0, 6.5, "SPEAKER_01", "hi there"),
+                (7.5, 9.9, "SPEAKER_00", "so, cut o"))],
+        [_timed((0.0, 2.5, "SPEAKER_00", "hi there"), (3.5, 6.5, "SPEAKER_01", "so, cut off mid-sentence"),
+                (8.0, 9.0, "SPEAKER_02", "sorry I'm late"))],
+    )
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
+
+    lines = transcriber.transcribe_parts([audio], source="system")
+
+    assert [(line.timestamp_seconds, line.speaker, line.text) for line in lines] == [
+        (0.0, "SPEAKER_00", "hello"),
+        (4.0, "SPEAKER_01", "hi there"),
+        # The overlap's second half comes from the later chunk, which heard the whole sentence.
+        (7.5, "SPEAKER_00", "so, cut off mid-sentence"),
+        (12.0, "SPEAKER_02 (part 2)", "sorry I'm late"),
+    ]
+
+
+def test_parts_are_placed_where_the_recorder_says_they_started(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    first, second = tmp_path / "system.wav", tmp_path / "system.part2.wav"
+    _write_wav(first, seconds=6.0)
+    _write_wav(second, seconds=2.0)
+    runpod = FakeRunpod(
+        [_completed((2.0, "SPEAKER_00", "first part"))],
+        [_completed((1.0, "SPEAKER_01", "second part"))],
+    )
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
+
+    lines = transcriber.transcribe_parts(
+        [first, second], source="system", start_offsets={first: 0.0, second: 4.5}
+    )
+
+    assert [(line.timestamp_seconds, line.text) for line in lines] == [(2.0, "first part"), (5.5, "second part")]
+
+
+def test_a_segment_is_split_where_its_words_change_speaker():
+    segments = _parse_segments(
+        {
+            "segments": [
+                {
+                    "start": 1.0,
+                    "end": 4.0,
+                    "speaker": "SPEAKER_01",
+                    "text": " Got plans this weekend? Not much.",
+                    "words": [
+                        {"word": "Got", "start": 1.0, "end": 1.2, "speaker": "SPEAKER_01"},
+                        {"word": "plans", "start": 1.2, "end": 1.5, "speaker": "SPEAKER_01"},
+                        {"word": "this", "start": 1.5, "end": 1.7},
+                        {"word": "weekend?", "start": 1.7, "end": 2.1, "speaker": "SPEAKER_01"},
+                        {"word": "Not", "start": 3.0, "end": 3.2, "speaker": "SPEAKER_00"},
+                        {"word": "much.", "start": 3.2, "end": 3.6, "speaker": "SPEAKER_00"},
+                    ],
+                },
+                {
+                    "start": 5.0,
+                    "speaker": "SPEAKER_00",
+                    "text": " One speaker only.",
+                    "words": [{"word": "One", "start": 5.0, "speaker": "SPEAKER_00"}],
+                },
+            ]
+        }
+    )
+
+    assert [(s.start_seconds, s.speaker, s.text) for s in segments] == [
+        (1.0, "SPEAKER_01", "Got plans this weekend?"),
+        (3.0, "SPEAKER_00", "Not much."),
+        (5.0, "SPEAKER_00", "One speaker only."),
     ]
 
 

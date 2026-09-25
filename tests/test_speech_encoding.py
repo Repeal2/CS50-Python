@@ -66,3 +66,20 @@ def test_an_empty_recording_gives_no_chunks(tmp_path):
     _write_tone_wav(path, seconds=0)
 
     assert encode_speech_chunks(path, max_chunk_seconds=60) == []
+
+
+def test_each_later_chunk_repeats_the_end_of_the_one_before(tmp_path):
+    path = tmp_path / "system.wav"
+    _write_tone_wav(path, seconds=2.5)
+
+    chunks = encode_speech_chunks(path, max_chunk_seconds=1.0, overlap_seconds=0.3)
+
+    assert [(c.start_seconds, c.duration_seconds, c.overlap_seconds) for c in chunks] == [
+        (0.0, 1.0, 0.0),
+        (0.7, 1.3, 0.3),
+        (1.7, 0.8, 0.3),
+    ]
+    for chunk in chunks:
+        _codec, _layout, frames, rate = _decode(chunk.data)
+        assert frames[0].pts == 0
+        assert sum(frame.samples for frame in frames) / rate == pytest.approx(chunk.duration_seconds, abs=0.05)

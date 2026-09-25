@@ -60,6 +60,9 @@ class CallAudioDevices:
 
     microphones: tuple[str, ...] = ()
     speakers: tuple[str, ...] = ()
+    # Set only when the call app has more than one microphone open and one of them is Windows' default
+    # communications microphone — the tie-breaker between them.
+    default_microphone: str | None = None
 
 
 def is_call_app_process(pid: int, processes: Mapping[int, tuple[str, int]]) -> bool:
@@ -82,6 +85,7 @@ def call_audio_devices_from(
     sessions: Iterable[AudioSessionInfo],
     processes: Mapping[int, tuple[str, int]],
     own_pid: int,
+    default_microphone: str | None = None,
 ) -> CallAudioDevices | None:
     """The pure half of find_call_audio_devices: which endpoints the call app has *active* sessions on.
     An inactive session is an app that opened the device at some point but isn't streaming now (Teams
@@ -99,7 +103,11 @@ def call_audio_devices_from(
             found.append(session.endpoint_name)
     if not microphones and not speakers:
         return None
-    return CallAudioDevices(microphones=tuple(microphones), speakers=tuple(speakers))
+    return CallAudioDevices(
+        microphones=tuple(microphones),
+        speakers=tuple(speakers),
+        default_microphone=default_microphone if len(microphones) > 1 and default_microphone in microphones else None,
+    )
 
 
 def _same_endpoint(portaudio_name: str, endpoint_name: str) -> bool:
@@ -147,6 +155,25 @@ def _ensure_com() -> None:
     except Exception:
         pass  # already initialized on this thread, in the other threading model — still usable
     _com_ready.done = True
+
+
+def _windows_default_microphone() -> str | None:
+    """The friendly name of Windows' default communications microphone (eCapture, eCommunications) —
+    what a call app's "default" microphone setting follows — or None if there isn't one."""
+    import comtypes
+    from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
+    from pycaw.constants import CLSID_MMDeviceEnumerator
+    from pycaw.pycaw import AudioUtilities
+
+    _ensure_com()
+    enumerator = comtypes.CoCreateInstance(
+        CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_INPROC_SERVER
+    )
+    try:
+        endpoint = enumerator.GetDefaultAudioEndpoint(1, 2)  # eCapture, eCommunications
+        return str(AudioUtilities.CreateDevice(endpoint).FriendlyName) or None
+    except Exception:  # no capture device at all
+        return None
 
 
 def _windows_sessions() -> list[AudioSessionInfo]:
@@ -232,6 +259,7 @@ def _windows_processes() -> Mapping[int, tuple[str, int]]:
 def find_call_audio_devices(
     sessions: Callable[[], Iterable[AudioSessionInfo]] | None = None,
     processes: Callable[[], Mapping[int, tuple[str, int]]] | None = None,
+    default_microphone: Callable[[], str | None] | None = None,
 ) -> CallAudioDevices | None:
     """The microphone and speaker Teams is using right now (see CallAudioDevices), or None if Teams
     isn't using any audio device, this isn't Windows, or Windows couldn't be asked. Never raises: it's
@@ -241,7 +269,13 @@ def find_call_audio_devices(
             return None
         sessions = sessions or _windows_sessions
         processes = processes or _windows_processes
+        default_microphone = default_microphone or _windows_default_microphone
     try:
-        return call_audio_devices_from(sessions(), processes(), os.getpid())
+        current_sessions, current_processes = list(sessions()), processes()
+        found = call_audio_devices_from(current_sessions, current_processes, os.getpid())
+        if found is not None and len(found.microphones) > 1 and default_microphone is not None:
+            # Only asked when it can decide something: Teams with more than one microphone open.
+            found = call_audio_devices_from(current_sessions, current_processes, os.getpid(), default_microphone())
+        return found
     except Exception:
         return None

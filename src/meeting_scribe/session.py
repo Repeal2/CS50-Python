@@ -14,10 +14,10 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
-from meeting_scribe.audio.recorder import Recorder, discover_wav_parts
+from meeting_scribe.audio.recorder import Recorder, discover_wav_parts, load_part_offsets
 from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
 from meeting_scribe.screen.region_picker import RegionTarget
@@ -116,6 +116,7 @@ def _transcribe_system_track(
     local_transcriber: WhisperTranscriber,
     system_paths: Sequence[Path],
     report: Callable[[str], None],
+    system_offsets: Mapping[Path, float] | None = None,
 ) -> tuple[list[TranscriptLine], str]:
     """(lines, engine) for the system-audio track — everyone but the meeting owner. With cloud speaker
     diarization opted into (Settings.diarize_system_audio) it goes to Runpod, so lines carry speaker
@@ -137,10 +138,10 @@ def _transcribe_system_track(
                 huggingface_token=settings.runpod_huggingface_token,
                 on_progress=report,
             )
-            return transcriber.transcribe_parts(system_paths, source="system"), "runpod"
+            return transcriber.transcribe_parts(system_paths, source="system", start_offsets=system_offsets), "runpod"
         except RunpodWhisperXError as error:
             report(f"Cloud speaker diarization failed ({error}) — transcribing on this PC instead.")
-    return local_transcriber.transcribe_parts(system_paths, source="system"), "local"
+    return local_transcriber.transcribe_parts(system_paths, source="system", start_offsets=system_offsets), "local"
 
 
 def _parts_with_audio(paths: Sequence[Path], label: str, report: Callable[[str], None]) -> tuple[Path, ...]:
@@ -166,6 +167,8 @@ def _finish_meeting(
     system_paths: Sequence[Path],
     screen_events: Sequence[ScreenTextEvent],
     report: Callable[[str], None],
+    mic_offsets: Mapping[Path, float] | None = None,
+    system_offsets: Mapping[Path, float] | None = None,
 ) -> str:
     """The shared back half of finishing a meeting — MeetingSession.stop() and
     retry_meeting_transcription() both end here: transcribe both tracks, save every line, push the
@@ -181,8 +184,10 @@ def _finish_meeting(
         if warning is not None:
             report(warning)
         try:
-            mic_lines = transcriber.transcribe_parts(mic_paths, source="mic")
-            system_lines, system_engine = _transcribe_system_track(settings, transcriber, system_paths, report)
+            mic_lines = transcriber.transcribe_parts(mic_paths, source="mic", start_offsets=mic_offsets)
+            system_lines, system_engine = _transcribe_system_track(
+                settings, transcriber, system_paths, report, system_offsets
+            )
         finally:
             transcriber.unload()
     report("Transcription complete.")
@@ -424,6 +429,8 @@ class MeetingSession:
             transcriber=self._transcriber,
             mic_paths=recorded.mic_paths,
             system_paths=recorded.system_paths,
+            mic_offsets=recorded.mic_offsets,
+            system_offsets=recorded.system_offsets,
             screen_events=self._screen_text.snapshot(),
             report=report,
         )
@@ -499,6 +506,8 @@ def _retry_meeting_transcription(
         transcriber=WhisperTranscriber(model_size=settings.whisper_model_size),
         mic_paths=mic_paths,
         system_paths=system_paths,
+        mic_offsets=load_part_offsets(meeting_dir / "mic.wav"),
+        system_offsets=load_part_offsets(meeting_dir / "system.wav"),
         screen_events=load_screen_text_events(meeting_dir),
         report=report,
     )

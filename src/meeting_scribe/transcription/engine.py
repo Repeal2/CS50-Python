@@ -10,7 +10,7 @@ import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 SOURCE_LABELS = {"mic": "You", "system": "Others", "screen_ocr": "Screen"}
 
@@ -163,23 +163,48 @@ class WhisperTranscriber:
             if segment.text.strip()
         ]
 
-    def transcribe_parts(self, audio_paths: Sequence[Path], source: str) -> list[TranscriptLine]:
+    def transcribe_parts(
+        self,
+        audio_paths: Sequence[Path],
+        source: str,
+        start_offsets: Mapping[Path, float] | None = None,
+    ) -> list[TranscriptLine]:
         """Transcribes one capture stream that may have been written as several WAV parts.
 
-        A WAV file can't hold more than a couple of hours of audio before its header runs out of room,
-        so a long meeting rolls over into numbered parts (see audio.recorder). Whisper timestamps each
-        part from its own zero; shifting every part by the total duration of the ones before it puts
-        the whole stream back on the meeting's clock, which is what the merge into one transcript
-        assumes."""
+        A stream rolls over into a new part whenever its device changes, and when a long meeting would
+        overflow a WAV header (see audio.recorder). Whisper timestamps each part from its own zero, so
+        each part is shifted to where it started on the meeting's clock — see part_start_offsets."""
         lines: list[TranscriptLine] = []
-        offset_seconds = 0.0
-        for audio_path in audio_paths:
+        for audio_path, offset_seconds in zip(audio_paths, part_start_offsets(audio_paths, start_offsets)):
             lines.extend(
                 TranscriptLine(line.timestamp_seconds + offset_seconds, line.source, line.text)
                 for line in self.transcribe(audio_path, source=source)
             )
-            offset_seconds += wav_duration_seconds(audio_path)
         return lines
+
+
+def part_start_offsets(
+    audio_paths: Sequence[Path], known: Mapping[Path, float] | None = None
+) -> list[float]:
+    """Where each WAV part of one capture stream starts on the meeting's clock, in seconds.
+
+    `known` is what the recorder noted as each part opened (see audio.recorder.load_part_offsets) — the
+    time that had actually passed since the meeting started. That's the only trustworthy answer: a part's
+    own length says how much audio it holds, not how long it was recording for, and the two part ways
+    whenever a device delivers more or less audio than real time (a Bluetooth headset changing profile,
+    a driver's own resampling). Adding up part lengths instead used to push every line after such a part
+    — sometimes by hours — past the end of the other track, so a whole track landed at the bottom of the
+    transcript. A part the recorder didn't note (a meeting recorded before it did) falls back to starting
+    where the previous one ended."""
+    offsets: list[float] = []
+    next_start = 0.0
+    for audio_path in audio_paths:
+        start = known.get(Path(audio_path)) if known else None
+        if start is None:
+            start = next_start
+        offsets.append(start)
+        next_start = start + wav_duration_seconds(audio_path)
+    return offsets
 
 
 def wav_duration_seconds(path: Path) -> float:

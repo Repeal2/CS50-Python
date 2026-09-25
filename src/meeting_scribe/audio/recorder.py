@@ -10,17 +10,20 @@ This module can be *imported* on any platform (the pyaudiowpatch import is defer
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import threading
 import time
 import wave
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
 from meeting_scribe.audio.call_devices import CallAudioDevices, find_call_audio_devices, match_portaudio_device
+from meeting_scribe.audio.device_picker import default_input_device_info, full_device_name, input_device_infos
 from meeting_scribe.audio.device_watch import device_signature
 
 CHUNK_FRAMES = 1024
@@ -109,6 +112,15 @@ _SYSTEM_SEARCH_INTERVAL_SECONDS = 4.0
 _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS = 10.0
 # While on the laptop microphone, how often the headset is checked for having come back to life.
 _HEADSET_RECHECK_SECONDS = 15.0
+# How loud a headset has to be, in a probe, before recording moves *onto* it: someone talking into it
+# (speech into a headset mic lands around -30 to -20 dBFS). Any non-zero sample at all only shows the
+# headset is switched on — one in a bag, powered up and still paired, hands over its noise floor and the
+# odd rustle all day — so that alone is only ever used to decide the headset being recorded isn't dead.
+_HEADSET_IN_USE_DBFS = _ACTIVITY_DBFS
+# Once Teams has said which microphone it's using, how long a gap in its answers (a device renegotiating,
+# the lobby before a breakout room) is ridden out on that microphone rather than guessed through.
+# While Teams is still playing the call, its answer is kept however long the gap.
+_CALL_APP_MICROPHONE_MEMORY_SECONDS = 60.0
 # How a headset microphone is recognized by name when Settings doesn't name one. Windows' own names for
 # them ("Headset Microphone (…)", "Headset (… Hands-Free)") nearly always say so.
 _HEADSET_NAME_HINTS = ("headset", "headphone", "hands-free", "handsfree", "earbud", "earphone", "airpods")
@@ -365,6 +377,31 @@ def describe_input_problems(mic: StreamHealth, system: StreamHealth) -> tuple[st
     return tuple(problem for problem in problems if problem is not None)
 
 
+# A part holding this much more audio than the time it was open for came from a device delivering audio
+# faster than real time. Transcription places the next part by the clock regardless (see
+# transcription.engine.part_start_offsets), but that part's own lines drift, so it's worth saying.
+_PART_EXCESS_AUDIO_SECONDS = 5.0
+_PART_EXCESS_AUDIO_RATIO = 1.1
+
+
+def describe_part_timing(label: str, timing: PartTiming) -> str | None:
+    """A ready-to-show sentence if one WAV part holds clearly more audio than the time it was recording
+    for, else None."""
+    wall = max(0.0, timing.ended_seconds - timing.started_seconds)
+    if timing.audio_seconds <= wall * _PART_EXCESS_AUDIO_RATIO + _PART_EXCESS_AUDIO_SECONDS:
+        return None
+    return (
+        f"{label}: {timing.path.name} holds {_format_seconds(timing.audio_seconds)} of audio but was only "
+        f"recording for {_format_seconds(wall)} — the device delivered audio faster than real time, so "
+        "timestamps within that part may be off."
+    )
+
+
+def _format_seconds(seconds: float) -> str:
+    minutes, secs = divmod(int(round(seconds)), 60)
+    return f"{minutes} min {secs:02d} s" if minutes else f"{secs} s"
+
+
 @dataclass(frozen=True)
 class InputCheck:
     """The result of listening to a device for a few seconds before a meeting starts (see
@@ -416,13 +453,18 @@ class InputCheck:
 
 
 def _find_input_device(pyaudio_instance, name: str | None) -> dict | None:
-    """The input device Windows currently calls `name`, or None if nothing answers to it anymore —
-    device names come and go with docks, USB headsets and driver updates."""
+    """The WASAPI input device Windows currently calls `name` (see device_picker.input_device_infos), or
+    None if nothing answers to it anymore — device names come and go with docks, USB headsets and driver
+    updates. A name cut off at 31 characters (saved from MME's list by an older version) still finds its
+    device."""
     if not name:
         return None
-    for index in range(pyaudio_instance.get_device_count()):
-        info = pyaudio_instance.get_device_info_by_index(index)
-        if info.get("name") == name and info.get("maxInputChannels", 0) > 0:
+    infos = input_device_infos(pyaudio_instance)
+    for info in infos:
+        if info.get("name") == name:
+            return info
+    for info in infos:
+        if _same_device(str(info.get("name", "")), name):
             return info
     return None
 
@@ -445,7 +487,7 @@ def check_input_device(device_name: str | None = None, seconds: float = 3.0) -> 
     try:
         device_info = _find_input_device(pyaudio_instance, device_name)
         if device_info is None:
-            device_info = pyaudio_instance.get_default_input_device_info()
+            device_info = default_input_device_info(pyaudio_instance)
         monitor = _StreamActivityMonitor()
         stream = pyaudio_instance.open(
             format=pyaudio.paInt16,
@@ -662,6 +704,12 @@ class _SegmentedWavWriter:
     same writer to a freshly spawned capture thread while the old one is still shutting down — if the old
     thread's stream.read() is slow to notice its stop event, both threads could otherwise call write()/
     close() on the same underlying wave.Wave_write object at once, which isn't itself thread-safe.
+
+    `clock`, if given, says how many seconds have passed since the meeting started. Each part notes the
+    time it opened, in `part_timings` and in a small JSON file beside the audio (see
+    part_offsets_path/load_part_offsets), so transcription can put every part where it really began
+    rather than where the previous part's audio happened to run out — see
+    transcription.engine.part_start_offsets.
     """
 
     def __init__(
@@ -671,8 +719,11 @@ class _SegmentedWavWriter:
         sample_width: int,
         framerate: int,
         max_data_bytes: int = MAX_WAV_DATA_BYTES,
+        clock: Callable[[], float] | None = None,
     ):
         self._base_path = Path(base_path)
+        self._clock = clock
+        self._timings: list[PartTiming] = []
         self._channels = channels
         self._sample_width = sample_width
         self._framerate = framerate
@@ -686,6 +737,16 @@ class _SegmentedWavWriter:
     @property
     def paths(self) -> tuple[Path, ...]:
         return tuple(self._paths)
+
+    @property
+    def part_timings(self) -> tuple[PartTiming, ...]:
+        """When each part opened and how much audio it holds — the last one as of now. Empty without a
+        `clock`."""
+        with self._lock:
+            timings = list(self._timings)
+            if timings and self._wav_file is not None:
+                timings[-1] = self._current_timing()
+            return tuple(timings)
 
     def write(self, data: bytes) -> None:
         if not data:
@@ -734,12 +795,65 @@ class _SegmentedWavWriter:
         self._wav_file = wav_file
         self._bytes_in_part = 0
         self._paths.append(path)
+        if self._clock is not None:
+            now = self._clock()
+            self._timings.append(PartTiming(path, now, now, 0.0))
+            self._save_offsets()
+
+    def _current_timing(self) -> PartTiming:
+        bytes_per_second = self._channels * self._sample_width * self._framerate
+        audio_seconds = self._bytes_in_part / bytes_per_second if bytes_per_second else 0.0
+        return replace(self._timings[-1], ended_seconds=self._clock(), audio_seconds=audio_seconds)
 
     def _close_current_part(self) -> None:
+        if self._wav_file is not None and self._timings:
+            self._timings[-1] = self._current_timing()
         wav_file, self._wav_file = self._wav_file, None
         self._bytes_in_part = 0
         if wav_file is not None:
             wav_file.close()
+
+    def _save_offsets(self) -> None:
+        # Written whole each time a part opens (a handful of lines), via a temporary file so a crash
+        # mid-write can't leave a half-written one behind for a retry to trip over.
+        target = part_offsets_path(self._base_path)
+        temporary = target.with_name(target.name + ".tmp")
+        record = {"parts": [{"file": t.path.name, "start_seconds": round(t.started_seconds, 3)} for t in self._timings]}
+        try:
+            temporary.write_text(json.dumps(record), encoding="utf-8")
+            os.replace(temporary, target)
+        except OSError:
+            pass  # without it, a retry falls back to adding up part lengths; the live transcript is unaffected
+
+
+@dataclass(frozen=True)
+class PartTiming:
+    """One WAV part of a capture stream on the meeting's clock: when it opened and closed (seconds since
+    the meeting started), and how many seconds of audio it holds."""
+
+    path: Path
+    started_seconds: float
+    ended_seconds: float
+    audio_seconds: float
+
+
+def part_offsets_path(base_path: Path) -> Path:
+    """Where _SegmentedWavWriter notes each part's start time: "mic.wav" -> "mic.parts.json"."""
+    base_path = Path(base_path)
+    return base_path.with_name(f"{base_path.stem}.parts.json")
+
+
+def load_part_offsets(base_path: Path) -> dict[Path, float]:
+    """The start time of each part of the stream whose first part is `base_path`, as noted while it was
+    recording — {} for a meeting recorded before that was noted, or if the note can't be read."""
+    base_path = Path(base_path)
+    try:
+        record = json.loads(part_offsets_path(base_path).read_text(encoding="utf-8"))
+        return {
+            base_path.with_name(str(part["file"])): float(part["start_seconds"]) for part in record["parts"]
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
 
 
 def discover_wav_parts(base_path: Path) -> tuple[Path, ...]:
@@ -777,6 +891,10 @@ class RecordedAudio:
     system_paths: tuple[Path, ...]
     started_at_monotonic: float
     notices: tuple[str, ...] = ()
+    # Where each part started on the meeting's clock (see _SegmentedWavWriter), for
+    # transcription.engine.part_start_offsets.
+    mic_offsets: dict[Path, float] = field(default_factory=dict)
+    system_offsets: dict[Path, float] = field(default_factory=dict)
 
 
 class Recorder:
@@ -864,6 +982,8 @@ class Recorder:
         self._auto_thread: threading.Thread | None = None
         self._next_system_search = 0.0
         self._next_headset_check = 0.0
+        # When Teams last said which microphone it was using — see _auto_select_microphone.
+        self._call_app_microphone_at: float | None = None
         # Held while a probe has streams open on self._pyaudio, so reload_devices() can't terminate it
         # under them. Never held while taking _lifecycle_lock, so the two can't deadlock.
         self._probe_lock = threading.Lock()
@@ -941,13 +1061,10 @@ class Recorder:
             if call_mic != self._mic_device_name:
                 self._mic_device_name = call_mic
                 self._record_switch(f"Microphone set to {call_mic!r} — Teams is using it.")
-        elif self._auto_mic:
-            # The preferred headset to begin with; the automation's first check, straight after start,
-            # listens to every connected headset and moves to one that's live if this one isn't.
-            headsets = self._connected_headsets()
-            if headsets and headsets[0] != self._mic_device_name:
-                self._mic_device_name = headsets[0]
-                self._record_switch(f"Microphone set to {headsets[0]!r} — a headset is connected.")
+        # Without an answer from Teams, recording starts on the microphone chosen in Settings. It used to
+        # start on any connected headset, which is how a meeting taken on the laptop's microphone ended
+        # up recording a headset left switched on in a bag; the automation's first check, straight after
+        # start, moves to a headset only if someone is actually talking into it.
         if call_speaker is not None and call_speaker != self._system_device_name:
             self._system_device_name = call_speaker
             self._record_switch(f"System audio set to {call_speaker!r} — Teams is playing the call through it.")
@@ -958,7 +1075,7 @@ class Recorder:
 
         self._mic_writer = _SegmentedWavWriter(
             self._mic_path, int(mic_info["maxInputChannels"]), SAMPLE_WIDTH_BYTES,
-            int(mic_info["defaultSampleRate"]),
+            int(mic_info["defaultSampleRate"]), clock=self._meeting_clock,
         )
         self._mic_thread = self._spawn_capture_thread(
             pyaudio, mic_info, self._mic_writer, "mic_level", self._mic_monitor, "Microphone",
@@ -967,7 +1084,7 @@ class Recorder:
 
         self._system_writer = _SegmentedWavWriter(
             self._system_path, int(system_info["maxInputChannels"]), SAMPLE_WIDTH_BYTES,
-            int(system_info["defaultSampleRate"]),
+            int(system_info["defaultSampleRate"]), clock=self._meeting_clock,
         )
         self._system_thread = self._spawn_capture_thread(
             pyaudio, system_info, self._system_writer, "system_level", self._system_monitor,
@@ -1201,6 +1318,12 @@ class Recorder:
             names = [device.name for device in input_devices_from(self._pyaudio)]
         except Exception:
             return None
+        if call.default_microphone is not None:
+            # Teams has more than one microphone open, and one of them is Windows' default for calls —
+            # the one Teams' own "Microphone" setting follows unless told otherwise.
+            chosen = match_portaudio_device(call.default_microphone, names)
+            if chosen is not None:
+                return chosen
         return self._pick_call_device(call.microphones, names, self._mic_active_device_name)
 
     def _call_app_loopback(self, call: CallAudioDevices | None) -> str | None:
@@ -1268,13 +1391,24 @@ class Recorder:
             return
         active = self._mic_active_device_name
         with self._probe_lock:
-            target = self._call_app_input(self._call_app_devices(now))
+            call = self._call_app_devices(now)
+            target = self._call_app_input(call)
         if target is not None:
             # Teams says which microphone it has open, which beats any guess made from names or levels —
             # including a headset that isn't called one, or a laptop mic Teams was deliberately set to.
+            self._call_app_microphone_at = now
             if (active is None or not _same_device(active, target)) and not self._watch_stop_event.is_set():
                 self.switch_mic_device(target, reason="Teams is using this microphone", automatic=True)
             return
+        if self._call_app_microphone_at is not None:
+            if call is not None:
+                self._call_app_microphone_at = now  # still in the call: the gap hasn't started yet
+            if now - self._call_app_microphone_at < _CALL_APP_MICROPHONE_MEMORY_SECONDS:
+                # Teams named a microphone earlier and has only stopped saying so for now — still
+                # playing the call, or only briefly silent. Guessing from headsets here is how a single
+                # missed answer used to move the recording onto a headset in a bag, and back again on
+                # the next one.
+                return
         silent_for = self.mic_health().seconds_without_signal
         active_is_dead = silent_for is not None and silent_for >= _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS
         with self._probe_lock:
@@ -1284,15 +1418,18 @@ class Recorder:
             from meeting_scribe.audio.device_picker import input_devices_from
 
             names = [device.name for device in input_devices_from(pyaudio_instance)]
-            headsets = find_headset_microphones(names, self._headset_microphone_name)
+            headsets = find_headset_microphones(names, full_device_name(self._headset_microphone_name, names))
             if not headsets:
                 return
             try:
-                default_name = pyaudio_instance.get_default_input_device_info().get("name")
+                default_name = default_input_device_info(pyaudio_instance).get("name")
             except Exception:  # no default input at all
                 default_name = None
             fallback = choose_fallback_microphone(
-                names, configured=self._configured_mic_name, default_name=default_name, headsets=headsets
+                names,
+                configured=full_device_name(self._configured_mic_name, names),
+                default_name=default_name,
+                headsets=headsets,
             )
             on_headset = active is not None and any(_same_device(active, h) for h in headsets)
             if starting:
@@ -1311,9 +1448,13 @@ class Recorder:
                 probes = _probe_devices(
                     pyaudio_instance, self._pyaudio_module, infos, _PROBE_SECONDS, self._watch_stop_event
                 )
-                live_headsets = [probe.name for probe in probes if probe.heard_signal]
-                if starting and on_headset and not any(_same_device(active, h) for h in live_headsets):
+                switched_on = [probe.name for probe in probes if probe.heard_signal]
+                if starting and on_headset and not any(_same_device(active, h) for h in switched_on):
                     active_is_dead = True
+                # Only a headset someone is talking into is worth moving to — see _HEADSET_IN_USE_DBFS.
+                live_headsets = [
+                    probe.name for probe in probes if probe.heard_signal and probe.peak_dbfs >= _HEADSET_IN_USE_DBFS
+                ]
         choice = next_microphone(
             active=active,
             headsets=headsets,
@@ -1324,22 +1465,13 @@ class Recorder:
         if choice is None or not self._auto_mic or self._watch_stop_event.is_set():
             return
         if any(_same_device(choice, h) for h in headsets):
-            reason = "that headset is connected and picking up sound"
+            reason = "someone is talking into that headset"
             if on_headset:
                 reason = "the headset in use isn't picking anything up, and this one is"
         else:
             reason = "no headset is picking anything up (muted, or switched off?)"
             self._next_headset_check = now + _HEADSET_RECHECK_SECONDS
         self.switch_mic_device(choice, reason=reason, automatic=True)
-
-    def _connected_headsets(self) -> list[str]:
-        from meeting_scribe.audio.device_picker import input_devices_from
-
-        try:
-            names = [device.name for device in input_devices_from(self._pyaudio)]
-        except Exception:
-            return []
-        return find_headset_microphones(names, self._headset_microphone_name)
 
     def _safe_device_signature(self):
         # Swallows everything: this is a background poll, not something a transient enumeration hiccup
@@ -1512,11 +1644,19 @@ class Recorder:
         # front of whoever reads the finished meeting, who wasn't necessarily watching at the time.
         for problem in self.input_problems():
             self._record_notice(problem)
+        for label, writer in (("Microphone", self._mic_writer), ("System audio", self._system_writer)):
+            if writer is not None:
+                for timing in writer.part_timings:
+                    problem = describe_part_timing(label, timing)
+                    if problem is not None:
+                        self._record_notice(problem)
         return RecordedAudio(
             mic_paths=self._written_paths(self._mic_writer, self._mic_path),
             system_paths=self._written_paths(self._system_writer, self._system_path),
             started_at_monotonic=self._started_at,
             notices=self.capture_notices(),
+            mic_offsets=self._written_offsets(self._mic_writer),
+            system_offsets=self._written_offsets(self._system_writer),
         )
 
     def capture_notices(self) -> tuple[str, ...]:
@@ -1537,6 +1677,14 @@ class Recorder:
         are behaving. Recomputed on every call rather than latched, so a microphone that comes back to
         life (the user unmutes it, or picks the right device next meeting) stops being reported."""
         return describe_input_problems(self.mic_health(), self.system_health())
+
+    def _meeting_clock(self) -> float:
+        """Seconds since start() — the clock every WAV part's start time is noted on."""
+        return time.monotonic() - self._started_at if self._started_at is not None else 0.0
+
+    @staticmethod
+    def _written_offsets(writer: _SegmentedWavWriter | None) -> dict[Path, float]:
+        return {} if writer is None else {t.path: t.started_seconds for t in writer.part_timings}
 
     @staticmethod
     def _written_paths(writer: _SegmentedWavWriter | None, fallback: Path) -> tuple[Path, ...]:
@@ -1569,7 +1717,7 @@ class Recorder:
         # because a headset was left at home — but doing it silently is how someone ends up with an hour
         # of a laptop's array microphone when they thought they were on a headset. This is the one
         # "wrong input device" case that needs no guesswork at all to detect, so it's stated outright.
-        fallback = self._pyaudio.get_default_input_device_info()
+        fallback = default_input_device_info(self._pyaudio)
         if name:
             self._record_notice(
                 f"Microphone {name!r} isn't available — recording from {fallback['name']!r} "

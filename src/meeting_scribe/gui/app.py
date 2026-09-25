@@ -960,7 +960,16 @@ class RecordPage(ttk.Frame):
     # -- audio ----------------------------------------------------------------------------------------
 
     def apply_device_lists(self, input_devices, loopback_devices) -> None:
-        self.mic_combo["values"] = _device_choices([d.name for d in input_devices], self.mic_var.get())
+        from meeting_scribe.audio.device_picker import full_device_name
+
+        input_names = [d.name for d in input_devices]
+        # A microphone saved by an older version under MME's cut-off name: show and keep its full one.
+        upgraded = full_device_name(self.mic_var.get(), input_names)
+        if upgraded != self.mic_var.get():
+            self.mic_var.set(upgraded)
+            if self.app.settings.mic_device_name is not None:
+                self.app.settings = update_settings(self.app.settings, mic_device_name=upgraded)
+        self.mic_combo["values"] = _device_choices(input_names, self.mic_var.get())
         self.system_combo["values"] = _device_choices([d.name for d in loopback_devices], self.system_var.get())
 
     def _on_devices_changed(self, _event=None) -> None:

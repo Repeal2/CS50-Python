@@ -23,8 +23,12 @@ from meeting_scribe.audio.recorder import (
     _SILENT_DBFS,
     _StreamActivityMonitor,
     check_input_device,
+    PartTiming,
     describe_input_problems,
+    describe_part_timing,
     discover_wav_parts,
+    load_part_offsets,
+    part_offsets_path,
 )
 
 
@@ -220,6 +224,67 @@ def test_stop_reports_every_part_that_was_recorded(tmp_path):
     assert [path.name for path in recorded.mic_paths] == ["mic.wav", "mic.part2.wav"]
     # No capture thread ever ran for system audio here, so it falls back to the plain single path.
     assert recorded.system_paths == (tmp_path / "system.wav",)
+
+
+class _FakeClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def test_writer_notes_when_each_part_started_on_the_meetings_clock(tmp_path):
+    clock = _FakeClock()
+    writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000, clock=clock)
+    writer.write(b"\x00\x00" * 16000)  # 1 s of audio...
+    clock.now = 125.0  # ...in a part that was open for 125 s (a device delivering too little)
+    writer.start_new_part(1, 16000)
+    writer.write(b"\x00\x00" * 8000)
+    clock.now = 130.0
+    writer.close()
+
+    assert [(t.path.name, t.started_seconds, t.ended_seconds, t.audio_seconds) for t in writer.part_timings] == [
+        ("mic.wav", 0.0, 125.0, 1.0),
+        ("mic.part2.wav", 125.0, 130.0, 0.5),
+    ]
+    # Saved beside the audio, so a retried transcription places the parts the same way.
+    assert part_offsets_path(tmp_path / "mic.wav") == tmp_path / "mic.parts.json"
+    assert load_part_offsets(tmp_path / "mic.wav") == {tmp_path / "mic.wav": 0.0, tmp_path / "mic.part2.wav": 125.0}
+
+
+def test_load_part_offsets_is_empty_for_a_meeting_recorded_before_they_were_noted(tmp_path):
+    assert load_part_offsets(tmp_path / "mic.wav") == {}
+    part_offsets_path(tmp_path / "mic.wav").write_text("not json", encoding="utf-8")
+    assert load_part_offsets(tmp_path / "mic.wav") == {}
+
+
+def test_a_part_holding_more_audio_than_time_passed_is_reported(tmp_path):
+    inflated = PartTiming(tmp_path / "mic.wav", started_seconds=0.0, ended_seconds=15.0, audio_seconds=6360.0)
+    normal = PartTiming(tmp_path / "mic.part2.wav", started_seconds=15.0, ended_seconds=5400.0, audio_seconds=5399.5)
+
+    assert describe_part_timing("Microphone", normal) is None
+    assert describe_part_timing("Microphone", inflated) == (
+        "Microphone: mic.wav holds 106 min 00 s of audio but was only recording for 15 s — the device "
+        "delivered audio faster than real time, so timestamps within that part may be off."
+    )
+
+
+def test_stop_returns_each_parts_start_time(tmp_path):
+    recorder = Recorder(tmp_path)
+    recorder._started_at = 0.0
+    clock = _FakeClock()
+    recorder._mic_writer = _SegmentedWavWriter(tmp_path / "mic.wav", 1, SAMPLE_WIDTH_BYTES, 16000, clock=clock)
+    recorder._mic_writer.write(b"\x00\x00" * 160)
+    clock.now = 42.0
+    recorder._mic_writer.start_new_part(1, 16000)
+    recorder._mic_writer.write(b"\x00\x00" * 160)
+    recorder._mic_writer.close()
+
+    recorded = recorder.stop()
+
+    assert recorded.mic_offsets == {tmp_path / "mic.wav": 0.0, tmp_path / "mic.part2.wav": 42.0}
+    assert recorded.system_offsets == {}
 
 
 class _FakeStream:

@@ -87,3 +87,22 @@ def test_a_failure_asking_windows_means_cannot_tell():
 def test_every_device_teams_has_open_is_reported_once():
     sessions = [_session(True, HEADSET_MIC, 10), _session(True, LAPTOP_MIC, 11), _session(True, HEADSET_MIC, 11)]
     assert call_audio_devices_from(sessions, PROCESSES, OWN_PID).microphones == (HEADSET_MIC, LAPTOP_MIC)
+
+
+def test_with_two_microphones_open_windows_default_for_calls_is_noted():
+    sessions = [_session(True, HEADSET_MIC, 10), _session(True, LAPTOP_MIC, 11)]
+
+    found = find_call_audio_devices(
+        sessions=lambda: sessions, processes=lambda: PROCESSES, default_microphone=lambda: LAPTOP_MIC
+    )
+
+    assert found.microphones == (HEADSET_MIC, LAPTOP_MIC)
+    assert found.default_microphone == LAPTOP_MIC
+
+
+def test_the_default_microphone_is_only_noted_when_it_decides_something():
+    one = [_session(True, HEADSET_MIC, 10)]
+    assert call_audio_devices_from(one, PROCESSES, OWN_PID, LAPTOP_MIC).default_microphone is None
+    two = [_session(True, HEADSET_MIC, 10), _session(True, LAPTOP_MIC, 11)]
+    # Windows' default isn't one Teams has open: no tie-breaker.
+    assert call_audio_devices_from(two, PROCESSES, OWN_PID, "USB Microphone").default_microphone is None

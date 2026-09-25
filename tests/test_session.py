@@ -87,7 +87,7 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
 
         transcriber_instance = MockTranscriber.return_value
 
-        def fake_transcribe(paths, source):
+        def fake_transcribe(paths, source, start_offsets=None):
             if source == "mic":
                 return [TranscriptLine(1.0, "mic", "let's get started")]
             return [TranscriptLine(2.0, "system", "sounds good")]
@@ -138,7 +138,7 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
             system_paths=(tmp_path / "system.wav",),
             started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source: (
+        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None: (
             [TranscriptLine(1.0, "mic", "let's get started")]
             if source == "mic"
             else [TranscriptLine(2.0, "system", "sounds could")]  # local Whisper, mishearing a little
@@ -186,11 +186,11 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
         kwargs["on_progress"]("Runpod job queued.")
         assert progress[-1] == "Runpod job queued."
         MockRunpod.return_value.transcribe_parts.assert_called_once_with(
-            recorder_instance.stop.return_value.system_paths, source="system"
+            recorder_instance.stop.return_value.system_paths, source="system", start_offsets={}
         )
         # Only the mic track was transcribed locally — the system track isn't transcribed twice.
         assert MockTranscriber.return_value.transcribe_parts.call_args_list == [
-            (((tmp_path / "mic.wav",),), {"source": "mic"}),
+            (((tmp_path / "mic.wav",),), {"source": "mic", "start_offsets": {}}),
         ]
         assert "SPEAKER_00: sounds good" in result
         assert "sounds could" not in result
@@ -215,7 +215,7 @@ def test_session_falls_back_to_local_transcription_when_cloud_diarization_fails(
             started_at_monotonic=0.0,
         )
 
-        def fake_transcribe(paths, source):
+        def fake_transcribe(paths, source, start_offsets=None):
             if source == "mic":
                 return [TranscriptLine(1.0, "mic", "let's get started")]
             return [TranscriptLine(2.0, "system", "sounds good")]
@@ -733,7 +733,7 @@ def test_session_transcribes_every_recorded_part(tmp_path):
             session.start()
             session.stop()
 
-            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic")
+            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic", start_offsets={})
 
 
 def _stuck_meeting(settings: Settings, db: Database, project_name="Test Project", title="Kickoff"):
@@ -753,7 +753,7 @@ def _stuck_meeting(settings: Settings, db: Database, project_name="Test Project"
 def test_retry_transcribes_recorded_audio_and_finishes_the_meeting(tmp_path):
     with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
 
-        def fake_transcribe(paths, source):
+        def fake_transcribe(paths, source, start_offsets=None):
             if source == "mic":
                 return [TranscriptLine(1.0, "mic", "let's get started")]
             return [TranscriptLine(2.0, "system", "sounds good")]
@@ -827,7 +827,61 @@ def test_retry_transcribes_every_recorded_part(tmp_path):
             retry_meeting_transcription(settings, db, meeting_id)
 
             mic_paths = (meeting_dir / "mic.wav", meeting_dir / "mic.part2.wav")
-            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic")
+            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic", start_offsets={})
+
+
+def test_retry_places_parts_where_the_recording_noted_they_started(tmp_path):
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+
+        from meeting_scribe.session import retry_meeting_transcription
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            project, meeting_id = _stuck_meeting(settings, db)
+            meeting_dir = settings.meeting_dir(meeting_id)
+            (meeting_dir / "mic.part2.wav").write_bytes(b"more fake mic audio")
+            (meeting_dir / "mic.parts.json").write_text(
+                '{"parts": [{"file": "mic.wav", "start_seconds": 0.0}, {"file": "mic.part2.wav", "start_seconds": 95.5}]}',
+                encoding="utf-8",
+            )
+
+            retry_meeting_transcription(settings, db, meeting_id)
+
+            mic_paths = (meeting_dir / "mic.wav", meeting_dir / "mic.part2.wav")
+            MockTranscriber.return_value.transcribe_parts.assert_any_call(
+                mic_paths,
+                source="mic",
+                start_offsets={meeting_dir / "mic.wav": 0.0, meeting_dir / "mic.part2.wav": 95.5},
+            )
+
+
+def test_session_passes_each_parts_recorded_start_time_to_transcription(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        mic_paths = (tmp_path / "mic.wav", tmp_path / "mic.part2.wav")
+        offsets = {mic_paths[0]: 0.0, mic_paths[1]: 12.0}
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=mic_paths,
+            system_paths=(tmp_path / "system.wav",),
+            started_at_monotonic=0.0,
+            mic_offsets=offsets,
+        )
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+            session.stop()
+
+            MockTranscriber.return_value.transcribe_parts.assert_any_call(
+                mic_paths, source="mic", start_offsets=offsets
+            )
 
 
 def test_retry_pushes_to_copilot_studio_when_a_sync_dir_is_configured(tmp_path):
@@ -893,7 +947,7 @@ def test_retry_replaces_segments_left_by_an_earlier_partial_attempt(tmp_path):
     # second retry has to replace those, not add to them.
     with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
 
-        def fake_transcribe(paths, source):
+        def fake_transcribe(paths, source, start_offsets=None):
             return [TranscriptLine(1.0, "mic", "hello")] if source == "mic" else []
 
         MockTranscriber.return_value.transcribe_parts.side_effect = fake_transcribe
@@ -1002,7 +1056,7 @@ def test_session_leaves_out_an_empty_system_track_instead_of_failing(tmp_path, _
     assert "You: hello" in result
     assert "System audio: system.wav has no audio in it, so that track is left out of the transcript." in progress
     # Neither transcriber was asked to read the empty file.
-    assert MockTranscriber.return_value.transcribe_parts.call_args_list == [(((mic,),), {"source": "mic"})]
+    assert MockTranscriber.return_value.transcribe_parts.call_args_list == [(((mic,),), {"source": "mic", "start_offsets": {}})]
     MockRunpod.assert_not_called()
 
 
@@ -1137,7 +1191,7 @@ def test_a_cut_off_last_line_of_on_screen_text_is_skipped(tmp_path):
 def test_retry_brings_back_the_on_screen_text_saved_during_the_meeting(tmp_path):
     with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.side_effect = (
-            lambda paths, source: [TranscriptLine(1.0, source, f"{source} speech")]
+            lambda paths, source, start_offsets=None: [TranscriptLine(1.0, source, f"{source} speech")]
         )
         from meeting_scribe.session import SCREEN_TEXT_FILENAME, retry_meeting_transcription
 

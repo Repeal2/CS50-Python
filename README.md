@@ -16,9 +16,11 @@ Windows' light/dark app setting.
   heard, right under the meters, without opening a dialog.
 - **Follows the devices Teams is using.** With "Switch devices automatically" on (Settings, on by
   default), the app records whichever microphone and speaker Teams has open, switching mid-meeting if
-  Teams does; when that can't be told, it falls back to the speaker that's playing and a headset mic
-  recognized by name. A capture stream that dies mid-meeting is reopened, and silence on the system
-  track is written out as silence so both tracks stay in step.
+  Teams does, and stays on Teams' microphone through brief gaps in its answer; when that can't be told
+  at all, it falls back to the speaker that's playing and a headset mic someone is actually talking into
+  (a headset merely switched on — in a bag, say — isn't moved onto). Microphones are opened through
+  WASAPI, like the system audio, one entry per device. A capture stream that dies mid-meeting is
+  reopened, and silence on the system track is written out as silence so both tracks stay in step.
 - **Warns about bad input while it can still be fixed.** A device Windows no longer has, a mic producing
   digital silence, or an input that has heard nothing while the other track was busy shows up as a
   warning line under the meters and in the activity log. A dead-silent mic also flashes the OCR box red.
@@ -41,7 +43,8 @@ Windows' light/dark app setting.
   sidebar shows how many meetings are still finishing, and the running recording clock is shown on the
   Record page and in the window title (so it's visible from the taskbar). Optionally, the system-audio
   track goes to a Runpod WhisperX endpoint for speaker labels instead, and is transcribed locally if that
-  fails.
+  fails. Lines are split wherever the speaker changes mid-sentence, and a long meeting's 45-minute chunks
+  overlap by two minutes so each speaker keeps one label across them.
 - **Keeps a searchable local library.** The Library lists meetings by project, and its search box
   (**Ctrl+F**) looks through every project's titles, transcripts, notes and attendees. Each meeting shows
   its transcript, on-screen text, notes, attendees and documents, with **Copy**, **Export…** (one plain-text
@@ -58,7 +61,7 @@ Windows' light/dark app setting.
 | Speech-to-text | [faster-whisper](https://github.com/SYSTRAN/faster-whisper), local | Running Whisper locally keeps meeting audio on the machine and avoids per-minute STT billing. |
 | Screen OCR | [pytesseract](https://github.com/madmaze/pytesseract) (wraps Tesseract) | Lightweight, no GPU, no ML runtime to bundle — important for a single-file Windows executable. Requires the Tesseract binary (see Packaging). |
 | System audio capture | [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) | A PyAudio fork with WASAPI loopback support, i.e. it can record "what the speakers are playing" on Windows without a virtual audio cable. |
-| Long recordings | Each track rolls over into numbered WAV parts (`mic.wav`, `mic.part2.wav`, …) just under 2 GiB | A WAV's RIFF header stores every chunk size as a 32-bit integer, so one file stops being describable somewhere under 4 GiB — and many readers treat those sizes as signed, which halves it. Writing past that point raises mid-write and kills the capture thread, silently ending the recording. Transcription stitches the parts back onto one clock. |
+| Long recordings | Each track rolls over into numbered WAV parts (`mic.wav`, `mic.part2.wav`, …) just under 2 GiB | A WAV's RIFF header stores every chunk size as a 32-bit integer, so one file stops being describable somewhere under 4 GiB — and many readers treat those sizes as signed, which halves it. Writing past that point raises mid-write and kills the capture thread, silently ending the recording. A device switch also starts a new part. Each part's start time on the meeting's clock is noted in `mic.parts.json` / `system.parts.json`, and transcription places every part there — not where the previous part's audio ran out, which drifts whenever a device delivers more or less audio than real time. |
 | OCR area | An on-screen box (Tkinter, `-transparentcolor`) | One borderless, always-on-top window whose inside is see-through and click-through, so the area being read is visible and adjustable at all times without getting in the way of the call. |
 | Look and feel | Flat ttk styles on the built-in "clam" theme (`gui/theme.py`) | The native Windows ttk theme can't be recoloured. Styling clam gets a modern, dark-mode-aware look with no extra dependency to bundle. |
 | Multi-monitor DPI coordinates | Per-monitor DPI awareness (`shcore.SetProcessDpiAwareness`, set before any window is created) | Without this, Windows virtualizes window/monitor coordinates for the process on any monitor that isn't running the primary monitor's DPI scale, which would throw `GetWindowRect` and mss's screen capture out of sync with each other on a mixed-DPI multi-monitor setup. |

@@ -3,6 +3,7 @@ the headset whenever it's connected and live (see audio.recorder)."""
 
 import contextlib
 import struct
+import sys
 import threading
 import time
 import wave
@@ -13,6 +14,7 @@ from meeting_scribe.audio.recorder import (
     DeviceProbe,
     Recorder,
     _HEADSET_RECHECK_SECONDS,
+    _CALL_APP_MICROPHONE_MEMORY_SECONDS,
     _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS,
     _SegmentedWavWriter,
     _SILENT_DBFS,
@@ -389,7 +391,7 @@ def _on_headset(tmp_path, host, silent_for):
 
 
 def test_a_silent_headset_hands_over_to_another_headset_that_is_live(tmp_path):
-    host = _mic_host(_PolledStream(), sony_stream=_PolledStream([QUIET] * 50))
+    host = _mic_host(_PolledStream(), sony_stream=_PolledStream([LOUD] * 50))
     recorder, switches = _on_headset(tmp_path, host, _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS + 1)
 
     recorder._auto_select_microphone(time.monotonic())
@@ -417,7 +419,7 @@ def test_a_headset_that_is_only_briefly_quiet_is_not_second_guessed(tmp_path):
 
 
 def test_at_the_start_a_switched_off_headset_is_left_straight_away_for_a_live_one(tmp_path):
-    host = _mic_host(_PolledStream([SILENT] * 50), sony_stream=_PolledStream([QUIET] * 50))
+    host = _mic_host(_PolledStream([SILENT] * 50), sony_stream=_PolledStream([LOUD] * 50))
     recorder, switches = _on_headset(tmp_path, host, 0.0)
 
     recorder._auto_select_microphone(time.monotonic(), starting=True)
@@ -435,7 +437,7 @@ def test_at_the_start_a_live_headset_is_kept(tmp_path):
 
 
 def test_from_the_laptop_every_headset_is_checked(tmp_path):
-    host = _mic_host(_PolledStream([SILENT] * 50), sony_stream=_PolledStream([QUIET] * 50))
+    host = _mic_host(_PolledStream([SILENT] * 50), sony_stream=_PolledStream([LOUD] * 50))
     recorder, switches = _auto_recorder(tmp_path, host, auto_microphone=True, mic_device_name=LAPTOP)
     recorder._mic_active_device_name = LAPTOP
     recorder._mic_monitor.stream_opened(time.monotonic())
@@ -455,12 +457,52 @@ def test_from_the_laptop_headsets_are_rechecked_only_every_so_often(tmp_path):
     recorder._auto_select_microphone(now)
     assert recorder._next_headset_check == now + _HEADSET_RECHECK_SECONDS
 
-    host.streams[1] = _PolledStream([QUIET] * 50)  # unmuted, but not due to be checked yet
+    host.streams[1] = _PolledStream([LOUD] * 50)  # talked into, but not due to be checked yet
     recorder._auto_select_microphone(now + 1)
     assert switches == []
 
     recorder._auto_select_microphone(now + _HEADSET_RECHECK_SECONDS)
     assert [(kind, name) for kind, name, _ in switches] == [("mic", JABRA)]
+
+
+def test_a_headset_left_switched_on_in_a_bag_is_not_moved_onto(tmp_path):
+    # The field case: Teams on the laptop's microphone, a headset still paired and powered up in a bag.
+    # It hands over its noise floor — non-zero, so "switched on" — but nobody is talking into it.
+    host = _mic_host(_PolledStream([QUIET] * 50), sony_stream=_PolledStream([QUIET] * 50))
+    recorder, switches = _auto_recorder(tmp_path, host, auto_microphone=True, mic_device_name=LAPTOP)
+    recorder._mic_active_device_name = LAPTOP
+    recorder._mic_monitor.stream_opened(time.monotonic())
+
+    recorder._auto_select_microphone(time.monotonic(), starting=True)
+    recorder._auto_select_microphone(time.monotonic() + _HEADSET_RECHECK_SECONDS)
+
+    assert switches == []
+
+
+def test_a_dead_headset_falls_back_to_the_laptop_rather_than_to_a_headset_in_a_bag(tmp_path):
+    host = _mic_host(_PolledStream(), sony_stream=_PolledStream([QUIET] * 50))
+    recorder, switches = _on_headset(tmp_path, host, _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS + 1)
+
+    recorder._auto_select_microphone(time.monotonic())
+
+    assert [(kind, name) for kind, name, _ in switches] == [("mic", LAPTOP)]
+
+
+def test_recording_does_not_start_on_a_headset_just_because_one_is_connected(tmp_path, monkeypatch):
+    recorder = Recorder(tmp_path, mic_device_name=LAPTOP, auto_microphone=True)
+    recorder._call_devices = lambda: None  # not in a Teams call yet
+    host = _mic_host(_PolledStream([QUIET] * 50))
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "pyaudiowpatch", SimpleNamespace(PyAudio=lambda: host, paInt16=8))
+    opened = []
+    monkeypatch.setattr(Recorder, "_resolve_loopback_device", lambda self, module, name: _info("Speakers [Loopback]", 9, True))
+    monkeypatch.setattr(Recorder, "_spawn_capture_thread", lambda self, module, info, *args: opened.append(info["name"]))
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)  # no background checks in this test
+
+    recorder.start()
+
+    assert opened == [LAPTOP, "Speakers [Loopback]"]
+    assert recorder.capture_notices() == ()
 
 
 def test_picking_a_device_by_hand_turns_its_automation_off(tmp_path, monkeypatch):
@@ -537,6 +579,41 @@ def test_system_audio_follows_the_output_teams_is_playing_through_straight_away(
         "system", "Headphones (Jabra) [Loopback]",
         {"reason": "Teams is playing the call through it", "automatic": True},
     )]
+
+
+def test_a_gap_in_teams_answers_is_ridden_out_on_its_microphone_not_guessed_through(tmp_path):
+    # Teams is on the laptop's microphone; a headset someone could be talking into is connected. Teams
+    # stops naming its microphone for a moment while still playing the call — that's not a reason to go
+    # looking at headsets.
+    host = _mic_host(_PolledStream([LOUD] * 500))
+    recorder, switches = _auto_recorder(tmp_path, host, auto_microphone=True, mic_device_name=LAPTOP)
+    recorder._mic_active_device_name = LAPTOP
+    recorder._mic_monitor.stream_opened(time.monotonic())
+    now = time.monotonic()
+    recorder._call_devices = lambda: CallAudioDevices(microphones=(LAPTOP,), speakers=("Speakers",))
+    recorder._auto_select_microphone(now)
+
+    recorder._call_devices = lambda: CallAudioDevices(speakers=("Speakers",))
+    recorder._call_devices_cache = None
+    recorder._auto_select_microphone(now + 600)  # still in the call, however long
+    recorder._call_devices = lambda: None
+    recorder._call_devices_cache = None
+    recorder._auto_select_microphone(now + 610)  # Teams silent altogether, but only briefly
+    assert switches == []
+
+    recorder._call_devices_cache = None
+    recorder._auto_select_microphone(now + 610 + _CALL_APP_MICROPHONE_MEMORY_SECONDS)
+    assert [(kind, name) for kind, name, _ in switches] == [("mic", JABRA)]
+
+
+def test_when_teams_has_two_microphones_open_windows_default_for_calls_decides(tmp_path):
+    host = _mic_host(_PolledStream([QUIET] * 50))
+    recorder, switches = _on_headset(tmp_path, host, 0.0)
+    recorder._call_devices = lambda: CallAudioDevices(microphones=(JABRA, LAPTOP), default_microphone=LAPTOP)
+
+    recorder._auto_select_microphone(time.monotonic())
+
+    assert [(kind, name) for kind, name, _ in switches] == [("mic", LAPTOP)]
 
 
 def test_teams_devices_are_ignored_once_the_automation_is_off(tmp_path):

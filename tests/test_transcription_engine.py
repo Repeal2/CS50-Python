@@ -170,6 +170,32 @@ def test_transcribe_parts_puts_every_part_back_on_the_meetings_clock(tmp_path, m
     ]
 
 
+def test_transcribe_parts_places_each_part_where_the_recorder_says_it_started(tmp_path, monkeypatch):
+    # A part's length is how much audio it holds, not how long it was recording for. Here the first part
+    # holds 60 s of audio but the device changed 2 s in, so the second part starts at 2 s, not 60 s —
+    # adding up lengths is what used to push a whole mic track past the end of the meeting.
+    first, second, third = tmp_path / "mic.wav", tmp_path / "mic.part2.wav", tmp_path / "mic.part3.wav"
+    _write_wav(first, seconds=60.0)
+    _write_wav(second, seconds=30.0)
+    _write_wav(third, seconds=10.0)
+    monkeypatch.setattr(
+        WhisperTranscriber,
+        "transcribe",
+        lambda self, audio_path, source: [TranscriptLine(1.0, source, audio_path.name)],
+    )
+
+    lines = WhisperTranscriber(model_size="tiny").transcribe_parts(
+        [first, second, third], source="mic", start_offsets={first: 0.0, second: 2.0}
+    )
+
+    # The third part wasn't noted (say, the note couldn't be saved), so it follows on from the second.
+    assert [(line.timestamp_seconds, line.text) for line in lines] == [
+        (1.0, "mic.wav"),
+        (3.0, "mic.part2.wav"),
+        (33.0, "mic.part3.wav"),
+    ]
+
+
 def test_transcribe_parts_of_a_single_file_leaves_timestamps_alone(tmp_path, monkeypatch):
     only = tmp_path / "mic.wav"
     _write_wav(only, seconds=10.0)
