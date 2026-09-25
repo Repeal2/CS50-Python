@@ -354,6 +354,23 @@ class Database:
                 )
             self._conn.commit()
 
+    def delete_meeting(self, meeting_id: int) -> list[str]:
+        """Deletes a meeting, its transcript and the documents attached to it — documents filed under
+        its project alone stay. Returns the attached documents' stored copies (see add_document's
+        `source_path`), for the caller to remove from disk; this only touches the database."""
+        with self._lock:
+            paths = [
+                row["source_path"]
+                for row in self._conn.execute(
+                    "SELECT source_path FROM documents WHERE meeting_id = ? AND source_path IS NOT NULL", (meeting_id,)
+                )
+            ]
+            self._conn.execute("DELETE FROM documents WHERE meeting_id = ?", (meeting_id,))
+            self._conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?", (meeting_id,))
+            self._conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+            self._conn.commit()
+        return paths
+
     def set_transcript_text(self, meeting_id: int, transcript_text: str) -> None:
         """Replaces a finished meeting's saved transcript text, leaving when it ended alone."""
         with self._lock:

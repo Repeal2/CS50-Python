@@ -12,6 +12,7 @@ doesn't wait for the previous one to finish transcribing/saving.
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -688,5 +689,39 @@ def add_transcription(
         )
         report(f"Transcribed {ENGINE_NAMES[engine]}.")
         return render_transcript(transcripts.cloud if engine == CLOUD_ENGINE else transcripts.local)
+    finally:
+        _release_meeting(meeting_id)
+
+
+def delete_meeting(settings: Settings, db: Database, meeting_id: int) -> list[Path]:
+    """Deletes a meeting from this PC: its database record, transcripts, notes and attached documents,
+    its recorded audio and on-screen text, and the stored copies of those documents. Whatever was already
+    pushed to Copilot Studio's sync folder is left alone — that copy isn't this app's any more.
+
+    The record goes first, then the files, best effort: returns the files or folders that couldn't be
+    removed (one still open elsewhere, say), so the caller can say so. Raises ValueError if the meeting
+    doesn't exist, or is being recorded or transcribed right now."""
+    if not _claim_meeting(meeting_id):
+        raise ValueError("That meeting is still being recorded or transcribed — stop it or wait for it to finish first.")
+    try:
+        if db.get_meeting(meeting_id) is None:
+            raise ValueError(f"No meeting with id {meeting_id}")
+        document_copies = [Path(path) for path in db.delete_meeting(meeting_id)]
+        left_behind: list[Path] = []
+        meeting_dir = settings.meeting_dir(meeting_id)
+        if meeting_dir.exists():
+            shutil.rmtree(meeting_dir, ignore_errors=True)
+            if meeting_dir.exists():
+                left_behind.append(meeting_dir)
+        documents_dir = Path(settings.documents_dir).resolve()
+        for path in document_copies:
+            # Only the app's own copies: a stored path from anywhere else is never deleted.
+            if documents_dir not in path.resolve().parents:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                left_behind.append(path)
+        return left_behind
     finally:
         _release_meeting(meeting_id)

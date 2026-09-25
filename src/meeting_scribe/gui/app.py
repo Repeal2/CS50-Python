@@ -46,6 +46,7 @@ from meeting_scribe.session import (
     LOCAL_ENGINE,
     MeetingSession,
     add_transcription,
+    delete_meeting,
     meeting_in_progress,
     meeting_transcripts,
     retry_meeting_transcription,
@@ -1431,6 +1432,7 @@ class LibraryPage(ttk.Frame):
         meetings_scroll.pack(side="right", fill="y")
         self.meeting_tree.pack(side="left", fill="both", expand=True)
         self.meeting_tree.bind("<<TreeviewSelect>>", self._on_meeting_selected)
+        self.meeting_tree.bind("<Delete>", lambda _e: self._delete_meeting())
 
         # Right: the selected meeting.
         detail_card, detail = _card(panes, padding=0)
@@ -1450,6 +1452,7 @@ class LibraryPage(ttk.Frame):
             ("Export…", self._export),
             ("Attach document", self._upload_document),
             ("Open folder", self._open_folder),
+            ("Delete…", self._delete_meeting),
         ):
             button = ttk.Button(toolbar, text=text, style="Link.TButton", command=command, state="disabled")
             button.pack(side="left", padx=(0, 4))
@@ -1717,6 +1720,41 @@ class LibraryPage(ttk.Frame):
         if name is not None:
             self._load_documents(meeting.id)
             self.app.toast(f"Attached {name} to “{meeting.title}”")
+
+    def _delete_meeting(self) -> None:
+        """Deletes the selected meeting and everything recorded for it, after asking."""
+        meeting = self._current
+        if meeting is None:
+            return
+        if meeting_in_progress(meeting.id):
+            messagebox.showinfo(
+                APP_NAME, f"“{meeting.title}” is still being recorded or transcribed — it can be deleted once that's done."
+            )
+            return
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Delete “{meeting.title}” ({_format_meeting_timestamp(meeting.started_at)})?\n\n"
+            "Its recording, transcripts, on-screen text, notes, attendees and attached documents are removed "
+            "from this PC. Anything already sent to Copilot Studio stays there. This can't be undone.",
+            icon="warning",
+            default="no",
+        ):
+            return
+        try:
+            left_behind = delete_meeting(self.app.settings, self.app.db, meeting.id)
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self._current = None
+        self.app.refresh_project_lists()
+        if left_behind:
+            messagebox.showwarning(
+                APP_NAME,
+                f"“{meeting.title}” is deleted, but some of its files couldn't be removed (still open elsewhere?):\n\n"
+                + "\n".join(str(path) for path in left_behind),
+            )
+        else:
+            self.app.toast(f"Deleted “{meeting.title}”")
 
     def _show_banner(self, text: str, *, retry: bool) -> None:
         self._banner_label.configure(text=text)

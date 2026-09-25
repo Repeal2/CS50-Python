@@ -1447,3 +1447,63 @@ def test_a_meeting_from_before_the_mic_went_to_the_cloud_shows_a_whole_cloud_tra
     assert [line.text for line in transcripts.local] == ["you, locally", "you, untagged"]
     assert [line.text for line in transcripts.cloud] == ["you, locally", "them, in the cloud", "you, untagged"]
     assert transcripts.preferred == transcripts.cloud
+
+
+# --- deleting a meeting -----------------------------------------------------------------------------------
+
+
+def test_deleting_a_meeting_removes_its_record_audio_and_attached_documents(tmp_path):
+    from meeting_scribe.session import delete_meeting
+
+    with Database(tmp_path / "test.db") as db:
+        settings = _settings(tmp_path)
+        project, meeting_id = _stuck_meeting(settings, db, title="Test meeting")
+        kept_id = db.create_meeting(project.id, "Real meeting")
+        db.add_transcript_segment(meeting_id, "mic", 1.0, "testing testing")
+        settings.documents_dir.mkdir(parents=True)
+        attached, filed = settings.documents_dir / "a.pdf", settings.documents_dir / "b.pdf"
+        attached.write_bytes(b"a")
+        filed.write_bytes(b"b")
+        outside = tmp_path / "elsewhere.pdf"
+        outside.write_bytes(b"c")
+        db.add_document(project.id, "a.pdf", "a", meeting_id=meeting_id, source_path=str(attached))
+        db.add_document(project.id, "elsewhere.pdf", "c", meeting_id=meeting_id, source_path=str(outside))
+        db.add_document(project.id, "b.pdf", "b", source_path=str(filed))  # the project's, not the meeting's
+
+        left_behind = delete_meeting(settings, db, meeting_id)
+
+        assert left_behind == []
+        assert db.get_meeting(meeting_id) is None
+        assert db.get_segments(meeting_id) == []
+        assert [m.title for m in db.list_meetings(project.id)] == ["Real meeting"]
+        assert db.get_meeting(kept_id) is not None
+        assert [row["filename"] for row in db.list_documents(project.id)] == ["b.pdf"]
+    assert not settings.meeting_dir(meeting_id).exists()
+    assert not attached.exists()
+    assert filed.exists()
+    assert outside.exists()  # never deletes a file outside the app's own documents folder
+
+
+def test_a_meeting_being_recorded_cannot_be_deleted(tmp_path):
+    from meeting_scribe.session import _claim_meeting, _release_meeting, delete_meeting
+
+    with Database(tmp_path / "test.db") as db:
+        settings = _settings(tmp_path)
+        _project, meeting_id = _stuck_meeting(settings, db)
+        _claim_meeting(meeting_id)
+        try:
+            with pytest.raises(ValueError, match="still being recorded"):
+                delete_meeting(settings, db, meeting_id)
+        finally:
+            _release_meeting(meeting_id)
+        assert db.get_meeting(meeting_id) is not None
+    assert settings.meeting_dir(meeting_id).exists()
+
+
+def test_deleting_a_meeting_that_does_not_exist_says_so(tmp_path):
+    from meeting_scribe.session import delete_meeting, meeting_in_progress
+
+    with Database(tmp_path / "test.db") as db:
+        with pytest.raises(ValueError, match="No meeting"):
+            delete_meeting(_settings(tmp_path), db, 42)
+    assert not meeting_in_progress(42)

@@ -51,8 +51,9 @@ Windows' light/dark app setting.
   (**Ctrl+F**) looks through every project's titles, transcripts, notes and attendees. Each meeting shows
   its transcripts (this PC's and the cloud's, on tabs of their own), on-screen text, notes, attendees and
   documents, with **Copy**, **Export…** (one plain-text file with every section), **Attach document**,
-  **Open folder**, and **Transcribe on this PC** / **Transcribe in cloud** to make (or remake) either
-  transcript from the meeting's recording afterwards. A meeting whose transcription didn't
+  **Open folder**, **Transcribe on this PC** / **Transcribe in cloud** to make (or remake) either
+  transcript from the meeting's recording afterwards, and **Delete…** (or the Delete key), which removes
+  the meeting, its recording and its attached documents from this PC after asking. A meeting whose transcription didn't
   finish keeps its recording and offers **Retry**.
 - **Pushes each finished meeting to Copilot Studio** as a named file package dropped into a folder
   OneDrive/SharePoint is already syncing (see "The Copilot push" below). This is one-way: the app doesn't
