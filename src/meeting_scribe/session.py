@@ -24,6 +24,8 @@ from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
 from meeting_scribe.screen.region_picker import RegionTarget
 from meeting_scribe.storage.database import Database
+from meeting_scribe.transcription import jobs
+from meeting_scribe.transcription.jobs import TranscriptionJob
 from meeting_scribe.transcription.engine import (
     TranscriptLine,
     WhisperTranscriber,
@@ -67,6 +69,25 @@ def _claim_meeting(meeting_id: int) -> bool:
 def _release_meeting(meeting_id: int) -> None:
     with _meetings_in_progress_lock:
         _meetings_in_progress.discard(meeting_id)
+
+
+def _reporter(
+    on_progress: Callable[[str], None] | None, job: TranscriptionJob | None
+) -> Callable[[str], None]:
+    """One report(message) that goes to the caller's on_progress and into the job's log."""
+
+    def report(message: str) -> None:
+        if job is not None:
+            job.log(message)
+        if on_progress is not None:
+            on_progress(message)
+
+    return report
+
+
+def _stage(job: TranscriptionJob | None, stage: str, fraction: float | None = None) -> None:
+    if job is not None:
+        job.set_stage(stage, fraction)
 
 
 class _ScreenTextLog:
@@ -177,12 +198,13 @@ class _Tracks:
 
 
 def _transcribe_in_cloud(
-    settings: Settings, tracks: _Tracks, report: Callable[[str], None]
+    settings: Settings, tracks: _Tracks, report: Callable[[str], None], job: TranscriptionJob | None = None
 ) -> tuple[list[TranscriptLine], list[TranscriptLine]]:
     """(microphone lines, system lines) from Runpod — the system track with its speakers labelled.
     Raises RunpodWhisperXError for anything that stops that, including missing credentials."""
     from meeting_scribe.transcription.runpod_whisperx import RunpodWhisperXTranscriber
 
+    _stage(job, jobs.CLOUD)
     transcriber = RunpodWhisperXTranscriber(
         api_key=settings.runpod_api_key,
         endpoint_id=settings.runpod_endpoint_id,
@@ -202,9 +224,28 @@ def _transcribe_in_cloud(
 
 
 def _transcribe_locally(
-    settings: Settings, transcriber: WhisperTranscriber, tracks: _Tracks, report: Callable[[str], None]
+    settings: Settings,
+    transcriber: WhisperTranscriber,
+    tracks: _Tracks,
+    report: Callable[[str], None],
+    job: TranscriptionJob | None = None,
 ) -> tuple[list[TranscriptLine], list[TranscriptLine]]:
-    with transcription_slot(on_wait=lambda: report(_WAITING_FOR_TRANSCRIPTION_MESSAGE)):
+    def on_wait() -> None:
+        _stage(job, jobs.QUEUED)
+        report(_WAITING_FOR_TRANSCRIPTION_MESSAGE)
+
+    # Progress is how much of both tracks' audio Whisper has worked through: the microphone first, then
+    # system audio.
+    mic_seconds = sum(wav_duration_seconds(path) for path in tracks.mic_paths)
+    total_seconds = mic_seconds + sum(wav_duration_seconds(path) for path in tracks.system_paths)
+
+    def progress(before: float) -> Callable[[float], None] | None:
+        if job is None or total_seconds <= 0:
+            return None
+        return lambda seconds: job.set_progress((before + seconds) / total_seconds)
+
+    with transcription_slot(on_wait=on_wait):
+        _stage(job, jobs.LOCAL, 0.0)
         # Checked right before the expensive part starts, not any earlier — a warning here is what a
         # `mkl_malloc: failed to allocate memory` crash further down would otherwise give no advance
         # notice of at all (see transcription.engine.low_memory_warning).
@@ -215,11 +256,14 @@ def _transcribe_locally(
             mic_lines = system_lines = []
             if tracks.mic_paths:
                 mic_lines = transcriber.transcribe_parts(
-                    tracks.mic_paths, source="mic", start_offsets=tracks.mic_offsets
+                    tracks.mic_paths, source="mic", start_offsets=tracks.mic_offsets, on_progress=progress(0.0)
                 )
             if tracks.system_paths:
                 system_lines = transcriber.transcribe_parts(
-                    tracks.system_paths, source="system", start_offsets=tracks.system_offsets
+                    tracks.system_paths,
+                    source="system",
+                    start_offsets=tracks.system_offsets,
+                    on_progress=progress(mic_seconds),
                 )
         finally:
             transcriber.unload()
@@ -234,6 +278,7 @@ def _transcribe(
     report: Callable[[str], None],
     *,
     fall_back: bool,
+    job: TranscriptionJob | None = None,
 ) -> dict[str, tuple[list[TranscriptLine], list[TranscriptLine]]]:
     """{engine: (microphone lines, system lines)} for each engine asked for. A cloud failure is reported
     rather than raised when `fall_back` is set: if this PC wasn't going to transcribe too, it does
@@ -245,7 +290,7 @@ def _transcribe(
     results: dict[str, tuple[list[TranscriptLine], list[TranscriptLine]]] = {}
     if CLOUD_ENGINE in engines:
         try:
-            results[CLOUD_ENGINE] = _transcribe_in_cloud(settings, tracks, report)
+            results[CLOUD_ENGINE] = _transcribe_in_cloud(settings, tracks, report, job)
         except RunpodWhisperXError as error:
             if not fall_back:
                 raise
@@ -255,7 +300,7 @@ def _transcribe(
                 report(f"Cloud transcription failed ({error}) — transcribing on this PC instead.")
                 engines.append(LOCAL_ENGINE)
     if LOCAL_ENGINE in engines:
-        results[LOCAL_ENGINE] = _transcribe_locally(settings, transcriber, tracks, report)
+        results[LOCAL_ENGINE] = _transcribe_locally(settings, transcriber, tracks, report, job)
     return results
 
 
@@ -293,6 +338,7 @@ def _finish_meeting(
     report: Callable[[str], None],
     mic_offsets: Mapping[Path, float] | None = None,
     system_offsets: Mapping[Path, float] | None = None,
+    job: TranscriptionJob | None = None,
 ) -> str:
     """The shared back half of finishing a meeting — MeetingSession.stop() and
     retry_meeting_transcription() both end here: transcribe both tracks with each engine Settings asks
@@ -304,8 +350,11 @@ def _finish_meeting(
         mic_offsets,
         system_offsets,
     )
-    results = _transcribe(settings, transcriber, chosen_engines(settings), tracks, report, fall_back=True)
+    results = _transcribe(
+        settings, transcriber, chosen_engines(settings), tracks, report, fall_back=True, job=job
+    )
     report("Transcription complete.")
+    _stage(job, jobs.SAVING)
 
     # Clears whatever an earlier, partially-successful attempt left behind (one that transcribed fine but
     # then failed pushing, say) so a retry doesn't leave two attempts' lines side by side.
@@ -502,7 +551,11 @@ class MeetingSession:
             _release_meeting(self.meeting_id)
 
     def stop(
-        self, on_progress: Callable[[str], None] | None = None, *, settings: Settings | None = None
+        self,
+        on_progress: Callable[[str], None] | None = None,
+        *,
+        settings: Settings | None = None,
+        job: TranscriptionJob | None = None,
     ) -> str:
         """Stops recording, transcribes, pushes the meeting to Copilot Studio (if configured), and saves
         it locally. Returns the plain transcript — there's no AI-generated notes to return anymore; that
@@ -514,16 +567,15 @@ class MeetingSession:
 
         `settings`, if given, is what the meeting is transcribed and pushed with — the Settings in force
         now, not when the meeting started. Without it, a transcription choice changed mid-meeting (the
-        cloud unticked, say) only took effect from the next meeting, so this one still went to the cloud."""
+        cloud unticked, say) only took effect from the next meeting, so this one still went to the cloud.
 
-        def report(message: str) -> None:
-            if on_progress is not None:
-                on_progress(message)
-
+        `job`, if given, is kept up to date with the stage and, while transcribing on this PC, how far
+        along it is — see transcription.jobs."""
+        report = _reporter(on_progress, job)
         if settings is not None:
             self._use_settings(settings)
         try:
-            return self._stop(report)
+            return self._stop(report, job)
         finally:
             _release_meeting(self.meeting_id)
 
@@ -532,7 +584,7 @@ class MeetingSession:
             self._transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
         self._settings = settings
 
-    def _stop(self, report: Callable[[str], None]) -> str:
+    def _stop(self, report: Callable[[str], None], job: TranscriptionJob | None) -> str:
         self._screen_watcher.stop()
         if not self._screen_watcher.ever_read:
             report("On-screen text wasn't read — Start OCR was never pressed on the OCR box.")
@@ -558,6 +610,7 @@ class MeetingSession:
             system_offsets=recorded.system_offsets,
             screen_events=self._screen_text.snapshot(),
             report=report,
+            job=job,
         )
 
 
@@ -566,6 +619,7 @@ def retry_meeting_transcription(
     db: Database,
     meeting_id: int,
     on_progress: Callable[[str], None] | None = None,
+    job: TranscriptionJob | None = None,
 ) -> str:
     """Re-runs transcription for a meeting whose recording finished but whose transcription didn't — the
     situation left behind by, say, a `mkl_malloc: failed to allocate memory` crash partway through a long
@@ -585,7 +639,7 @@ def retry_meeting_transcription(
             "That meeting is still being recorded or finished — its transcript will appear when it's done."
         )
     try:
-        return _retry_meeting_transcription(settings, db, meeting_id, on_progress)
+        return _retry_meeting_transcription(settings, db, meeting_id, _reporter(on_progress, job), job)
     finally:
         _release_meeting(meeting_id)
 
@@ -594,13 +648,9 @@ def _retry_meeting_transcription(
     settings: Settings,
     db: Database,
     meeting_id: int,
-    on_progress: Callable[[str], None] | None,
+    report: Callable[[str], None],
+    job: TranscriptionJob | None,
 ) -> str:
-
-    def report(message: str) -> None:
-        if on_progress is not None:
-            on_progress(message)
-
     meeting = db.get_meeting(meeting_id)
     if meeting is None:
         raise ValueError(f"No meeting with id {meeting_id}")
@@ -635,6 +685,7 @@ def _retry_meeting_transcription(
         system_offsets=load_part_offsets(meeting_dir / "system.wav"),
         screen_events=load_screen_text_events(meeting_dir),
         report=report,
+        job=job,
     )
 
 
@@ -644,6 +695,7 @@ def add_transcription(
     meeting_id: int,
     engine: str,
     on_progress: Callable[[str], None] | None = None,
+    job: TranscriptionJob | None = None,
 ) -> str:
     """Transcribes a finished meeting's recorded audio again with one engine — LOCAL_ENGINE or
     CLOUD_ENGINE — whatever Settings says: a meeting transcribed only on this PC can be sent to the cloud
@@ -661,7 +713,7 @@ def add_transcription(
     if not _claim_meeting(meeting_id):
         raise ValueError("That meeting is still being recorded or transcribed — try again when it's done.")
     try:
-        report = on_progress or (lambda _message: None)
+        report = _reporter(on_progress, job)
         meeting = db.get_meeting(meeting_id)
         if meeting is None:
             raise ValueError(f"No meeting with id {meeting_id}")
@@ -679,7 +731,8 @@ def add_transcription(
                 f'The recorded audio for "{meeting.title}" is no longer in {meeting_dir} — nothing to transcribe.'
             )
         transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
-        results = _transcribe(settings, transcriber, (engine,), tracks, report, fall_back=False)
+        results = _transcribe(settings, transcriber, (engine,), tracks, report, fall_back=False, job=job)
+        _stage(job, jobs.SAVING)
         db.clear_transcript_segments(meeting_id, engine=engine)
         _save_transcription(db, meeting_id, engine, results[engine])
 

@@ -224,3 +224,64 @@ def test_notes_format_spans_style_bold_and_italic_text():
 def test_notes_format_spans_leave_snake_case_and_plain_hashes_alone():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     assert gui_app._notes_format_spans("see meeting_scribe_app for #3") == []
+
+
+def test_format_took_reads_naturally_from_seconds_to_hours():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._format_took(45.4) == "45 s"
+    assert gui_app._format_took(12 * 60) == "12 min"
+    assert gui_app._format_took(65 * 60) == "1 h 05 min"
+
+
+def test_format_eta_says_nothing_until_there_is_an_estimate():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._format_eta(None) == ""
+    assert gui_app._format_eta(20) == "less than a minute left"
+    assert gui_app._format_eta(4 * 60) == "about 4 min left"
+
+
+def _job(**overrides):
+    from meeting_scribe.transcription import jobs
+    from meeting_scribe.transcription.jobs import JobSnapshot
+
+    fields = dict(
+        id=1, run_id=1, meeting_id=1, title="Kickoff", kind=jobs.KIND_AFTER_RECORDING, state=jobs.RUNNING,
+        stage=jobs.LOCAL, fraction=0.42, message="", elapsed_seconds=90, eta_seconds=150, error=None, log=(),
+    )
+    fields.update(overrides)
+    return JobSnapshot(**fields)
+
+
+def test_job_progress_text_shows_the_percentage_only_while_transcribing_on_this_pc():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    from meeting_scribe.transcription import jobs
+
+    assert gui_app._job_progress_text(_job()) == "Transcribing on this PC  ·  42%  ·  2 min so far  ·  about 2 min left"
+    assert gui_app._job_progress_text(_job(stage=jobs.CLOUD, fraction=None, eta_seconds=None)) == (
+        "Transcribing in the cloud  ·  2 min so far"
+    )
+
+
+def test_run_outcome_prefers_the_live_job_and_calls_an_orphaned_run_interrupted():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    from meeting_scribe.transcription import jobs
+
+    running_row = {"outcome": "running", "detail": None}
+    assert gui_app._run_outcome(running_row, _job()) == ("Running", "")
+    assert gui_app._run_outcome(running_row, _job(state=jobs.DONE)) == ("Done", "")
+    assert gui_app._run_outcome(running_row, None)[0] == "Interrupted"
+    assert gui_app._run_outcome({"outcome": "failed", "detail": "no API key"}, None) == ("Failed", "no API key")
+
+
+def test_meeting_transcription_status_names_which_transcripts_a_meeting_has():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    from meeting_scribe.storage.database import Meeting
+
+    finished = Meeting(1, 1, "Kickoff", "2026-01-01T10:00:00+00:00", "2026-01-01T11:00:00+00:00", "", None, None, None, None)
+    unfinished = Meeting(1, 1, "Kickoff", "2026-01-01T10:00:00+00:00", None, None, None, None, None, None)
+    status = gui_app._meeting_transcription_status
+    assert status(finished, {"local", "runpod"}, False) == "This PC + Cloud"
+    assert status(finished, {"runpod"}, False) == "Cloud"
+    assert status(finished, set(), False) == "No speech found"
+    assert status(unfinished, set(), False) == "Not transcribed"
+    assert status(unfinished, set(), True) == "In progress"

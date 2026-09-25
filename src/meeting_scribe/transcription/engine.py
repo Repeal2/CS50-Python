@@ -153,33 +153,51 @@ class WhisperTranscriber:
         (see transcription_slot) shouldn't have to share memory with a model nobody is using anymore."""
         self._model = None
 
-    def transcribe(self, audio_path: Path, source: str) -> list[TranscriptLine]:
-        """Runs Whisper over a recorded WAV file, returning one TranscriptLine per detected segment."""
+    def transcribe(
+        self, audio_path: Path, source: str, on_progress: Callable[[float], None] | None = None
+    ) -> list[TranscriptLine]:
+        """Runs Whisper over a recorded WAV file, returning one TranscriptLine per detected segment.
+
+        `on_progress`, if given, is called with how far into the file (in seconds) Whisper has got, as
+        each segment comes out — faster-whisper decodes lazily as the segments are read, so this is live."""
         model = self._ensure_model()
         segments, _info = model.transcribe(str(audio_path), vad_filter=True)
-        return [
-            TranscriptLine(timestamp_seconds=segment.start, source=source, text=segment.text.strip())
-            for segment in segments
-            if segment.text.strip()
-        ]
+        lines = []
+        for segment in segments:
+            if on_progress is not None:
+                on_progress(segment.end)
+            if segment.text.strip():
+                lines.append(TranscriptLine(timestamp_seconds=segment.start, source=source, text=segment.text.strip()))
+        return lines
 
     def transcribe_parts(
         self,
         audio_paths: Sequence[Path],
         source: str,
         start_offsets: Mapping[Path, float] | None = None,
+        on_progress: Callable[[float], None] | None = None,
     ) -> list[TranscriptLine]:
         """Transcribes one capture stream that may have been written as several WAV parts.
 
         A stream rolls over into a new part whenever its device changes, and when a long meeting would
         overflow a WAV header (see audio.recorder). Whisper timestamps each part from its own zero, so
-        each part is shifted to where it started on the meeting's clock — see part_start_offsets."""
+        each part is shifted to where it started on the meeting's clock — see part_start_offsets.
+
+        `on_progress`, if given, is called with how many seconds of this stream's audio are done so far,
+        across all its parts (see transcribe)."""
         lines: list[TranscriptLine] = []
+        done_seconds = 0.0
         for audio_path, offset_seconds in zip(audio_paths, part_start_offsets(audio_paths, start_offsets)):
+            part_progress = None
+            if on_progress is not None:
+                part_progress = lambda seconds, before=done_seconds: on_progress(before + seconds)  # noqa: E731
             lines.extend(
                 TranscriptLine(line.timestamp_seconds + offset_seconds, line.source, line.text)
-                for line in self.transcribe(audio_path, source=source)
+                for line in self.transcribe(audio_path, source=source, on_progress=part_progress)
             )
+            done_seconds += wav_duration_seconds(audio_path)
+            if on_progress is not None:
+                on_progress(done_seconds)  # the silence after its last segment counts as done too
         return lines
 
 

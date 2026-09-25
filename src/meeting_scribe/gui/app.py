@@ -53,7 +53,9 @@ from meeting_scribe.session import (
 )
 from meeting_scribe.storage.database import Database, Meeting
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
+from meeting_scribe.transcription import jobs
 from meeting_scribe.transcription.engine import render_transcript
+from meeting_scribe.transcription.jobs import JobBoard, JobSnapshot
 
 APP_NAME = "Meeting Scribe"
 
@@ -186,6 +188,78 @@ def _meeting_export_text(
         if body and body.strip():
             sections.append(f"{heading}\n{'-' * len(heading)}\n{body.strip()}")
     return "\n\n".join(sections) + "\n"
+
+
+def _format_took(seconds: float) -> str:
+    """How long a transcription took or has been going: "45 s", "12 min", "1 h 05 min"."""
+    seconds = max(0, round(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    minutes = round(seconds / 60)
+    return f"{minutes} min" if minutes < 60 else f"{minutes // 60} h {minutes % 60:02d} min"
+
+
+def _format_eta(seconds: float | None) -> str:
+    """A running job's estimate: "about 4 min left" — "" while there's nothing to go on."""
+    if seconds is None:
+        return ""
+    if seconds < 60:
+        return "less than a minute left"
+    return f"about {_format_took(seconds)} left"
+
+
+def _job_progress_text(job: JobSnapshot) -> str:
+    """The line under a running job's name: its stage, how far along, and how long to go."""
+    parts = [job.stage]
+    if job.fraction is not None and job.stage == jobs.LOCAL:
+        parts.append(f"{job.fraction:.0%}")
+    parts.append(f"{_format_took(job.elapsed_seconds)} so far")
+    eta = _format_eta(job.eta_seconds)
+    if eta:
+        parts.append(eta)
+    return "  ·  ".join(parts)
+
+
+_RUN_OUTCOMES = {jobs.RUNNING: "Running", jobs.DONE: "Done", jobs.FAILED: "Failed"}
+
+
+def _run_outcome(row, job: JobSnapshot | None) -> tuple[str, str]:
+    """(result in words, error if any) for a transcription run. `job` is this process's job for it, if
+    there is one — fresher than the database row. A run still marked running that no job here owns was
+    cut short by the app closing or crashing."""
+    if job is not None:
+        return _RUN_OUTCOMES[job.state], job.error or ""
+    if row["outcome"] == jobs.RUNNING:
+        return "Interrupted", "the app was closed or crashed before it finished"
+    return _RUN_OUTCOMES.get(row["outcome"], row["outcome"]), row["detail"] or ""
+
+
+def _format_run_time(iso_string: str) -> str:
+    """"Sep 25 3:45 PM" — when a transcription run started, short enough for the log's When column."""
+    try:
+        return datetime.fromisoformat(iso_string).astimezone().strftime("%b %d %I:%M %p").replace(" 0", " ")
+    except ValueError:
+        return iso_string
+
+
+def _run_took(row) -> str:
+    if not row["finished_at"]:
+        return ""
+    try:
+        seconds = (datetime.fromisoformat(row["finished_at"]) - datetime.fromisoformat(row["started_at"])).total_seconds()
+    except ValueError:
+        return ""
+    return _format_took(seconds)
+
+
+def _meeting_transcription_status(meeting: Meeting, engines: "set[str]", in_progress: bool) -> str:
+    """A meeting's line in the Transcriptions log: which transcripts it has, or why it has none."""
+    if in_progress:
+        return "In progress"
+    if meeting.ended_at is None:
+        return "Not transcribed"
+    names = [name for engine, name in ((LOCAL_ENGINE, "This PC"), (CLOUD_ENGINE, "Cloud")) if engine in engines]
+    return " + ".join(names) if names else "No speech found"
 
 
 def _safe_filename(name: str) -> str:
@@ -412,6 +486,12 @@ class MeetingScribeApp(tk.Tk):
     _DEVICE_POLL_MS = 2000  # how often device dropdowns check for devices coming and going
     _MEETING_POLL_MS = 2000  # how often to check whether a Teams call has started
     _CLOCK_MS = 500
+    _NAV_LABELS = {
+        "record": "●   Record",
+        "library": "▤   Library",
+        "transcriptions": "⟳   Transcriptions",
+        "settings": "⚙   Settings",
+    }
 
     def __init__(self, settings: Settings | None = None):
         _enable_per_monitor_dpi_awareness()
@@ -423,6 +503,8 @@ class MeetingScribeApp(tk.Tk):
 
         self.settings = settings or load_settings()
         self.db = Database(self.settings.db_path)
+        # Every transcription this process runs, and how far along it is — see the Transcriptions page.
+        self.jobs = JobBoard(self.db)
         self._session: MeetingSession | None = None
         self._session_started_at: float | None = None
         # Finish-up jobs (a stopped meeting's transcription, a Library retry) still running — see
@@ -471,10 +553,16 @@ class MeetingScribeApp(tk.Tk):
 
         self.record_page = RecordPage(self._content, self)
         self.library_page = LibraryPage(self._content, self)
+        self.transcriptions_page = TranscriptionsPage(self._content, self)
         self.settings_page = SettingsPage(self._content, self)
-        self._pages = {"record": self.record_page, "library": self.library_page, "settings": self.settings_page}
+        self._pages = {
+            "record": self.record_page,
+            "library": self.library_page,
+            "transcriptions": self.transcriptions_page,
+            "settings": self.settings_page,
+        }
         self._nav_buttons: dict[str, ttk.Button] = {}
-        for key, label in (("record", "●   Record"), ("library", "▤   Library"), ("settings", "⚙   Settings")):
+        for key, label in self._NAV_LABELS.items():
             button = ttk.Button(sidebar, text=label, style="Nav.TButton", command=lambda k=key: self.show_page(k))
             button.pack(fill="x", pady=2)
             self._nav_buttons[key] = button
@@ -498,6 +586,12 @@ class MeetingScribeApp(tk.Tk):
             self._nav_buttons[name].configure(style="NavActive.TButton" if name == key else "Nav.TButton")
         if key == "library":
             self.library_page.on_show(focus_search=focus_search)
+        elif key == "transcriptions":
+            self.transcriptions_page.on_show()
+
+    def open_in_library(self, meeting_id: int) -> None:
+        self.show_page("library")
+        self.library_page.open_meeting(meeting_id)
 
     def toast(self, message: str) -> None:
         """A short, non-blocking confirmation at the bottom of the window — for things that went fine and
@@ -512,7 +606,7 @@ class MeetingScribeApp(tk.Tk):
     def _tick_clock(self) -> None:
         """Keeps the recording clock, window title and sidebar status current."""
         try:
-            finishing = sum(thread.is_alive() for thread in self._background_threads)
+            active = self.jobs.active()
             if self._session is not None and self._session_started_at is not None:
                 elapsed = _format_elapsed(time.monotonic() - self._session_started_at)
                 self.title(f"● {elapsed} — {APP_NAME}")
@@ -521,8 +615,12 @@ class MeetingScribeApp(tk.Tk):
                 elapsed = None
                 self.title(APP_NAME)
                 status = "Ready"
-            if finishing:
-                status += f"\nFinishing {finishing} meeting{'s' if finishing > 1 else ''}…"
+            if len(active) == 1:
+                job = active[0]
+                done = f" · {job.fraction:.0%}" if job.fraction is not None and job.stage == jobs.LOCAL else ""
+                status += f"\nTranscribing “{job.title}”{done}"
+            elif active:
+                status += f"\nTranscribing {len(active)} meetings…"
             self._sidebar_status.configure(text=status)
             self.record_page.show_elapsed(elapsed)
         finally:
@@ -764,6 +862,7 @@ class MeetingScribeApp(tk.Tk):
     def refresh_project_lists(self) -> None:
         self.record_page.refresh_projects()
         self.library_page.refresh()
+        self.transcriptions_page.refresh_history()
 
     def prompt_new_project(self) -> str | None:
         name = simpledialog.askstring("New project", "Project name:", parent=self)
@@ -1377,7 +1476,7 @@ class RecordPage(ttk.Frame):
         self.manual_notes_editor.configure(state="disabled")
         for button in self._format_buttons:
             button.configure(state="disabled")
-        self.log(f"[{session.title}] Stopped — transcribing in the background.")
+        self.log(f"[{session.title}] Stopped — transcribing in the background (progress under Transcriptions).")
         self.close_ocr_box()
         settings = self.app.settings
 
@@ -1386,9 +1485,10 @@ class RecordPage(ttk.Frame):
                 self.after(0, self.log, f"[{session.title}] {message}")
 
             try:
-                # The Settings in force now, not when the meeting started: unticking the cloud mid-meeting
-                # applies to this meeting.
-                session.stop(on_progress=report, settings=settings)
+                with self.app.jobs.run(session.meeting_id, session.title, jobs.KIND_AFTER_RECORDING) as job:
+                    # The Settings in force now, not when the meeting started: unticking the cloud
+                    # mid-meeting applies to this meeting.
+                    session.stop(on_progress=report, settings=settings, job=job)
             except Exception as exc:
                 self.after(0, self._on_stop_failed, session.title, exc)
                 return
@@ -1735,6 +1835,22 @@ class LibraryPage(ttk.Frame):
                 self.project_tree.selection_set(item)
         self._reload_meetings(select_id=current_id)
 
+    def open_meeting(self, meeting_id: int) -> None:
+        """Shows one meeting, selecting its project — from the Transcriptions page."""
+        meeting = self.app.db.get_meeting(meeting_id)
+        if meeting is None:
+            return
+        self._clear_search()
+        self.refresh()  # a meeting recorded since the Library last loaded may be in a new project
+        # Selecting the project below reloads the list again once Tk gets to it, re-selecting whichever
+        # meeting is current by then — so this one has to be current before that happens.
+        self._current = meeting
+        for item, project in self._projects.items():
+            if project.id == meeting.project_id:
+                self.project_tree.selection_set(item)
+                self.project_tree.see(item)
+        self._reload_meetings(select_id=meeting_id)
+
     def _selected_project(self):
         selection = self.project_tree.selection()
         return self._projects.get(selection[0]) if selection else None
@@ -1995,8 +2111,10 @@ class LibraryPage(ttk.Frame):
             self.after(0, self._show_retry_progress, meeting.id, message)
 
         def worker() -> None:
+            kind = jobs.KIND_AGAIN_LOCAL if engine == LOCAL_ENGINE else jobs.KIND_AGAIN_CLOUD
             try:
-                add_transcription(settings, self.app.db, meeting.id, engine, on_progress=report)
+                with self.app.jobs.run(meeting.id, meeting.title, kind) as job:
+                    add_transcription(settings, self.app.db, meeting.id, engine, on_progress=report, job=job)
             except Exception as exc:
                 self.after(0, self._on_transcribe_again_failed, meeting.id, meeting.title, where, exc)
                 return
@@ -2027,7 +2145,10 @@ class LibraryPage(ttk.Frame):
 
         def worker() -> None:
             try:
-                retry_meeting_transcription(self.app.settings, self.app.db, meeting.id, on_progress=report)
+                with self.app.jobs.run(meeting.id, meeting.title, jobs.KIND_RETRY) as job:
+                    retry_meeting_transcription(
+                        self.app.settings, self.app.db, meeting.id, on_progress=report, job=job
+                    )
             except Exception as exc:
                 self.after(0, self._on_retry_failed, meeting.id, meeting.title, exc)
                 return
@@ -2051,6 +2172,271 @@ class LibraryPage(ttk.Frame):
             self._banner_label.configure(text=_UNFINISHED_MEETING_NOTICE)
             self.retry_button.configure(state="normal")
         messagebox.showerror(APP_NAME, f'Couldn\'t retry "{meeting_title}": {exc}')
+
+
+# --- Transcriptions -------------------------------------------------------------------------------
+
+
+class _JobRow:
+    """One running transcription on the Transcriptions page: name, what it's doing, and a progress bar —
+    measured while transcribing on this PC, a moving bar while it waits or runs in the cloud."""
+
+    def __init__(self, parent: ttk.Frame):
+        self.frame = ttk.Frame(parent, style="Card.TFrame", borderwidth=0)
+        self.frame.columnconfigure(0, weight=1)
+        self._title = ttk.Label(self.frame, style="Card.TLabel")
+        self._title.grid(row=0, column=0, sticky="w")
+        self._kind = ttk.Label(self.frame, style="Card.Muted.TLabel")
+        self._kind.grid(row=0, column=1, sticky="e")
+        self._bar = ttk.Progressbar(self.frame, style="Progress.Horizontal.TProgressbar", maximum=100)
+        self._bar.grid(row=1, column=0, columnspan=2, sticky="we", pady=(4, 2))
+        self._detail = ttk.Label(self.frame, style="Card.Muted.TLabel")
+        self._detail.grid(row=2, column=0, columnspan=2, sticky="w")
+        self._message = ttk.Label(self.frame, style="Card.Muted.TLabel", justify="left")
+        self._message.grid(row=3, column=0, columnspan=2, sticky="w")
+        _wrap_to_width(self._message, self.frame, margin=10)
+        self._moving = False
+
+    def show(self, job: JobSnapshot) -> None:
+        self._title.configure(text=job.title)
+        self._kind.configure(text=job.kind)
+        self._detail.configure(text=_job_progress_text(job))
+        self._message.configure(text=job.message)
+        measured = job.fraction is not None and job.stage == jobs.LOCAL
+        if measured:
+            if self._moving:
+                self._bar.stop()
+                self._moving = False
+            self._bar.configure(mode="determinate", value=job.fraction * 100)
+        elif not self._moving:
+            self._bar.configure(mode="indeterminate", value=0)
+            self._bar.start(20)
+            self._moving = True
+
+    def destroy(self) -> None:
+        if self._moving:
+            self._bar.stop()
+        self.frame.destroy()
+
+
+class TranscriptionsPage(ttk.Frame):
+    """What's being transcribed now and how far along it is, and a log of every meeting and each time it
+    was transcribed — after recording, retried, or again afterwards on this PC or in the cloud."""
+
+    _POLL_MS = 1000
+    _MEETINGS_SHOWN = 200
+    _IDLE_TEXT = (
+        "Nothing is being transcribed right now. A meeting shows up here as soon as it's stopped, "
+        "with how far along this PC is and roughly how long it has to go."
+    )
+
+    def __init__(self, parent: tk.Misc, app: MeetingScribeApp):
+        super().__init__(parent, padding=(28, 24))
+        self.app = app
+        self._rows: dict[int, _JobRow] = {}
+        self._active_ids: tuple[int, ...] = ()
+        self._meeting_items: dict[str, int] = {}  # tree item -> meeting id
+        self._run_items: dict[str, object] = {}  # tree item -> transcription run row
+
+        ttk.Label(self, text="Transcriptions", style="Heading.TLabel").pack(anchor="w", pady=(0, 16))
+
+        now_card, self._now = _card(self, "Now")
+        now_card.pack(fill="x")
+        self._idle = ttk.Label(self._now, text=self._IDLE_TEXT, style="Card.Muted.TLabel", justify="left")
+        self._idle.pack(anchor="w", fill="x")
+        _wrap_to_width(self._idle, self._now, margin=20)
+
+        panes = ttk.PanedWindow(self, orient="horizontal")
+        panes.pack(fill="both", expand=True, pady=(12, 0))
+
+        history_card, history = _card(panes, padding=0)
+        panes.add(history_card, weight=3)
+        history_header = ttk.Frame(history, style="Card.TFrame", borderwidth=0, padding=(14, 10, 8, 4))
+        history_header.pack(fill="x")
+        ttk.Label(history_header, text="Meetings", style="Card.Title.TLabel").pack(side="left")
+        self._open_button = ttk.Button(
+            history_header, text="Open in Library", style="Link.TButton", state="disabled",
+            command=self._open_selected,
+        )
+        self._open_button.pack(side="right")
+        tree_frame = ttk.Frame(history, style="Card.TFrame", borderwidth=0)
+        tree_frame.pack(fill="both", expand=True, padx=(6, 0), pady=(0, 6))
+        self.tree = ttk.Treeview(tree_frame, columns=("when", "status", "took"), show="tree headings", selectmode="browse")
+        for column, heading, width, stretch in (
+            ("#0", "Meeting", 190, True),
+            ("when", "When", 120, False),
+            ("status", "Transcription", 170, True),
+            ("took", "Duration", 70, False),
+        ):
+            self.tree.heading(column, text=heading, anchor="w")
+            self.tree.column(column, width=width, stretch=stretch, anchor="w")
+        self.tree.tag_configure("problem", foreground=app.palette.danger)
+        self.tree.tag_configure("run", foreground=app.palette.muted)
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self._on_selected)
+        self.tree.bind("<Double-1>", lambda _e: self._open_selected())
+
+        log_card, log = _card(panes, padding=0)
+        panes.add(log_card, weight=2)
+        log_header = ttk.Frame(log, style="Card.TFrame", borderwidth=0, padding=(14, 10, 8, 4))
+        log_header.pack(fill="x")
+        ttk.Label(log_header, text="Log", style="Card.Title.TLabel").pack(side="left")
+        log_frame, self.log_text = _scrolled_text(log, app.palette, app.fonts.mono, state="disabled", width=30)
+        self.log_text.configure(foreground=app.palette.muted)
+        log_frame.pack(fill="both", expand=True, padx=(2, 0), pady=(0, 2))
+        _set_readonly_text(self.log_text, "Pick a meeting or one of its transcriptions to see what happened.")
+
+        self.after(self._POLL_MS, self._poll)
+
+    def on_show(self) -> None:
+        self._refresh_now()
+        self.refresh_history()
+
+    # -- now --------------------------------------------------------------------------------------------
+
+    def _poll(self) -> None:
+        try:
+            if self.winfo_ismapped():
+                self._refresh_now()
+            else:
+                self._active_ids = tuple(job.id for job in self.app.jobs.active())
+        finally:
+            self.after(self._POLL_MS, self._poll)
+
+    def _refresh_now(self) -> None:
+        active = self.app.jobs.active()
+        ids = tuple(job.id for job in active)
+        if ids != self._active_ids:
+            # A job started or finished: the history changes with it.
+            self._active_ids = ids
+            self.refresh_history()
+        for job_id in [job_id for job_id in self._rows if job_id not in ids]:
+            self._rows.pop(job_id).destroy()
+        for index, job in enumerate(active):
+            row = self._rows.get(job.id)
+            if row is None:
+                row = self._rows[job.id] = _JobRow(self._now)
+            row.frame.pack(fill="x", pady=(0 if index == 0 else 12, 0))
+            row.show(job)
+        if active:
+            self._idle.pack_forget()
+        else:
+            self._idle.pack(anchor="w", fill="x")
+        self._refresh_selected_log()
+
+    # -- history ----------------------------------------------------------------------------------------
+
+    def refresh_history(self) -> None:
+        """Reloads the meeting log, keeping the selection and which meetings are expanded."""
+        selected = self.tree.selection()
+        selected_key = self._item_key(selected[0]) if selected else None
+        expanded = {self._meeting_items[item] for item in self._meeting_items if self.tree.item(item, "open")}
+        db = self.app.db
+        runs: dict[int, list] = {}
+        for run in db.list_transcription_runs():
+            runs.setdefault(run["meeting_id"], []).append(run)
+        engines = db.transcribed_engines()
+        live = self._jobs_by_run()
+        busy = {job.meeting_id for job in live.values() if job.active}
+
+        self.tree.delete(*self.tree.get_children())
+        self._meeting_items, self._run_items = {}, {}
+        reselect = None
+        for meeting in db.list_recent_meetings(self._MEETINGS_SHOWN):
+            in_progress = meeting.id in busy or meeting_in_progress(meeting.id)
+            status = _meeting_transcription_status(meeting, engines.get(meeting.id, set()), in_progress)
+            problem = meeting.ended_at is None and not in_progress
+            item = self.tree.insert(
+                "", "end", text="  " + meeting.title,
+                values=(_format_short_date(meeting.started_at), status, _format_duration(meeting.started_at, meeting.ended_at)),
+                open=meeting.id in expanded, tags=("problem",) if problem else (),
+            )
+            self._meeting_items[item] = meeting.id
+            if selected_key == ("meeting", meeting.id):
+                reselect = item
+            for run in runs.get(meeting.id, []):
+                outcome, _detail = _run_outcome(run, live.get(run["id"]))
+                child = self.tree.insert(
+                    item, "end", text=f"    {run['kind']}",
+                    values=(_format_run_time(run["started_at"]), outcome, _run_took(run)),
+                    tags=("problem",) if outcome in ("Failed", "Interrupted") else ("run",),
+                )
+                self._run_items[child] = run
+                if selected_key == ("run", run["id"]):
+                    reselect = child
+        if reselect is not None:
+            self.tree.selection_set(reselect)
+            self.tree.see(reselect)
+        else:
+            self._open_button.configure(state="disabled")
+
+    def _jobs_by_run(self) -> "dict[int, JobSnapshot]":
+        return {job.run_id: job for job in self.app.jobs.snapshot() if job.run_id is not None}
+
+    def _item_key(self, item: str):
+        if item in self._meeting_items:
+            return ("meeting", self._meeting_items[item])
+        if item in self._run_items:
+            return ("run", self._run_items[item]["id"])
+        return None
+
+    def _selected_meeting_id(self) -> int | None:
+        selection = self.tree.selection()
+        if not selection:
+            return None
+        item = selection[0]
+        if item in self._run_items:
+            return self._run_items[item]["meeting_id"]
+        return self._meeting_items.get(item)
+
+    def _on_selected(self, _event=None) -> None:
+        self._open_button.configure(state="normal" if self._selected_meeting_id() is not None else "disabled")
+        self._refresh_selected_log(force=True)
+
+    def _refresh_selected_log(self, *, force: bool = False) -> None:
+        """Shows the selected run's log, or every run of the selected meeting — kept current while one of
+        them is still running."""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        item = selection[0]
+        live = self._jobs_by_run()
+        if item in self._run_items:
+            runs = [self._run_items[item]]
+        elif item in self._meeting_items:
+            runs = [self._run_items[child] for child in self.tree.get_children(item)]
+        else:
+            return
+        if not force and not any(run["id"] in live and live[run["id"]].active for run in runs):
+            return  # nothing in view is changing
+        sections = []
+        for run in reversed(runs):  # oldest first reads as a story
+            job = live.get(run["id"])
+            lines = "\n".join(job.log) if job is not None else run["log"].rstrip("\n")
+            heading = f"{run['kind']} — {_format_meeting_timestamp(run['started_at'])}"
+            outcome, detail = _run_outcome(run, job)
+            footer = f"{outcome}{': ' + detail if detail else ''}"
+            sections.append(f"{heading}\n{lines or '(nothing reported)'}\n→ {footer}")
+        if not sections:
+            meeting_id = self._meeting_items.get(item)
+            meeting = self.app.db.get_meeting(meeting_id) if meeting_id is not None else None
+            sections.append(
+                "No transcriptions recorded for this meeting — it was transcribed before this log existed."
+                if meeting is not None and meeting.ended_at is not None
+                else "No transcriptions recorded for this meeting yet."
+            )
+        at_end = self.log_text.yview()[1] >= 0.999
+        _set_readonly_text(self.log_text, "\n\n".join(sections))
+        if at_end or force:
+            self.log_text.see("end")
+
+    def _open_selected(self) -> None:
+        meeting_id = self._selected_meeting_id()
+        if meeting_id is not None:
+            self.app.open_in_library(meeting_id)
 
 
 # --- Settings -------------------------------------------------------------------------------------

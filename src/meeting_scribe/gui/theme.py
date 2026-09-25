@@ -309,6 +309,11 @@ def apply_theme(root: tk.Tk) -> tuple[Palette, Fonts]:
         "Meter.Horizontal.TProgressbar", background=p.success, troughcolor=p.meter_trough,
         bordercolor=p.meter_trough, lightcolor=p.success, darkcolor=p.success, thickness=px(8),
     )
+    # Transcription progress (the Transcriptions page).
+    style.configure(
+        "Progress.Horizontal.TProgressbar", background=p.accent, troughcolor=p.meter_trough,
+        bordercolor=p.meter_trough, lightcolor=p.accent, darkcolor=p.accent, thickness=px(8),
+    )
 
     # Notebook — flat tabs on the card surface.
     style.configure("TNotebook", background=p.surface, borderwidth=0, tabmargins=(0, 0, 0, 0))

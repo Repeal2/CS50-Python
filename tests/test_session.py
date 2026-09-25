@@ -89,7 +89,7 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
 
         transcriber_instance = MockTranscriber.return_value
 
-        def fake_transcribe(paths, source, start_offsets=None):
+        def fake_transcribe(paths, source, start_offsets=None, on_progress=None):
             if source == "mic":
                 return [TranscriptLine(1.0, "mic", "let's get started")]
             return [TranscriptLine(2.0, "system", "sounds good")]
@@ -202,7 +202,7 @@ def test_with_both_chosen_the_meeting_keeps_both_transcripts(tmp_path):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
             mic_paths=(tmp_path / "mic.wav",), system_paths=(tmp_path / "system.wav",), started_at_monotonic=0.0
         )
-        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None: [
+        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None, on_progress=None: [
             TranscriptLine(1.0, source, f"local {source}")
         ]
         MockRunpod.return_value.transcribe_parts.side_effect = lambda paths, source, **kwargs: [
@@ -241,7 +241,7 @@ def test_a_cloud_failure_with_both_chosen_keeps_this_pcs_transcript(tmp_path):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
             mic_paths=(tmp_path / "mic.wav",), system_paths=(tmp_path / "system.wav",), started_at_monotonic=0.0
         )
-        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None: [
+        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None, on_progress=None: [
             TranscriptLine(1.0, source, f"local {source}")
         ]
 
@@ -307,7 +307,7 @@ def test_session_falls_back_to_local_transcription_when_cloud_diarization_fails(
             started_at_monotonic=0.0,
         )
 
-        def fake_transcribe(paths, source, start_offsets=None):
+        def fake_transcribe(paths, source, start_offsets=None, on_progress=None):
             if source == "mic":
                 return [TranscriptLine(1.0, "mic", "let's get started")]
             return [TranscriptLine(2.0, "system", "sounds good")]
@@ -576,6 +576,121 @@ def test_session_stop_reports_progress_through_each_stage(tmp_path):
             ]
 
 
+class _RecordingJob:
+    """Stands in for a transcription.jobs.TranscriptionJob, keeping everything it was told in order."""
+
+    def __init__(self):
+        self.events = []
+
+    def log(self, message):
+        self.events.append(("log", message))
+
+    def set_stage(self, stage, fraction=None):
+        self.events.append(("stage", stage, fraction))
+
+    def set_progress(self, fraction):
+        self.events.append(("progress", round(fraction, 3)))
+
+
+def test_stop_tells_the_job_its_stages_and_how_far_along_this_pc_is(tmp_path):
+    from meeting_scribe.transcription import jobs
+
+    def fake_transcribe(paths, source, start_offsets=None, on_progress=None):
+        on_progress(30.0)  # half of this track's 60 s
+        on_progress(60.0)
+        return [TranscriptLine(1.0, source, "hello")]
+
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=(tmp_path / "mic.wav",), system_paths=(tmp_path / "system.wav",), started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe_parts.side_effect = fake_transcribe
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+            job = _RecordingJob()
+            messages = []
+            session.stop(on_progress=messages.append, job=job)
+
+    assert job.events == [
+        ("log", "Recording stopped."),
+        ("stage", jobs.LOCAL, 0.0),
+        # Microphone first, then system audio — each 60 s, so each is half of the whole.
+        ("progress", 0.25),
+        ("progress", 0.5),
+        ("progress", 0.75),
+        ("progress", 1.0),
+        ("log", "Transcription complete."),
+        ("stage", jobs.SAVING, None),
+        ("log", "Copilot sync folder not configured — nothing pushed."),
+        ("log", "Meeting saved."),
+    ]
+    # The caller's own on_progress still hears every message.
+    assert messages == [event[1] for event in job.events if event[0] == "log"]
+
+
+def test_a_job_waiting_for_another_transcription_is_marked_queued(tmp_path):
+    import threading
+
+    from meeting_scribe.transcription import jobs
+    from meeting_scribe.transcription.engine import transcription_slot
+
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+        from meeting_scribe.session import retry_meeting_transcription
+
+        settings = _settings(tmp_path)
+        with Database(tmp_path / "test.db") as db:
+            _project, meeting_id = _stuck_meeting(settings, db)
+            job = _RecordingJob()
+            holding, release = threading.Event(), threading.Event()
+
+            def other_transcription():
+                with transcription_slot():
+                    holding.set()
+                    release.wait(5)
+
+            other = threading.Thread(target=other_transcription)
+            other.start()
+            holding.wait(5)
+            retry = threading.Thread(target=retry_meeting_transcription, args=(settings, db, meeting_id), kwargs={"job": job})
+            retry.start()
+            for _ in range(500):
+                if ("stage", jobs.QUEUED, None) in job.events:
+                    break
+                threading.Event().wait(0.01)
+            release.set()
+            retry.join(5)
+            other.join(5)
+
+    stages = [event[1] for event in job.events if event[0] == "stage"]
+    assert stages == [jobs.QUEUED, jobs.LOCAL, jobs.SAVING]
+
+
+def test_a_cloud_job_is_marked_as_in_the_cloud(tmp_path):
+    from meeting_scribe.transcription import jobs
+
+    with patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod:
+        MockRunpod.return_value.transcribe_parts.return_value = []
+        from meeting_scribe.session import CLOUD_ENGINE, add_transcription
+
+        settings = _settings(tmp_path, runpod_api_key="key", runpod_endpoint_id="endpoint")
+        with Database(tmp_path / "test.db") as db:
+            _project, meeting_id = _stuck_meeting(settings, db)
+            db.finish_meeting(meeting_id, transcript_text="")
+            job = _RecordingJob()
+            add_transcription(settings, db, meeting_id, CLOUD_ENGINE, job=job)
+
+    assert [event[1] for event in job.events if event[0] == "stage"] == [jobs.CLOUD, jobs.SAVING]
+
+
 def test_stop_reports_a_low_memory_warning_before_transcribing(tmp_path, monkeypatch):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
@@ -825,7 +940,7 @@ def test_session_transcribes_every_recorded_part(tmp_path):
             session.start()
             session.stop()
 
-            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic", start_offsets={})
+            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic", start_offsets={}, on_progress=None)
 
 
 def _stuck_meeting(settings: Settings, db: Database, project_name="Test Project", title="Kickoff"):
@@ -845,7 +960,7 @@ def _stuck_meeting(settings: Settings, db: Database, project_name="Test Project"
 def test_retry_transcribes_recorded_audio_and_finishes_the_meeting(tmp_path):
     with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
 
-        def fake_transcribe(paths, source, start_offsets=None):
+        def fake_transcribe(paths, source, start_offsets=None, on_progress=None):
             if source == "mic":
                 return [TranscriptLine(1.0, "mic", "let's get started")]
             return [TranscriptLine(2.0, "system", "sounds good")]
@@ -919,7 +1034,7 @@ def test_retry_transcribes_every_recorded_part(tmp_path):
             retry_meeting_transcription(settings, db, meeting_id)
 
             mic_paths = (meeting_dir / "mic.wav", meeting_dir / "mic.part2.wav")
-            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic", start_offsets={})
+            MockTranscriber.return_value.transcribe_parts.assert_any_call(mic_paths, source="mic", start_offsets={}, on_progress=None)
 
 
 def test_retry_places_parts_where_the_recording_noted_they_started(tmp_path):
@@ -945,6 +1060,7 @@ def test_retry_places_parts_where_the_recording_noted_they_started(tmp_path):
                 mic_paths,
                 source="mic",
                 start_offsets={meeting_dir / "mic.wav": 0.0, meeting_dir / "mic.part2.wav": 95.5},
+                on_progress=None,
             )
 
 
@@ -972,7 +1088,7 @@ def test_session_passes_each_parts_recorded_start_time_to_transcription(tmp_path
             session.stop()
 
             MockTranscriber.return_value.transcribe_parts.assert_any_call(
-                mic_paths, source="mic", start_offsets=offsets
+                mic_paths, source="mic", start_offsets=offsets, on_progress=None
             )
 
 
@@ -1039,7 +1155,7 @@ def test_retry_replaces_segments_left_by_an_earlier_partial_attempt(tmp_path):
     # second retry has to replace those, not add to them.
     with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
 
-        def fake_transcribe(paths, source, start_offsets=None):
+        def fake_transcribe(paths, source, start_offsets=None, on_progress=None):
             return [TranscriptLine(1.0, "mic", "hello")] if source == "mic" else []
 
         MockTranscriber.return_value.transcribe_parts.side_effect = fake_transcribe
@@ -1143,7 +1259,7 @@ def test_session_leaves_out_an_empty_system_track_instead_of_failing(tmp_path, _
     assert "You: hello" in result
     assert "System audio: system.wav has no audio in it, so that track is left out of the transcript." in progress
     # Neither transcriber was asked to read the empty file.
-    assert MockTranscriber.return_value.transcribe_parts.call_args_list == [(((mic,),), {"source": "mic", "start_offsets": {}})]
+    assert MockTranscriber.return_value.transcribe_parts.call_args_list == [(((mic,),), {"source": "mic", "start_offsets": {}, "on_progress": None})]
     MockRunpod.assert_not_called()
 
 
@@ -1278,7 +1394,7 @@ def test_a_cut_off_last_line_of_on_screen_text_is_skipped(tmp_path):
 def test_retry_brings_back_the_on_screen_text_saved_during_the_meeting(tmp_path):
     with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.side_effect = (
-            lambda paths, source, start_offsets=None: [TranscriptLine(1.0, source, f"{source} speech")]
+            lambda paths, source, start_offsets=None, on_progress=None: [TranscriptLine(1.0, source, f"{source} speech")]
         )
         from meeting_scribe.session import SCREEN_TEXT_FILENAME, retry_meeting_transcription
 
@@ -1378,7 +1494,7 @@ def test_a_meeting_transcribed_here_can_be_sent_to_the_cloud_afterwards(tmp_path
 
 def test_transcribing_again_replaces_only_that_engines_lines(tmp_path):
     with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
-        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None: [
+        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None, on_progress=None: [
             TranscriptLine(1.0, source, f"new local {source}")
         ]
         from meeting_scribe.session import LOCAL_ENGINE, add_transcription, meeting_transcripts

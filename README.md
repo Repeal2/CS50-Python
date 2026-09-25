@@ -7,7 +7,8 @@ saves everything locally, and pushes.
 
 ## What it does
 
-The window has three pages, picked from the sidebar: **Record**, **Library** and **Settings**. It follows
+The window has four pages, picked from the sidebar: **Record**, **Library**, **Transcriptions** and
+**Settings**. It follows
 Windows' light/dark app setting.
 
 - **Records audio** from the microphone *and* the system output (WASAPI loopback), so both sides of a
@@ -43,13 +44,20 @@ Windows' light/dark app setting.
   around. "Attach document" files a PDF, Word doc, image or text file under the project (and the meeting,
   while one is recording, or the selected meeting in the Library).
 - **Transcribes in the background** after Stop, so the next meeting can start straight away. The
-  sidebar shows how many meetings are still finishing, and the running recording clock is shown on the
-  Record page and in the window title (so it's visible from the taskbar). Settings has two ticks — on
+  sidebar shows what's still transcribing (with a percentage when there's one), and the running
+  recording clock is shown on the Record page and in the window title (so it's visible from the taskbar). Settings has two ticks — on
   this PC, and in the cloud on a Runpod WhisperX endpoint, which also labels the other side's speakers —
   and at least one stays ticked; tick both to keep both transcripts and compare them. They apply as soon
   as they're ticked, including to the meeting being recorded. If the cloud fails and this PC wasn't
   transcribing too, it does instead. Cloud lines are split wherever the speaker changes mid-sentence, and
   a long meeting's 45-minute chunks overlap by two minutes so each speaker keeps one label across them.
+- **Shows transcription progress and history.** The Transcriptions page lists what's being transcribed
+  right now, one bar each: a measured percentage while this PC transcribes (how much of both tracks'
+  audio Whisper has worked through), how long it's taken so far and roughly how long is left, or a
+  moving bar while a meeting waits its turn (this PC transcribes one meeting at a time) or runs in the
+  cloud. Below it, every meeting with each time it was transcribed — after recording, retried, or again
+  on this PC or in the cloud — whether that finished, failed or was cut short by the app closing, how
+  long it took, and its log. **Open in Library** (or a double-click) jumps to the meeting.
 - **Keeps a searchable local library.** The Library lists meetings by project, and its search box
   (**Ctrl+F**) looks through every project's titles, transcripts, notes, minutes and attendees. Each meeting
   shows its transcripts (this PC's and the cloud's, on tabs of their own), on-screen text, notes, meeting
@@ -92,10 +100,11 @@ src/meeting_scribe/
   screen/region_picker.py  # drag-to-select a rectangle (used for Capture Attendees)
   screen/meeting_detector.py  # notices a Teams call starting/ending, for the start/stop prompts
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
+  transcription/jobs.py    # running transcriptions: stage, percentage, estimate — for the Transcriptions page
   ai/copilot_push.py    # one-way, named-file-package drop of a finished meeting to Copilot Studio
-  storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents
+  storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents, transcription runs
   storage/documents.py  # Text extraction for uploaded PDFs/docx/images/text
-  gui/app.py             # Tkinter window: Record, Library and Settings pages
+  gui/app.py             # Tkinter window: Record, Library, Transcriptions and Settings pages
   gui/theme.py           # palette (light/dark), fonts and ttk styles
   gui/meeting_prompt.py  # the "Teams meeting detected" / "Meeting ended" prompts
   main.py                 # Entry point (GUI by default; `list-projects` for scripting)

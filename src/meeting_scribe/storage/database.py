@@ -58,7 +58,22 @@ CREATE TABLE IF NOT EXISTS documents (
     added_at TEXT NOT NULL
 );
 
+-- Every transcription run of a meeting — after recording, a retry, or another engine afterwards — with
+-- how it went and what it reported, for the Transcriptions page. A row still 'running' that no job in
+-- this process owns was cut short by the app closing or crashing.
+CREATE TABLE IF NOT EXISTS transcription_runs (
+    id INTEGER PRIMARY KEY,
+    meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome TEXT NOT NULL DEFAULT 'running' CHECK (outcome IN ('running', 'done', 'failed')),
+    detail TEXT,
+    log TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_meetings_project ON meetings(project_id);
+CREATE INDEX IF NOT EXISTS idx_runs_meeting ON transcription_runs(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_segments_meeting ON transcript_segments(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
 """
@@ -352,6 +367,27 @@ class Database:
             ).fetchall()
         return [Meeting(**dict(row)) for row in rows]
 
+    def list_recent_meetings(self, limit: int = 200) -> list[Meeting]:
+        """The newest meetings across every project, newest first — the Transcriptions page's log."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM meetings ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [Meeting(**dict(row)) for row in rows]
+
+    def transcribed_engines(self) -> dict[int, set[str]]:
+        """{meeting id: the engines its spoken transcript came from} for every meeting with one — "local"
+        and/or "runpod" (a line saved before lines were tagged by engine counts as "local")."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT meeting_id, COALESCE(engine, 'local') AS engine FROM transcript_segments "
+                "WHERE source != 'screen_ocr'"
+            ).fetchall()
+        engines: dict[int, set[str]] = {}
+        for row in rows:
+            engines.setdefault(row["meeting_id"], set()).add(row["engine"])
+        return engines
+
     def get_segments(self, meeting_id: int) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(
@@ -392,6 +428,7 @@ class Database:
             ]
             self._conn.execute("DELETE FROM documents WHERE meeting_id = ?", (meeting_id,))
             self._conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?", (meeting_id,))
+            self._conn.execute("DELETE FROM transcription_runs WHERE meeting_id = ?", (meeting_id,))
             self._conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
             self._conn.commit()
         return paths
@@ -450,3 +487,45 @@ class Database:
                 "SELECT * FROM documents WHERE meeting_id = ? ORDER BY added_at DESC", (meeting_id,)
             ).fetchall()
 
+    # -- Transcription runs ------------------------------------------------
+
+    def start_transcription_run(self, meeting_id: int, kind: str) -> int:
+        """Records that a transcription of this meeting has started; `kind` says which (see
+        transcription.jobs). Returns the run's id, for append_transcription_run_log and
+        finish_transcription_run."""
+        with self._lock, closing(self._conn.cursor()) as cur:
+            cur.execute(
+                "INSERT INTO transcription_runs (meeting_id, kind, started_at) VALUES (?, ?, ?)",
+                (meeting_id, kind, _now()),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def append_transcription_run_log(self, run_id: int, line: str) -> None:
+        """Adds one line to a run's log as it happens, so a crash partway through keeps what came before."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE transcription_runs SET log = log || ? || char(10) WHERE id = ?", (line, run_id)
+            )
+            self._conn.commit()
+
+    def finish_transcription_run(self, run_id: int, outcome: str, detail: str | None = None) -> None:
+        """Marks a run 'done' or 'failed'; `detail` is the error for a failed one."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE transcription_runs SET outcome = ?, detail = ?, finished_at = ? WHERE id = ?",
+                (outcome, detail, _now(), run_id),
+            )
+            self._conn.commit()
+
+    def list_transcription_runs(self, meeting_id: int | None = None, limit: int = 500) -> list[sqlite3.Row]:
+        """Transcription runs, newest first — one meeting's, or every meeting's."""
+        with self._lock:
+            if meeting_id is None:
+                return self._conn.execute(
+                    "SELECT * FROM transcription_runs ORDER BY started_at DESC, id DESC LIMIT ?", (limit,)
+                ).fetchall()
+            return self._conn.execute(
+                "SELECT * FROM transcription_runs WHERE meeting_id = ? ORDER BY started_at DESC, id DESC LIMIT ?",
+                (meeting_id, limit),
+            ).fetchall()

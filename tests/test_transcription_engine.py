@@ -1,6 +1,7 @@
 import contextlib
 import sys
 import wave
+from pathlib import Path
 from types import ModuleType
 
 from meeting_scribe.transcription.engine import (
@@ -156,7 +157,7 @@ def test_transcribe_parts_puts_every_part_back_on_the_meetings_clock(tmp_path, m
     _write_wav(first, seconds=60.0)
     _write_wav(second, seconds=30.0)
 
-    def fake_transcribe(self, audio_path, source):
+    def fake_transcribe(self, audio_path, source, on_progress=None):
         said = "first part" if audio_path == first else "second part"
         return [TranscriptLine(5.0, source, said)]
 
@@ -181,7 +182,7 @@ def test_transcribe_parts_places_each_part_where_the_recorder_says_it_started(tm
     monkeypatch.setattr(
         WhisperTranscriber,
         "transcribe",
-        lambda self, audio_path, source: [TranscriptLine(1.0, source, audio_path.name)],
+        lambda self, audio_path, source, on_progress=None: [TranscriptLine(1.0, source, audio_path.name)],
     )
 
     lines = WhisperTranscriber(model_size="tiny").transcribe_parts(
@@ -202,12 +203,49 @@ def test_transcribe_parts_of_a_single_file_leaves_timestamps_alone(tmp_path, mon
     monkeypatch.setattr(
         WhisperTranscriber,
         "transcribe",
-        lambda self, audio_path, source: [TranscriptLine(3.0, source, "hello")],
+        lambda self, audio_path, source, on_progress=None: [TranscriptLine(3.0, source, "hello")],
     )
 
     lines = WhisperTranscriber(model_size="tiny").transcribe_parts([only], source="mic")
 
     assert [(line.timestamp_seconds, line.text) for line in lines] == [(3.0, "hello")]
+
+
+def test_transcribe_reports_how_far_into_the_file_it_has_got(monkeypatch):
+    class Segment:
+        def __init__(self, start, end, text):
+            self.start, self.end, self.text = start, end, text
+
+    class Model:
+        def transcribe(self, path, vad_filter):
+            return iter([Segment(0.0, 4.0, "hello"), Segment(4.0, 9.5, "  "), Segment(9.5, 12.0, "bye")]), None
+
+    transcriber = WhisperTranscriber(model_size="tiny")
+    monkeypatch.setattr(transcriber, "_ensure_model", lambda: Model())
+    seen = []
+
+    lines = transcriber.transcribe(Path("mic.wav"), "mic", on_progress=seen.append)
+
+    assert seen == [4.0, 9.5, 12.0]  # a blank segment still moves progress along
+    assert [line.text for line in lines] == ["hello", "bye"]
+
+
+def test_transcribe_parts_reports_progress_across_every_part(tmp_path, monkeypatch):
+    first, second = tmp_path / "mic.wav", tmp_path / "mic.part2.wav"
+    _write_wav(first, seconds=60.0)
+    _write_wav(second, seconds=30.0)
+
+    def fake_transcribe(self, audio_path, source, on_progress=None):
+        on_progress(10.0)
+        return []
+
+    monkeypatch.setattr(WhisperTranscriber, "transcribe", fake_transcribe)
+    seen = []
+
+    WhisperTranscriber(model_size="tiny").transcribe_parts([first, second], source="mic", on_progress=seen.append)
+
+    # Each part counts from where the ones before it left off, and a finished part counts in full.
+    assert seen == [10.0, 60.0, 70.0, 90.0]
 
 
 def test_transcription_slot_runs_one_transcription_at_a_time():
