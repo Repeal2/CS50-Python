@@ -34,8 +34,11 @@ Windows' light/dark app setting.
   it arrives, so it survives a crash and a Retry.
 - **Takes notes as you go.** The Notes panel saves as you type. Enter continues a bullet, Tab / Shift+Tab
   indent and outdent, and **Ctrl+T** stamps the recording time (`[12:34]`) using the same clock as the
-  transcript. The project and title stay editable for the whole meeting, and the title dropdown suggests
-  titles already used in the project.
+  transcript. The toolbar above the notes adds headings (**H1** / **H2**), **bold** (**Ctrl+B**),
+  _italic_ (**Ctrl+I**) and bullets, kept as Markdown-style markers so the saved notes stay plain text.
+  Beside the notes, **Previous meeting minutes** shows the minutes of the last meeting with the same
+  title in the same project, for recurring meetings. The project and title stay editable for the whole
+  meeting, and the title dropdown suggests titles already used in the project.
 - **Captures attendees and documents.** "Capture attendees" reads a participants panel you drag a box
   around. "Attach document" files a PDF, Word doc, image or text file under the project (and the meeting,
   while one is recording, or the selected meeting in the Library).
@@ -48,8 +51,9 @@ Windows' light/dark app setting.
   transcribing too, it does instead. Cloud lines are split wherever the speaker changes mid-sentence, and
   a long meeting's 45-minute chunks overlap by two minutes so each speaker keeps one label across them.
 - **Keeps a searchable local library.** The Library lists meetings by project, and its search box
-  (**Ctrl+F**) looks through every project's titles, transcripts, notes and attendees. Each meeting shows
-  its transcripts (this PC's and the cloud's, on tabs of their own), on-screen text, notes, attendees and
+  (**Ctrl+F**) looks through every project's titles, transcripts, notes, minutes and attendees. Each meeting
+  shows its transcripts (this PC's and the cloud's, on tabs of their own), on-screen text, notes, meeting
+  minutes, attendees and
   documents, with **Copy**, **Export…** (one plain-text file with every section), **Attach document**,
   **Open folder**, **Transcribe on this PC** / **Transcribe in cloud** to make (or remake) either
   transcript from the meeting's recording afterwards, and **Delete…** (or the Delete key), which removes

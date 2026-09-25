@@ -418,3 +418,29 @@ def test_search_meetings_treats_like_wildcards_literally(tmp_path):
 
         assert [meeting.id for meeting in db.search_meetings("%")] == [literal]
         assert db.search_meetings("_3") == []
+
+
+def test_minutes_are_saved_and_searchable(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        project = db.create_project("Minutes")
+        meeting = db.create_meeting(project.id, "Weekly sync")
+        assert db.get_meeting(meeting).minutes is None
+        db.set_minutes(meeting, "Agreed to ship the pilot")
+
+        assert db.get_meeting(meeting).minutes == "Agreed to ship the pilot"
+        assert [m.id for m in db.search_meetings("pilot")] == [meeting]
+
+
+def test_get_previous_occurrence_finds_the_latest_same_titled_meeting_in_the_project(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        acme = db.create_project("Acme")
+        other = db.create_project("Other")
+        db.create_meeting(acme.id, "Weekly sync", started_at="2026-09-01T09:00:00+00:00")
+        latest = db.create_meeting(acme.id, "Weekly sync", started_at="2026-09-08T09:00:00+00:00")
+        db.create_meeting(acme.id, "Retro", started_at="2026-09-10T09:00:00+00:00")
+        db.create_meeting(other.id, "Weekly sync", started_at="2026-09-12T09:00:00+00:00")
+        current = db.create_meeting(acme.id, "Weekly sync", started_at="2026-09-15T09:00:00+00:00")
+
+        assert db.get_previous_occurrence(acme.id, "Weekly sync", exclude_meeting_id=current).id == latest
+        assert db.get_previous_occurrence(acme.id, "Weekly sync").id == current
+        assert db.get_previous_occurrence(acme.id, "Kickoff") is None

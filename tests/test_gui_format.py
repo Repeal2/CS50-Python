@@ -206,3 +206,21 @@ def test_safe_filename_replaces_characters_windows_rejects():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     assert gui_app._safe_filename('Q3: plan/"final"?') == "Q3 plan final"
     assert gui_app._safe_filename("???") == "meeting"
+
+
+def test_notes_format_spans_style_a_heading_and_dim_its_marker():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._notes_format_spans("## Actions") == [("h2", 3, 10), ("marker", 0, 3)]
+
+
+def test_notes_format_spans_style_bold_and_italic_text():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    spans = gui_app._notes_format_spans("- **ship** it _now_")
+    assert ("bold", 4, 8) in spans
+    assert ("italic", 15, 18) in spans
+    assert spans.count(("marker", 2, 4)) == 1
+
+
+def test_notes_format_spans_leave_snake_case_and_plain_hashes_alone():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._notes_format_spans("see meeting_scribe_app for #3") == []

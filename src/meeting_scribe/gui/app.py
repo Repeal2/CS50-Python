@@ -75,6 +75,20 @@ DEFAULT_MEETING_TITLE = "Untitled meeting"
 _NOTES_BULLET_PREFIX = re.compile(r"^[ \t]*(?:[-*•]\s+)?")
 _NOTES_INDENT = "    "
 
+# Notes formatting is kept as Markdown-style markers in the saved text — "# " / "## " headings, **bold**,
+# _italic_ — so it stays readable when exported or pushed as plain text, and the editor styles it live.
+_NOTES_HEADING = re.compile(r"^(#{1,2}) \S.*$")
+_NOTES_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
+_NOTES_ITALIC = re.compile(r"(?<!\w)_(?=[^\s_])(.+?)(?<=[^\s_])_(?!\w)")
+_NOTES_LIST_MARKER = re.compile(r"^([ \t]*)([-*•] )?")
+_NOTES_HEADING_MARKER = re.compile(r"^#{1,2} ")
+
+_NO_PREVIOUS_MINUTES = (
+    "When this is a recurring meeting — the same title in the same project — the last meeting's minutes "
+    "show here."
+)
+_NO_MINUTES = "No minutes have been written for this meeting yet."
+
 _DOCUMENT_FILETYPES = [
     ("Supported documents", "*.pdf *.docx *.txt *.md *.png *.jpg *.jpeg *.bmp *.tiff"),
     ("All files", "*.*"),
@@ -166,6 +180,7 @@ def _meeting_export_text(
         *transcripts,
         ("On-screen text", screen),
         ("Notes", meeting.manual_notes),
+        ("Meeting minutes", meeting.minutes),
         ("Attendees", meeting.attendees),
     ):
         if body and body.strip():
@@ -247,7 +262,7 @@ def _enable_per_monitor_dpi_awareness() -> None:
 # --- small widgets --------------------------------------------------------------------------------
 
 
-def _card(parent: tk.Misc, title: str | None = None, *, padding: int = 16) -> tuple[ttk.Frame, ttk.Frame]:
+def _card(parent: tk.Misc, title: str | None = None, *, padding: int | tuple[int, ...] = 16) -> tuple[ttk.Frame, ttk.Frame]:
     """A bordered surface with an optional title. Returns (card, body) — pack/grid the card, fill the body."""
     card = ttk.Frame(parent, style="Card.TFrame")
     body = ttk.Frame(card, style="Card.TFrame", borderwidth=0, padding=padding)
@@ -293,6 +308,49 @@ def _set_readonly_text(widget: tk.Text, content: str) -> None:
     widget.delete("1.0", "end")
     widget.insert("1.0", content)
     widget.configure(state="disabled")
+
+
+def _notes_format_spans(line: str) -> list[tuple[str, int, int]]:
+    """(tag, start column, end column) spans styling one line of notes: the heading, bold and italic text,
+    and the markers around them, which are dimmed rather than hidden so they stay editable."""
+    spans: list[tuple[str, int, int]] = []
+    heading = _NOTES_HEADING.match(line)
+    if heading:
+        marker_end = len(heading.group(1)) + 1
+        spans.append(("h1" if len(heading.group(1)) == 1 else "h2", marker_end, len(line)))
+        spans.append(("marker", 0, marker_end))
+    for pattern, tag, marker_len in ((_NOTES_BOLD, "bold", 2), (_NOTES_ITALIC, "italic", 1)):
+        for match in pattern.finditer(line):
+            start, end = match.span()
+            spans.append((tag, start + marker_len, end - marker_len))
+            spans.append(("marker", start, start + marker_len))
+            spans.append(("marker", end - marker_len, end))
+    return spans
+
+
+def _configure_notes_tags(widget: tk.Text, palette: Palette, fonts) -> None:
+    """Sets up the tags _highlight_notes applies — for the notes editor and every read-only view of notes."""
+    body = fonts.body.actual()
+    widget.tag_configure("h1", font=fonts.title, spacing1=8, spacing3=2)
+    widget.tag_configure("h2", font=fonts.strong, spacing1=6, spacing3=2)
+    widget.tag_configure("bold", font=fonts.strong)
+    widget.tag_configure("italic", font=(body["family"], body["size"], "italic"))
+    widget.tag_configure("marker", foreground=palette.muted)
+    widget.tag_raise("marker")
+
+
+def _highlight_notes(widget: tk.Text) -> None:
+    """Re-styles the notes' Markdown-style formatting — cheap enough to run after every keystroke."""
+    for tag in ("h1", "h2", "bold", "italic", "marker"):
+        widget.tag_remove(tag, "1.0", "end")
+    for line_number, line in enumerate(widget.get("1.0", "end-1c").split("\n"), start=1):
+        for tag, start, end in _notes_format_spans(line):
+            widget.tag_add(tag, f"{line_number}.{start}", f"{line_number}.{end}")
+
+
+def _set_readonly_notes(widget: tk.Text, content: str) -> None:
+    _set_readonly_text(widget, content)
+    _highlight_notes(widget)
 
 
 class _PlaceholderEntry(ttk.Entry):
@@ -784,7 +842,6 @@ class MeetingScribeApp(tk.Tk):
 class RecordPage(ttk.Frame):
     # Long enough to say a sentence into the microphone, short enough that nobody skips the test.
     MIC_TEST_SECONDS = 3.0
-    _IDLE_HINT = "An OCR box appears on screen when recording starts — drag it over the captions, then press Start OCR."
     _RECORDING_HINT = "Recording. Stopping transcribes in the background, so you can start the next meeting right away."
 
     def __init__(self, parent: tk.Misc, app: MeetingScribeApp):
@@ -801,11 +858,6 @@ class RecordPage(ttk.Frame):
         self._manual_notes_save_after_id: str | None = None
         # A mic test's result holds the line under the meters for a few seconds — see _on_mic_test_done.
         self._mic_test_result: str | None = None
-
-        header = ttk.Frame(self)
-        header.pack(fill="x", pady=(0, 16))
-        ttk.Label(header, text="Record", style="Heading.TLabel").pack(side="left")
-        self._rec_pill = ttk.Label(header, style="RecPill.TLabel")
 
         # Meeting card: what's being recorded, and the one big button.
         meeting_card, meeting = _card(self)
@@ -836,6 +888,7 @@ class RecordPage(ttk.Frame):
         actions.grid(row=2, column=0, columnspan=5, sticky="we", pady=(16, 0))
         self.record_button = ttk.Button(actions, text="●  Start recording", style="Record.TButton", command=self.start)
         self.record_button.pack(side="left")
+        self._rec_pill = ttk.Label(actions, style="RecPill.TLabel")
         ttk.Button(actions, text="Reset OCR box", style="Link.TButton", command=self._reset_ocr_box).pack(side="right")
         ttk.Button(actions, text="Attach document", style="Link.TButton", command=self._upload_document).pack(
             side="right"
@@ -845,14 +898,14 @@ class RecordPage(ttk.Frame):
             state="disabled",
         )
         self.capture_attendees_button.pack(side="right")
-        self._hint_var = tk.StringVar(value=self._IDLE_HINT)
-        ttk.Label(meeting, textvariable=self._hint_var, style="Card.Muted.TLabel").grid(
-            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0)
-        )
+        # Shown only while recording.
+        self._hint = ttk.Label(meeting, text=self._RECORDING_HINT, style="Card.Muted.TLabel")
+        self._hint.grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self._hint.grid_remove()
 
         # Audio card: device pickers with live meters right next to them.
-        audio_card, audio = _card(self, padding=14)
-        audio_card.pack(fill="x", pady=(14, 0))
+        audio_card, audio = _card(self, padding=(14, 8))
+        audio_card.pack(fill="x", pady=(12, 0))
         audio.columnconfigure(2, weight=1)
         self.mic_var = tk.StringVar(value=app.settings.mic_device_name or SYSTEM_DEFAULT_LABEL)
         self.system_var = tk.StringVar(value=app.settings.system_device_name or SYSTEM_DEFAULT_LABEL)
@@ -867,48 +920,82 @@ class RecordPage(ttk.Frame):
         # Inline rather than a dialog: a modal mid-meeting would steal focus from the call.
         self._input_warning = ttk.Label(audio, style="Card.Danger.TLabel", wraplength=760, justify="left")
         self._input_warning.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        self._audio_status = ""
+        self._audio_status: str | None = None  # None forces the first _set_audio_status to hide the line
         self._set_audio_status("")
 
-        # Notes beside the activity log.
-        panes = ttk.PanedWindow(self, orient="horizontal")
-        panes.pack(fill="both", expand=True, pady=(14, 0))
+        # Notes beside the previous meeting's minutes, with the activity log along the bottom.
+        body = ttk.PanedWindow(self, orient="vertical")
+        body.pack(fill="both", expand=True, pady=(12, 0))
+        panes = ttk.PanedWindow(body, orient="horizontal")
+        body.add(panes, weight=4)
 
         notes_card, notes = _card(panes, padding=0)
-        notes_header = ttk.Frame(notes, style="Card.TFrame", borderwidth=0, padding=(14, 10, 10, 4))
+        notes_header = ttk.Frame(notes, style="Card.TFrame", borderwidth=0, padding=(14, 8, 10, 4))
         notes_header.pack(fill="x")
-        ttk.Label(notes_header, text="Notes", style="Card.Title.TLabel").pack(side="left")
-        ttk.Button(notes_header, text="Insert time  Ctrl+T", style="Link.TButton", command=self._insert_timestamp).pack(
+        ttk.Label(notes_header, text="Notes", style="Card.Title.TLabel").pack(side="left", padx=(0, 12))
+        # Formatting toolbar — each button also has a shortcut, listed in its label or below.
+        self._format_buttons = []
+        for text, command in (
+            ("H1", lambda: self._toggle_heading(1)),
+            ("H2", lambda: self._toggle_heading(2)),
+            ("B", lambda: self._toggle_inline("**")),
+            ("I", lambda: self._toggle_inline("_")),
+            ("• List", self._toggle_bullet),
+        ):
+            button = ttk.Button(notes_header, text=text, style="Link.TButton", command=command, state="disabled")
+            button.pack(side="left")
+            self._format_buttons.append(button)
+        ttk.Button(notes_header, text="Time  Ctrl+T", style="Link.TButton", command=self._insert_timestamp).pack(
             side="right"
         )
-        notes_frame, self.manual_notes_editor = _scrolled_text(notes, palette, fonts.body, undo=True)
+        notes_frame, self.manual_notes_editor = _scrolled_text(notes, palette, fonts.body, undo=True, height=8, width=60)
         notes_frame.pack(fill="both", expand=True, padx=(2, 0), pady=(0, 2))
+        _configure_notes_tags(self.manual_notes_editor, palette, fonts)
         self.manual_notes_editor.insert(
             "1.0",
             "Notes open here when recording starts, and save as you type.\n\n"
             "- Start a line with \"- \" and Enter continues the bullet\n"
             "    - Tab and Shift+Tab indent and outdent\n"
+            "- H1 / H2 make a heading; **B** (Ctrl+B) and _I_ (Ctrl+I) bold or italicize the selection\n"
             "- Ctrl+T stamps the recording time, to match the transcript",
         )
+        _highlight_notes(self.manual_notes_editor)
         self.manual_notes_editor.configure(state="disabled", foreground=palette.muted)
-        self.manual_notes_editor.bind("<KeyRelease>", self._schedule_manual_notes_save)
+        self.manual_notes_editor.bind("<KeyRelease>", self._on_manual_notes_edited)
         self.manual_notes_editor.bind("<Return>", self._on_manual_notes_return)
         self.manual_notes_editor.bind("<Tab>", self._on_manual_notes_indent)
         self.manual_notes_editor.bind("<Shift-Tab>", self._on_manual_notes_dedent)
         self.manual_notes_editor.bind("<Control-t>", self._insert_timestamp)
+        self.manual_notes_editor.bind("<Control-b>", lambda _e: self._toggle_inline("**"))
+        self.manual_notes_editor.bind("<Control-i>", lambda _e: self._toggle_inline("_"))
         panes.add(notes_card, weight=3)
 
-        log_card, log = _card(panes, padding=0)
-        log_header = ttk.Frame(log, style="Card.TFrame", borderwidth=0, padding=(14, 10, 10, 4))
+        # The last occurrence's minutes, for a recurring meeting — see _refresh_previous_minutes.
+        minutes_card, minutes = _card(panes, padding=0)
+        minutes_header = ttk.Frame(minutes, style="Card.TFrame", borderwidth=0, padding=(14, 8, 10, 4))
+        minutes_header.pack(fill="x")
+        ttk.Label(minutes_header, text="Previous meeting minutes", style="Card.Title.TLabel").pack(side="left")
+        self._previous_minutes_when = ttk.Label(minutes_header, style="Card.Muted.TLabel")
+        self._previous_minutes_when.pack(side="right")
+        minutes_frame, self.previous_minutes = _scrolled_text(
+            minutes, palette, fonts.body, state="disabled", height=8, width=40
+        )
+        minutes_frame.pack(fill="both", expand=True, padx=(2, 0), pady=(0, 2))
+        _configure_notes_tags(self.previous_minutes, palette, fonts)
+        panes.add(minutes_card, weight=2)
+
+        log_card, log = _card(body, padding=0)
+        log_header = ttk.Frame(log, style="Card.TFrame", borderwidth=0, padding=(14, 6, 10, 2))
         log_header.pack(fill="x")
         ttk.Label(log_header, text="Activity", style="Card.Title.TLabel").pack(side="left")
         ttk.Button(log_header, text="Clear", style="Link.TButton", command=self._clear_log).pack(side="right")
-        log_frame, self.output = _scrolled_text(log, palette, fonts.mono, state="disabled")
+        log_frame, self.output = _scrolled_text(log, palette, fonts.mono, state="disabled", height=4)
         self.output.configure(foreground=palette.muted)
         log_frame.pack(fill="both", expand=True, padx=(2, 0), pady=(0, 2))
-        panes.add(log_card, weight=2)
+        body.add(log_card, weight=1)
 
         self.refresh_projects()
+        self._refresh_previous_minutes()
         self.apply_device_lists(*_enumerate_devices())
         self._poll_audio_levels()
 
@@ -928,7 +1015,7 @@ class RecordPage(ttk.Frame):
             self._rec_pill.pack_forget()
         else:
             self._rec_pill.configure(text=f"●  Recording  {elapsed}")
-            self._rec_pill.pack(side="right")
+            self._rec_pill.pack(side="left", padx=(12, 0))
 
     # -- projects / titles --------------------------------------------------------------------------
 
@@ -950,6 +1037,7 @@ class RecordPage(ttk.Frame):
         than on every keystroke — moving a meeting creates the project, which mustn't happen per letter.
         Refreshes the title suggestions and, mid-meeting, moves the meeting to this project."""
         self._refresh_title_suggestions()
+        self._refresh_previous_minutes()
         session = self.app._session
         project_name = self.project_var.get().strip()
         if session is None or not project_name or project_name == session.project.name:
@@ -960,10 +1048,34 @@ class RecordPage(ttk.Frame):
     def _on_title_changed(self, *_args) -> None:
         """The title stays editable for the whole meeting; each change is saved straight away."""
         session = self.app._session
-        if session is None:
+        if session is not None:
+            session.title = self.title_var.get()
+            self.app.db.update_meeting_title(session.meeting_id, session.title)
+        self._refresh_previous_minutes()
+
+    def _refresh_previous_minutes(self) -> None:
+        """Shows the minutes of the last meeting with this project and title — a recurring meeting's
+        previous occurrence — so they can be read before and during the next one."""
+        session = self.app._session
+        project = self.app.db.get_project_by_name(self.project_var.get().strip())
+        title = self.title_var.get().strip()
+        previous = None
+        if project is not None and title and title != DEFAULT_MEETING_TITLE:
+            previous = self.app.db.get_previous_occurrence(
+                project.id, title, exclude_meeting_id=session.meeting_id if session is not None else None
+            )
+        if previous is None:
+            self._previous_minutes_when.configure(text="")
+            _set_readonly_text(self.previous_minutes, _NO_PREVIOUS_MINUTES)
+            self.previous_minutes.configure(foreground=self.app.palette.muted)
             return
-        session.title = self.title_var.get()
-        self.app.db.update_meeting_title(session.meeting_id, session.title)
+        self._previous_minutes_when.configure(text=_format_short_date(previous.started_at))
+        if previous.minutes:
+            _set_readonly_notes(self.previous_minutes, previous.minutes)
+            self.previous_minutes.configure(foreground=self.app.palette.text)
+        else:
+            _set_readonly_text(self.previous_minutes, _NO_MINUTES)
+            self.previous_minutes.configure(foreground=self.app.palette.muted)
 
     # -- audio ----------------------------------------------------------------------------------------
 
@@ -1234,12 +1346,16 @@ class RecordPage(ttk.Frame):
         self.title_var.set(meeting_title)
         self.record_button.configure(text="■  Stop recording", style="Stop.TButton", command=self.stop)
         self.capture_attendees_button.configure(state="normal")
-        self._hint_var.set(self._RECORDING_HINT)
+        self._hint.grid()
 
         self.manual_notes_editor.configure(state="normal", foreground=self.app.palette.text)
         self.manual_notes_editor.delete("1.0", "end")
         self.manual_notes_editor.edit_reset()
+        _highlight_notes(self.manual_notes_editor)
         self.manual_notes_editor.focus_set()
+        for button in self._format_buttons:
+            button.configure(state="normal")
+        self._refresh_previous_minutes()
 
         # The log isn't cleared: a previous meeting may still be logging its finish-up, and the [title]
         # prefix keeps overlapping meetings' lines apart.
@@ -1257,8 +1373,10 @@ class RecordPage(ttk.Frame):
 
         self.record_button.configure(text="●  Start recording", style="Record.TButton", command=self.start)
         self.capture_attendees_button.configure(state="disabled")
-        self._hint_var.set(self._IDLE_HINT)
+        self._hint.grid_remove()
         self.manual_notes_editor.configure(state="disabled")
+        for button in self._format_buttons:
+            button.configure(state="disabled")
         self.log(f"[{session.title}] Stopped — transcribing in the background.")
         self.close_ocr_box()
         settings = self.app.settings
@@ -1291,6 +1409,88 @@ class RecordPage(ttk.Frame):
         )
 
     # -- notes ------------------------------------------------------------------------------------------
+
+    def _on_manual_notes_edited(self, _event=None) -> None:
+        _highlight_notes(self.manual_notes_editor)
+        self._schedule_manual_notes_save()
+
+    def _notes_editable(self) -> bool:
+        return str(self.manual_notes_editor.cget("state")) == "normal"
+
+    def _after_notes_format(self) -> str:
+        self.manual_notes_editor.focus_set()
+        self._on_manual_notes_edited()
+        return "break"
+
+    def _toggle_heading(self, level: int) -> str:
+        """Makes the current line a heading of this level, or back into plain text if it already is one."""
+        if not self._notes_editable():
+            return "break"
+        editor = self.manual_notes_editor
+        line_start = editor.index("insert linestart")
+        line = editor.get(line_start, "insert lineend")
+        existing = _NOTES_HEADING_MARKER.match(line)
+        marker = "#" * level + " "
+        editor.edit_separator()
+        if existing:
+            editor.delete(line_start, f"{line_start}+{len(existing.group(0))}c")
+        if existing is None or existing.group(0) != marker:
+            # A heading replaces any bullet/indent — "# - x" wouldn't read as either.
+            prefix = _NOTES_LIST_MARKER.match(editor.get(line_start, "insert lineend")).group(0)
+            if prefix:
+                editor.delete(line_start, f"{line_start}+{len(prefix)}c")
+            editor.insert(line_start, marker)
+        editor.edit_separator()
+        return self._after_notes_format()
+
+    def _toggle_inline(self, marker: str) -> str:
+        """Wraps the selection in a bold/italic marker, or unwraps it if it's already wrapped. With nothing
+        selected, inserts an empty pair with the cursor between, ready to type into."""
+        if not self._notes_editable():
+            return "break"
+        editor = self.manual_notes_editor
+        editor.edit_separator()
+        if editor.tag_ranges("sel"):
+            start, end = editor.index("sel.first"), editor.index("sel.last")
+            selected = editor.get(start, end)
+            before = editor.get(f"{start}-{len(marker)}c", start)
+            after = editor.get(end, f"{end}+{len(marker)}c")
+            if len(selected) >= 2 * len(marker) and selected.startswith(marker) and selected.endswith(marker):
+                editor.delete(start, end)
+                editor.insert(start, selected[len(marker):-len(marker)])
+            elif before == marker and after == marker:
+                editor.delete(end, f"{end}+{len(marker)}c")
+                editor.delete(f"{start}-{len(marker)}c", start)
+            else:
+                editor.insert(end, marker)
+                editor.insert(start, marker)
+            editor.tag_remove("sel", "1.0", "end")
+        else:
+            editor.insert("insert", marker * 2)
+            editor.mark_set("insert", f"insert-{len(marker)}c")
+        editor.edit_separator()
+        return self._after_notes_format()
+
+    def _toggle_bullet(self) -> str:
+        """Starts the current line with "- " (after its indent), or takes the bullet off if it has one."""
+        if not self._notes_editable():
+            return "break"
+        editor = self.manual_notes_editor
+        line_start = editor.index("insert linestart")
+        line = editor.get(line_start, "insert lineend")
+        heading = _NOTES_HEADING_MARKER.match(line)
+        editor.edit_separator()
+        if heading:
+            editor.delete(line_start, f"{line_start}+{len(heading.group(0))}c")
+            line = line[len(heading.group(0)):]
+        indent, bullet = _NOTES_LIST_MARKER.match(line).groups()
+        position = f"{line_start}+{len(indent)}c"
+        if bullet:
+            editor.delete(position, f"{position}+{len(bullet)}c")
+        else:
+            editor.insert(position, "- ")
+        editor.edit_separator()
+        return self._after_notes_format()
 
     def _schedule_manual_notes_save(self, _event=None) -> None:
         """Debounced: saves ~400ms after typing pauses rather than on every keystroke."""
@@ -1337,7 +1537,7 @@ class RecordPage(ttk.Frame):
         if self.app._session is not None:
             self.manual_notes_editor.insert("insert", _notes_timestamp(self.app.elapsed_seconds()))
             self.manual_notes_editor.focus_set()
-            self._schedule_manual_notes_save()
+            self._on_manual_notes_edited()
         return "break"
 
     # -- documents / attendees -------------------------------------------------------------------------
@@ -1489,6 +1689,9 @@ class LibraryPage(ttk.Frame):
         self.cloud_text = self._text_tab("Transcript · cloud")
         self.ocr_text = self._text_tab("On screen")
         self.manual_notes_text = self._text_tab("Notes")
+        _configure_notes_tags(self.manual_notes_text, palette, app.fonts)
+        self.minutes_text = self._text_tab("Meeting Minutes")
+        _configure_notes_tags(self.minutes_text, palette, app.fonts)
         self.attendees_text = self._text_tab("Attendees")
         self._build_documents_tab()
 
@@ -1642,7 +1845,8 @@ class LibraryPage(ttk.Frame):
         if finished and not local and cloud and self.detail_notebook.index("current") == 0:
             self.detail_notebook.select(1)  # open on the transcript there is
         _set_readonly_text(self.ocr_text, screen or "No on-screen text was captured.")
-        _set_readonly_text(self.manual_notes_text, meeting.manual_notes or "No notes were taken.")
+        _set_readonly_notes(self.manual_notes_text, meeting.manual_notes or "No notes were taken.")
+        _set_readonly_notes(self.minutes_text, meeting.minutes or _NO_MINUTES)
         _set_readonly_text(self.attendees_text, meeting.attendees or "No attendees were captured.")
         self._load_documents(meeting.id)
 
@@ -1676,8 +1880,8 @@ class LibraryPage(ttk.Frame):
     def _copy_current_tab(self) -> None:
         tab = self.detail_notebook.index("current")
         widget = [
-            self.local_text, self.cloud_text, self.ocr_text, self.manual_notes_text, self.attendees_text,
-            self.document_viewer,
+            self.local_text, self.cloud_text, self.ocr_text, self.manual_notes_text, self.minutes_text,
+            self.attendees_text, self.document_viewer,
         ][tab]
         self.clipboard_clear()
         self.clipboard_append(widget.get("1.0", "end-1c"))

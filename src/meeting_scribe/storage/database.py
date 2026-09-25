@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS meetings (
     notes_markdown TEXT,
     manual_notes TEXT,
     attendees TEXT,
-    meeting_code TEXT
+    meeting_code TEXT,
+    minutes TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transcript_segments (
@@ -75,6 +76,8 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE meetings ADD COLUMN attendees TEXT")
     if "meeting_code" not in meetings_columns:
         conn.execute("ALTER TABLE meetings ADD COLUMN meeting_code TEXT")
+    if "minutes" not in meetings_columns:
+        conn.execute("ALTER TABLE meetings ADD COLUMN minutes TEXT")
 
     documents_columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
     if "source_path" not in documents_columns:
@@ -139,6 +142,9 @@ class Meeting:
     manual_notes: str | None
     attendees: str | None
     meeting_code: str | None
+    # The meeting's minutes — a summary written after the meeting, shown in the Library's Meeting Minutes
+    # tab and, for a recurring meeting, on the Record page when its next occurrence starts.
+    minutes: str | None = None
 
 
 class Database:
@@ -274,6 +280,25 @@ class Database:
             )
             self._conn.commit()
 
+    def set_minutes(self, meeting_id: int, minutes: str | None) -> None:
+        """Overwrites the meeting's minutes."""
+        with self._lock:
+            self._conn.execute("UPDATE meetings SET minutes = ? WHERE id = ?", (minutes, meeting_id))
+            self._conn.commit()
+
+    def get_previous_occurrence(
+        self, project_id: int, title: str, *, exclude_meeting_id: int | None = None
+    ) -> Meeting | None:
+        """The most recent meeting with this title in this project — the last occurrence of a recurring
+        meeting — leaving out `exclude_meeting_id` (the one being recorded). None if there isn't one."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM meetings WHERE project_id = ? AND title = ? AND id IS NOT ? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (project_id, title, exclude_meeting_id),
+            ).fetchone()
+        return Meeting(**dict(row)) if row else None
+
     def update_meeting_title(self, meeting_id: int, title: str) -> None:
         """Renames a meeting in place — the title can be edited any time up until the meeting ends,
         not just fixed at Start."""
@@ -316,10 +341,10 @@ class Database:
         return [Meeting(**dict(row)) for row in rows]
 
     def search_meetings(self, query: str) -> list[Meeting]:
-        """Meetings in any project whose title, transcript, manual notes or attendee list contains
+        """Meetings in any project whose title, transcript, manual notes, attendee list or minutes contains
         `query` (case-insensitive), newest first — the Library tab's search box."""
         pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        columns = ("title", "transcript_text", "manual_notes", "attendees")
+        columns = ("title", "transcript_text", "manual_notes", "attendees", "minutes")
         where = " OR ".join(f"{column} LIKE ? ESCAPE '\\'" for column in columns)
         with self._lock:
             rows = self._conn.execute(
