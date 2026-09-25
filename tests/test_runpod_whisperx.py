@@ -20,6 +20,11 @@ from meeting_scribe.transcription.runpod_whisperx import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_waiting_between_retries(monkeypatch):
+    monkeypatch.setattr(runpod_whisperx, "_RETRY_DELAYS_SECONDS", (0.0, 0.0))
+
+
 def _write_wav(path, seconds, framerate=48000, channels=2):
     """A silent WAV in the loopback recorder's usual format. Compressing it (see speech_encoding) needs
     PyAV, which faster-whisper already depends on."""
@@ -515,3 +520,130 @@ def test_transcription_works_end_to_end_without_the_requests_package(tmp_path, m
     method, path, authorization, body = received[0]
     assert (method, path, authorization) == ("POST", "/run", "Bearer k")
     assert json.loads(body)["input"]["audio_file"].startswith("data:audio/ogg;base64,")
+
+
+# --- dropped connections are retried -----------------------------------------------------------------------
+
+import urllib.error  # noqa: E402
+
+
+def _reset():
+    # Exactly what Windows gave in the field: urllib wrapping WinError 10054.
+    return urllib.error.URLError(
+        ConnectionResetError(10054, "An existing connection was forcibly closed by the remote host", None, 10054, None)
+    )
+
+
+class FlakyRunpod(FakeRunpod):
+    """FakeRunpod whose POST /run and GET /status fail the first `post_failures` / `get_failures` times —
+    raising each item if it's an exception, or answering with it as a status code otherwise."""
+
+    def __init__(self, *job_statuses, post_failures=(), get_failures=()):
+        super().__init__(*job_statuses)
+        self.post_failures, self.get_failures = list(post_failures), list(get_failures)
+        self.gets = 0
+
+    @staticmethod
+    def _fail(failure):
+        if isinstance(failure, BaseException):
+            raise failure
+        return FakeResponse(status_code=failure, text="busy")
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        if url.endswith("/run") and self.post_failures:
+            return self._fail(self.post_failures.pop(0))
+        return super().post(url, headers=headers, json=json, timeout=timeout)
+
+    def get(self, url, headers=None, timeout=None):
+        self.gets += 1
+        if self.get_failures:
+            return self._fail(self.get_failures.pop(0))
+        return super().get(url, headers=headers, timeout=timeout)
+
+
+def _flaky_transcriber(runpod, progress, delays=(0.0, 0.0, 0.0)):
+    waits = []
+    transcriber = RunpodWhisperXTranscriber(
+        session=runpod, poll_seconds=0, on_progress=progress.append, retry_delays=delays, sleep=waits.append
+    )
+    return transcriber, waits
+
+
+def test_a_connection_reset_while_waiting_is_retried_not_fatal(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+    runpod = FlakyRunpod([_completed((0.5, "SPEAKER_00", "hello"))], get_failures=[_reset(), 503])
+    progress = []
+    transcriber, waits = _flaky_transcriber(runpod, progress, delays=(2.0, 5.0, 15.0))
+
+    lines = transcriber.transcribe_parts([audio], source="system")
+
+    assert [line.text for line in lines] == ["hello"]
+    assert waits == [2.0, 5.0]  # waited before each try again
+    assert (
+        "Runpod: the connection was reset (by the network or Runpod) while checking on system audio — "
+        "trying again in 2 s (try 2 of 4)." in progress
+    )
+    assert any("Runpod answered 503 while checking on system audio" in line for line in progress)
+    assert runpod.cancelled == []
+
+
+def test_a_connection_reset_while_uploading_is_retried(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+    runpod = FlakyRunpod([_completed((0.5, "SPEAKER_00", "hello"))], post_failures=[_reset()])
+    progress = []
+    transcriber, _waits = _flaky_transcriber(runpod, progress)
+
+    lines = transcriber.transcribe_parts([audio], source="system")
+
+    assert [line.text for line in lines] == ["hello"]
+    assert any("while uploading system audio" in line for line in progress)
+
+
+def test_a_connection_that_keeps_failing_gives_up_saying_where_and_why(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setattr(runpod_whisperx, "_MAX_CHUNK_SECONDS", 1.0)
+    monkeypatch.setattr(runpod_whisperx, "_CHUNK_OVERLAP_SECONDS", 0.0)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.5)
+    runpod = FlakyRunpod(
+        [{"status": "IN_PROGRESS"}], [{"status": "IN_PROGRESS"}], get_failures=[_reset()] * 10
+    )
+    transcriber, _waits = _flaky_transcriber(runpod, [])
+
+    with pytest.raises(RunpodWhisperXError) as raised:
+        transcriber.transcribe_parts([audio], source="system")
+
+    assert str(raised.value) == (
+        "checking on system audio part 1 of 2 failed after 4 tries — the connection was reset (by the network "
+        "or Runpod)"
+    )
+    assert runpod.gets == 4
+    assert runpod.cancelled == ["job-0", "job-1"]  # nothing left running (and billing) on Runpod
+
+
+def test_a_refused_api_key_is_not_retried(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+    runpod = FlakyRunpod([_completed()], post_failures=[401, 401])
+    transcriber, waits = _flaky_transcriber(runpod, [])
+
+    with pytest.raises(RunpodWhisperXError, match=r"uploading system audio: Runpod refused the API key \(401\)"):
+        transcriber.transcribe_parts([audio], source="system")
+    assert waits == []
+    assert runpod.post_failures == [401]  # tried once
+
+
+def test_a_microphone_upload_failure_names_the_microphone(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "mic.wav"
+    _write_wav(audio, seconds=1.0)
+    runpod = FlakyRunpod([_completed()], post_failures=[TimeoutError("timed out")] * 10)
+    transcriber, _waits = _flaky_transcriber(runpod, [])
+
+    with pytest.raises(RunpodWhisperXError, match="^uploading microphone audio failed after 4 tries — no reply in time$"):
+        transcriber.transcribe_parts([audio], source="mic", diarize=False)

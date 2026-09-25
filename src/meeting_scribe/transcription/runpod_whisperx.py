@@ -24,6 +24,7 @@ and adjusting those two functions to match; don't assume another template uses t
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import time
@@ -57,6 +58,17 @@ _CHUNK_OVERLAP_SECONDS = 120.0
 # How many seconds of speech two labels must share in an overlap before they're taken to be one person.
 _MIN_SHARED_SPEECH_SECONDS = 2.0
 
+
+# A request that fails for a reason that's usually passing — the connection dropped or reset (Windows' error
+# 10054), a timeout, Runpod busy or briefly down (429 and the 5xx gateway errors) — is tried again after
+# each of these waits, about two minutes in all, before the whole cloud transcription gives up. One dropped
+# connection in the half-hour of polling a long meeting can take used to lose the lot.
+_RETRY_DELAYS_SECONDS = (2.0, 5.0, 15.0, 30.0, 60.0)
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# OSError covers every socket-level failure urllib raises (URLError wraps them; ConnectionResetError and
+# TimeoutError are subclasses); HTTPException covers a reply cut off mid-way (RemoteDisconnected,
+# IncompleteRead). An HTTP error status isn't among them: _HttpSession returns that as a response.
+_TRANSIENT_ERRORS = (OSError, http.client.HTTPException)
 
 _TRACK_NAMES = {"system": "system audio", "mic": "microphone audio"}
 
@@ -144,6 +156,8 @@ class RunpodWhisperXTranscriber:
         session=None,
         poll_seconds: float = 5.0,
         timeout_seconds: float = 1800.0,
+        retry_delays: Sequence[float] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self._api_key = api_key or os.environ.get(_API_KEY_ENV)
         self._endpoint_id = endpoint_id or os.environ.get(_ENDPOINT_ID_ENV)
@@ -152,6 +166,8 @@ class RunpodWhisperXTranscriber:
         self._session = session if session is not None else _HttpSession()
         self._poll_seconds = poll_seconds
         self._timeout_seconds = timeout_seconds
+        self._retry_delays = tuple(_RETRY_DELAYS_SECONDS if retry_delays is None else retry_delays)
+        self._sleep = sleep
         if not self._api_key or not self._endpoint_id:
             raise RunpodWhisperXError(
                 f"Cloud speaker diarization is opted into but not configured — set {_API_KEY_ENV} and "
@@ -208,11 +224,19 @@ class RunpodWhisperXTranscriber:
             f"{_format_duration(total_seconds)}{split_note})…"
         )
         job_ids: list[str] = []
+        labels = [
+            track if len(chunks) == 1 else f"{track} part {number} of {len(chunks)}"
+            for number in range(1, len(chunks) + 1)
+        ]
+        step = f"sending {track} to Runpod"
         try:
-            for _offset, chunk in chunks:
-                job_ids.append(self._submit_job(_data_uri(chunk), diarize=diarize))
+            for label, (_offset, chunk) in zip(labels, chunks):
+                step = f"uploading {label}"
+                job_ids.append(self._submit_job(_data_uri(chunk), step=step, diarize=diarize))
             self._report("Runpod job queued." if len(job_ids) == 1 else f"{len(job_ids)} Runpod jobs queued.")
-            outputs = self._wait_for_results(job_ids)
+            step = f"waiting for Runpod to transcribe the {track}"
+            outputs = self._wait_for_results(job_ids, labels)
+            step = f"reading Runpod's transcript of the {track}"
             parsed = [_parse_segments(output) for output in outputs]
         except Exception as error:
             # Nothing will use the rest of the results now — stop paying for them.
@@ -222,7 +246,7 @@ class RunpodWhisperXTranscriber:
             # A dropped connection, a certificate rejected by a corporate proxy, a response in an unexpected shape:
             # whatever it is, it has to surface as RunpodWhisperXError so the caller falls back to local
             # transcription instead of the meeting losing its transcript over it.
-            raise RunpodWhisperXError(f"couldn't get a transcript from Runpod: {error!r}") from error
+            raise RunpodWhisperXError(f"{step} failed: {error!r}") from error
 
         placed = [
             [_replace_times(segment, offset_seconds) for segment in segments]
@@ -279,46 +303,85 @@ class RunpodWhisperXTranscriber:
                 )
         return chunks
 
-    def _submit_job(self, audio_url: str, *, diarize: bool = True) -> str:
-        payload = _build_payload(audio_url, huggingface_token=self._huggingface_token, diarize=diarize)
-        response = self._session.post(
-            f"{self._base_url}/run", headers=self._headers, json=payload, timeout=60
-        )
-        _raise_for_bad_response(response)
-        return response.json()["id"]
+    def _request(self, step: str, send: Callable[[], object]):
+        """`send()`'s response, trying again after each of `retry_delays` while it fails for a passing
+        reason (see _RETRY_DELAYS_SECONDS). Raises RunpodWhisperXError naming `step` — "uploading system
+        audio part 2 of 3", say — once it has run out of tries, or straight away for anything that another
+        try wouldn't change (a wrong API key, a 400)."""
+        attempts = len(self._retry_delays) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = send()
+            except _TRANSIENT_ERRORS as error:
+                problem = _describe_network_error(error)
+            else:
+                if response.status_code not in _RETRYABLE_STATUS_CODES:
+                    _raise_for_bad_response(response, step)
+                    return response
+                problem = f"Runpod answered {response.status_code}"
+            if attempt == attempts:
+                raise RunpodWhisperXError(f"{step} failed after {attempts} tries — {problem}")
+            delay = self._retry_delays[attempt - 1]
+            self._report(f"Runpod: {problem} while {step} — trying again in {delay:.0f} s (try {attempt + 1} of {attempts}).")
+            self._sleep(delay)
 
-    def _wait_for_results(self, job_ids: list[str]) -> list:
+    def _submit_job(self, audio_url: str, *, step: str = "uploading audio", diarize: bool = True) -> str:
+        payload = _build_payload(audio_url, huggingface_token=self._huggingface_token, diarize=diarize)
+        # If a connection drops after Runpod has taken the job but before its reply arrives, trying again
+        # queues the chunk a second time; the spare job's result is simply never collected. Worth it, over
+        # losing the meeting's cloud transcript to one dropped connection.
+        response = self._request(
+            step, lambda: self._session.post(f"{self._base_url}/run", headers=self._headers, json=payload, timeout=60)
+        )
+        try:
+            return response.json()["id"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise RunpodWhisperXError(f"{step}: unexpected reply from Runpod: {response.text[:200]!r}") from error
+
+    def _wait_for_results(self, job_ids: list[str], labels: Sequence[str] | None = None) -> list:
         """Polls every job until all have finished, returning their outputs in the same order. All are
         polled each round rather than one at a time, so a chunk that finishes early isn't left waiting —
-        Runpod only keeps a finished job's result for a limited time."""
+        Runpod only keeps a finished job's result for a limited time. `labels` names each job in messages
+        ("system audio part 2 of 3")."""
+        labels = list(labels) if labels is not None else [f"part {n} of {len(job_ids)}" for n in range(1, len(job_ids) + 1)]
         deadline = time.monotonic() + self._timeout_seconds
         outputs: dict[str, object] = {}
         while True:
             for job_id in job_ids:
                 if job_id in outputs:
                     continue
-                response = self._session.get(
-                    f"{self._base_url}/status/{job_id}", headers=self._headers, timeout=30
+                label = labels[job_ids.index(job_id)]
+                step = f"checking on {label}"
+                response = self._request(
+                    step,
+                    lambda job_id=job_id: self._session.get(
+                        f"{self._base_url}/status/{job_id}", headers=self._headers, timeout=30
+                    ),
                 )
-                _raise_for_bad_response(response)
-                body = response.json()
+                try:
+                    body = response.json()
+                except ValueError as error:
+                    raise RunpodWhisperXError(f"{step}: unexpected reply from Runpod: {response.text[:200]!r}") from error
                 status = body.get("status")
                 if status == "COMPLETED":
                     output = body.get("output")
                     # The worker reports bad input by returning {"error": ...} as a completed job's
                     # output, not by failing the job.
                     if isinstance(output, dict) and output.get("error"):
-                        raise RunpodWhisperXError(f"Runpod job {job_id} failed: {output['error']}")
+                        raise RunpodWhisperXError(f"Runpod couldn't transcribe {label}: {output['error']}")
                     outputs[job_id] = output
                     if len(job_ids) > 1:
                         self._report(f"Runpod finished part {job_ids.index(job_id) + 1} of {len(job_ids)}.")
                 elif status in ("FAILED", "CANCELLED", "TIMED_OUT"):
-                    raise RunpodWhisperXError(f"Runpod job {job_id} ended as {status}: {body.get('error')}")
+                    raise RunpodWhisperXError(f"Runpod's job for {label} ended as {status}: {body.get('error')}")
             if len(outputs) == len(job_ids):
                 return [outputs[job_id] for job_id in job_ids]
             if time.monotonic() >= deadline:
-                raise RunpodWhisperXError(f"Runpod didn't finish within {self._timeout_seconds:.0f}s")
-            time.sleep(self._poll_seconds)
+                unfinished = ", ".join(label for job_id, label in zip(job_ids, labels) if job_id not in outputs)
+                raise RunpodWhisperXError(
+                    f"Runpod didn't finish {unfinished} within {self._timeout_seconds / 60:.0f} min"
+                )
+            self._sleep(self._poll_seconds)
 
     def _cancel_quietly(self, job_ids: list[str]) -> None:
         for job_id in job_ids:
@@ -352,9 +415,27 @@ def _count(n: int, noun: str) -> str:
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
-def _raise_for_bad_response(response) -> None:
+def _raise_for_bad_response(response, step: str = "calling Runpod") -> None:
+    if response.status_code == 401:
+        raise RunpodWhisperXError(f"{step}: Runpod refused the API key (401) — check it in Settings")
     if response.status_code >= 400:
-        raise RunpodWhisperXError(f"Runpod API call failed ({response.status_code}): {response.text[:500]}")
+        raise RunpodWhisperXError(f"{step}: Runpod answered {response.status_code}: {response.text[:500]}")
+
+
+def _describe_network_error(error: BaseException) -> str:
+    """A short, readable cause for a failed request — "the connection was reset" rather than
+    URLError(ConnectionResetError(10054, 'An existing connection was forcibly closed…'))."""
+    reason = getattr(error, "reason", None)
+    cause = reason if isinstance(reason, BaseException) else error
+    if isinstance(cause, ConnectionResetError):
+        return "the connection was reset (by the network or Runpod)"
+    if isinstance(cause, ConnectionAbortedError):
+        return "the connection was dropped"
+    if isinstance(cause, (TimeoutError, http.client.RemoteDisconnected)) or "timed out" in str(cause):
+        return "no reply in time" if not isinstance(cause, http.client.RemoteDisconnected) else "Runpod hung up"
+    if isinstance(cause, ConnectionRefusedError):
+        return "the connection was refused"
+    return f"network error: {cause}"
 
 
 def _build_payload(audio_url: str, *, huggingface_token: str | None, diarize: bool = True) -> dict:
