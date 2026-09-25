@@ -1813,9 +1813,7 @@ class SettingsPage(ttk.Frame):
         footer = ttk.Frame(page)
         footer.pack(fill="x", pady=(18, 0))
         ttk.Button(footer, text="Save settings", style="Accent.TButton", command=self._save).pack(side="left")
-        ttk.Button(footer, text="Open data folder", command=lambda: _open_path(self.app.settings.data_dir)).pack(
-            side="left", padx=(10, 0)
-        )
+        ttk.Button(footer, text="Open data folder", command=self._open_data_folder).pack(side="left", padx=(10, 0))
 
         self.apply_device_lists(_enumerate_devices()[0])
 
@@ -1917,3 +1915,15 @@ class SettingsPage(ttk.Frame):
         if hotkeys_changed:
             self.app.apply_hotkeys()
         self.app.toast("Settings saved")
+
+    def _open_data_folder(self) -> None:
+        """Recreates the data directory if it's gone missing since startup (e.g. deleted by an antivirus
+        or cleanup tool, or a roaming profile share that was briefly offline) before opening it, mirroring
+        the same recovery load_settings does at launch — instead of letting os.startfile fail with a raw
+        "location is unavailable" error and no explanation."""
+        data_dir = self.app.settings.data_dir
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            _open_path(data_dir)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't open {data_dir}: {exc}")
