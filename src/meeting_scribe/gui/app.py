@@ -207,7 +207,9 @@ def _enumerate_devices() -> tuple[list, list]:
 def _open_path(path: Path) -> None:
     """Opens a folder or file with whatever the OS uses for it (Explorer on Windows)."""
     if sys.platform == "win32":
-        os.startfile(path)  # noqa: S606 — a local folder chosen by the app itself
+        # Under the Microsoft Store Python, writes to AppData are redirected into the package's private
+        # LocalCache, which Explorer (outside the package) can't see; realpath maps to where it really is.
+        os.startfile(os.path.realpath(path))  # noqa: S606 — a local folder chosen by the app itself
     else:
         subprocess.Popen(["xdg-open", str(path)])
 
@@ -1917,13 +1919,8 @@ class SettingsPage(ttk.Frame):
         self.app.toast("Settings saved")
 
     def _open_data_folder(self) -> None:
-        """Recreates the data directory if it's gone missing since startup (e.g. deleted by an antivirus
-        or cleanup tool, or a roaming profile share that was briefly offline) before opening it, mirroring
-        the same recovery load_settings does at launch — instead of letting os.startfile fail with a raw
-        "location is unavailable" error and no explanation."""
         data_dir = self.app.settings.data_dir
         try:
-            data_dir.mkdir(parents=True, exist_ok=True)
             _open_path(data_dir)
         except OSError as exc:
             messagebox.showerror(APP_NAME, f"Couldn't open {data_dir}: {exc}")
