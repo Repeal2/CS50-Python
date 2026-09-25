@@ -5,6 +5,7 @@ to Copilot Studio (see ai/copilot_push.py).
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import sqlite3
@@ -364,6 +365,19 @@ class Database:
             )
             self._conn.commit()
             return cur.lastrowid
+
+    def rebase_document_paths(self, old_root: Path | str, new_root: Path | str) -> None:
+        """Repoints stored document copies from under `old_root` to the same files under `new_root`,
+        for after the data folder has been moved (see config.load_settings)."""
+        old_prefix = os.path.join(str(old_root), "")
+        new_prefix = os.path.join(str(new_root), "")
+        with self._lock:
+            self._conn.execute(
+                "UPDATE documents SET source_path = ? || substr(source_path, ?) "
+                "WHERE substr(source_path, 1, ?) = ?",
+                (new_prefix, len(old_prefix) + 1, len(old_prefix), old_prefix),
+            )
+            self._conn.commit()
 
     def list_documents(self, project_id: int) -> list[sqlite3.Row]:
         with self._lock:

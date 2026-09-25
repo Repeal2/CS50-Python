@@ -13,16 +13,8 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from meeting_scribe.config import load_settings
+from meeting_scribe.config import default_data_dir, load_settings
 from meeting_scribe.storage.database import Database
-
-
-def _fallback_log_dir() -> Path:
-    """Where to write a startup failure when we can't trust load_settings() to have succeeded (it's
-    frequently the thing that failed) — the same %APPDATA%\\MeetingScribe convention config._default_data_dir
-    uses, computed independently so this has no dependency on config.py actually working."""
-    appdata = os.environ.get("APPDATA")
-    return Path(appdata) / "MeetingScribe" if appdata else Path.home() / ".meeting_scribe_data"
 
 
 def _show_fatal_startup_error(detail: str) -> None:
@@ -37,7 +29,7 @@ def _show_fatal_startup_error(detail: str) -> None:
     broken) is the most robust fallback available, in that order because the log write is more likely to
     succeed than a message box is to be seen."""
     try:
-        log_dir = _fallback_log_dir()
+        log_dir = default_data_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         with open(log_dir / "startup_error.log", "a", encoding="utf-8") as f:
             f.write(f"\n--- {datetime.now().isoformat()} ---\n{detail}\n")
@@ -108,9 +100,11 @@ def _run_gui() -> int:
     """Launches the desktop app with a safety net around everything up to and including mainloop() —
     see _show_fatal_startup_error for why this needs its own handling rather than relying on
     MeetingScribeApp.report_callback_exception."""
-    _install_crash_logging(_fallback_log_dir())
     try:
+        # Settings first: load_settings may move the data folder, which crash.log (held open from here
+        # on) would otherwise block.
         settings = load_settings()
+        _install_crash_logging(settings.data_dir)
         from meeting_scribe.gui.app import MeetingScribeApp
 
         app = MeetingScribeApp(settings)

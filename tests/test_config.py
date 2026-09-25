@@ -353,7 +353,7 @@ def test_a_blank_headset_means_recognize_one_by_name(tmp_path, monkeypatch):
 def test_the_ocr_box_position_is_saved_and_loaded(tmp_path, monkeypatch):
     from meeting_scribe import config
 
-    monkeypatch.setattr(config, "_default_data_dir", lambda: tmp_path)
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
     settings = config.load_settings()
     assert settings.ocr_area is None
 

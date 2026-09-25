@@ -112,6 +112,19 @@ Everything above is browsable and searchable in the app's Library (plain text se
 transcripts, notes and attendees). Summarizing or asking questions across meetings is Copilot Studio's job
 once the data has been pushed to it, not this app's.
 
+### Where it's stored
+
+Everything — the database, recordings, attached documents' originals, settings and logs — lives in one
+folder, `%USERPROFILE%\MeetingScribe` (e.g. `C:\Users\you\MeetingScribe`), shown on the **Settings** page
+under Storage. Set `MEETING_SCRIBE_DATA_DIR` to use a different folder. It deliberately isn't under AppData
+(the Microsoft Store Python silently redirects AppData writes into a private per-version folder that Explorer
+can't see and Windows deletes along with that Python) or Documents (usually OneDrive-synced, which a live
+database and multi-GB recordings don't survive well).
+
+Earlier versions used `%APPDATA%\MeetingScribe`. On first launch the app moves the most recently used old
+folder — including one hidden inside a Store Python's `LocalCache` — to the new location. If it can't (say,
+another copy of the app is still running), it keeps using the old folder and tries again next launch.
+
 ## Setup (development)
 
 ```bash

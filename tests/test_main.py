@@ -18,18 +18,8 @@ def _no_real_crash_logging(request, monkeypatch):
         monkeypatch.setattr(main_module, "_install_crash_logging", lambda log_dir: None)
 
 
-def test_fallback_log_dir_uses_appdata(monkeypatch):
-    monkeypatch.setenv("APPDATA", r"C:\Users\Test\AppData\Roaming")
-    assert main_module._fallback_log_dir() == Path(r"C:\Users\Test\AppData\Roaming") / "MeetingScribe"
-
-
-def test_fallback_log_dir_falls_back_to_home_without_appdata(monkeypatch):
-    monkeypatch.delenv("APPDATA", raising=False)
-    assert main_module._fallback_log_dir() == Path.home() / ".meeting_scribe_data"
-
-
 def test_show_fatal_startup_error_writes_a_log_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path / "MeetingScribe"))
     monkeypatch.setattr(sys, "platform", "linux")  # skip the Win32 message box path
 
     main_module._show_fatal_startup_error("boom: something broke")
@@ -40,11 +30,11 @@ def test_show_fatal_startup_error_writes_a_log_file(tmp_path, monkeypatch):
 
 
 def test_show_fatal_startup_error_tolerates_a_log_write_it_cannot_make(tmp_path, monkeypatch):
-    # Points APPDATA at a file (not a directory), so mkdir()/open() both fail — logging the error must
+    # Points the data folder at a file (not a directory), so mkdir()/open() both fail — logging the error must
     # not itself raise, since this is already the last-resort path with nothing further to fall back to.
     blocked = tmp_path / "blocked"
     blocked.write_text("not a directory")
-    monkeypatch.setenv("APPDATA", str(blocked))
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(blocked))
     monkeypatch.setattr(sys, "platform", "linux")
 
     main_module._show_fatal_startup_error("irrelevant")  # must not raise
@@ -62,7 +52,7 @@ def test_run_gui_returns_zero_on_a_clean_run(monkeypatch):
 
     fake_module.MeetingScribeApp = FakeApp
     monkeypatch.setitem(sys.modules, "meeting_scribe.gui.app", fake_module)
-    monkeypatch.setattr(main_module, "load_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr(main_module, "load_settings", lambda: SimpleNamespace(data_dir=Path("unused")))
 
     assert main_module._run_gui() == 0
 
@@ -80,7 +70,7 @@ def test_run_gui_reports_a_fatal_error_instead_of_letting_it_escape(monkeypatch)
 
     fake_module.MeetingScribeApp = ExplodingApp
     monkeypatch.setitem(sys.modules, "meeting_scribe.gui.app", fake_module)
-    monkeypatch.setattr(main_module, "load_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr(main_module, "load_settings", lambda: SimpleNamespace(data_dir=Path("unused")))
 
     reported = []
     monkeypatch.setattr(main_module, "_show_fatal_startup_error", reported.append)

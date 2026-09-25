@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -24,15 +25,72 @@ USER_CONFIG_FILENAME = "settings.json"
 WHISPER_MODEL_SIZES = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo")
 
 
-def _default_data_dir() -> Path:
+DB_FILENAME = "meeting_scribe.db"
+
+
+def default_data_dir() -> Path:
     override = os.environ.get("MEETING_SCRIBE_DATA_DIR")
     if override:
         return Path(override)
-    # %APPDATA%\MeetingScribe on Windows; ~/.meeting_scribe_data elsewhere (dev/test).
+    # Directly under the user profile rather than AppData: the Microsoft Store Python silently redirects
+    # AppData writes into a private per-version folder that Explorer can't see and that Windows deletes
+    # along with that Python. The profile root isn't redirected, and unlike Documents isn't OneDrive-synced.
+    profile = os.environ.get("USERPROFILE")
+    if profile:
+        return Path(profile) / "MeetingScribe"
+    return Path.home() / ".meeting_scribe_data"
+
+
+def _legacy_data_dirs() -> list[Path]:
+    """Where earlier versions kept data: %APPDATA%\\MeetingScribe, which under the Microsoft Store Python
+    really lives in that Python's private LocalCache (one per installed Python version)."""
+    found = []
     appdata = os.environ.get("APPDATA")
     if appdata:
-        return Path(appdata) / "MeetingScribe"
-    return Path.home() / ".meeting_scribe_data"
+        found.append(Path(appdata) / "MeetingScribe")
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        found.extend(
+            Path(local_appdata, "Packages").glob("PythonSoftwareFoundation.Python.*/LocalCache/Roaming/MeetingScribe")
+        )
+    return found
+
+
+def _move_legacy_data(target: Path) -> tuple[Path, Path | None]:
+    """Moves the most recently used legacy data folder to `target`, once. Returns (folder to use, folder
+    moved from). If the move can't happen — another running copy of the app has files open, or `target`
+    already has something in it — this run keeps using the legacy folder rather than starting empty, and
+    the move is retried next launch. Never raises: this runs before the app can report anything."""
+    if (target / DB_FILENAME).exists():
+        return target, None
+    legacy = _legacy_data_dirs()
+    try:
+        candidates = {Path(os.path.realpath(p)) for p in legacy if (p / DB_FILENAME).exists()}
+        candidates.discard(Path(os.path.realpath(target)))
+        if not candidates:
+            return target, None
+        source = max(candidates, key=lambda p: (p / DB_FILENAME).stat().st_mtime)
+    except OSError:
+        return target, None
+    try:
+        if target.exists():
+            target.rmdir()  # only succeeds when empty — anything already there is left alone
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.rename(target)
+    except OSError:
+        return source, None
+
+    # Documents' stored paths were written under the old folder (as the app saw it, which under the Store
+    # Python isn't the real path), so repoint them or they'd silently drop out of Copilot pushes.
+    from meeting_scribe.storage.database import Database
+
+    try:
+        with Database(target / DB_FILENAME) as db:
+            for old_root in {*legacy, source}:
+                db.rebase_document_paths(old_root, target)
+    except sqlite3.Error:
+        pass
+    return target, source
 
 
 def _bundled_tesseract_path() -> Path | None:
@@ -102,10 +160,13 @@ class Settings:
     # next meeting's box appears in the same place instead of needing to be set up again. None until
     # the box has been moved or resized once. See screen.ocr_box.
     ocr_area: tuple[int, int, int, int] | None = None
+    # Set only on the launch that moved existing data into data_dir from an older location, so the app
+    # can say so. Not persisted.
+    moved_from: Path | None = None
 
     @property
     def db_path(self) -> Path:
-        return self.data_dir / "meeting_scribe.db"
+        return self.data_dir / DB_FILENAME
 
     @property
     def documents_dir(self) -> Path:
@@ -222,7 +283,9 @@ def _ocr_area_from_json(data: object) -> tuple[int, int, int, int] | None:
 
 
 def load_settings() -> Settings:
-    data_dir = _default_data_dir()
+    data_dir, moved_from = default_data_dir(), None
+    if not os.environ.get("MEETING_SCRIBE_DATA_DIR"):
+        data_dir, moved_from = _move_legacy_data(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     user_config = _load_user_config(data_dir)
 
@@ -250,4 +313,5 @@ def load_settings() -> Settings:
         runpod_endpoint_id=user_config.get("runpod_endpoint_id"),
         runpod_huggingface_token=user_config.get("runpod_huggingface_token"),
         ocr_area=_ocr_area_from_json(user_config.get("ocr_area")),
+        moved_from=moved_from,
     )

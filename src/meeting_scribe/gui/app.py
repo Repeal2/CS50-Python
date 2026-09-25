@@ -22,7 +22,7 @@ from typing import Callable
 
 from meeting_scribe import __version__
 from meeting_scribe.audio.device_watch import device_signature
-from meeting_scribe.config import WHISPER_MODEL_SIZES, Settings, load_settings, update_settings
+from meeting_scribe.config import WHISPER_MODEL_SIZES, Settings, default_data_dir, load_settings, update_settings
 from meeting_scribe.gui.meeting_prompt import PromptCard, start_recording_prompt, stop_recording_prompt
 from meeting_scribe.gui.theme import Palette, apply_theme, style_text
 from meeting_scribe.hotkeys import (
@@ -214,6 +214,10 @@ def _open_path(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def _is_store_python_private(path: str) -> bool:
+    return "\\packages\\pythonsoftwarefoundation.python." in path.lower()
+
+
 def _enable_per_monitor_dpi_awareness() -> None:
     """Marks this process per-monitor DPI aware, so Windows reports physical-pixel window and monitor
     coordinates instead of virtualizing them per monitor — which would throw win32gui.GetWindowRect and
@@ -363,6 +367,8 @@ class MeetingScribeApp(tk.Tk):
         self.report_callback_exception = self._report_callback_exception
 
         self._build_layout()
+        if self.settings.moved_from is not None:
+            self.record_page.log(f"Moved your meeting data from {self.settings.moved_from} to {self.settings.data_dir}")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind_all("<Control-f>", lambda _e: self.show_page("library", focus_search=True))
 
@@ -1812,10 +1818,26 @@ class SettingsPage(ttk.Frame):
             "Also in the app: Ctrl+T stamps the time in your notes, Ctrl+F searches the Library.",
         )
 
+        # Storage
+        body = self._section(page, "Storage")
+        real_data_dir = os.path.realpath(settings.data_dir)
+        line = ttk.Frame(body, style="Card.TFrame", borderwidth=0)
+        ttk.Label(line, text=real_data_dir, style="Card.TLabel").pack(side="left")
+        ttk.Button(line, text="Open", style="Link.TButton", command=self._open_data_folder).pack(
+            side="left", padx=(10, 0)
+        )
+        self._field(body, 0, "Data folder", line)
+        if _is_store_python_private(real_data_dir):
+            self._hint(
+                body, 1,
+                "This is a private folder of the Microsoft Store Python, which Windows deletes if that Python is "
+                f"uninstalled. Meeting Scribe tries to move it to {default_data_dir()} each time it starts — close "
+                "every copy of the app and start it again. If this stays, check that folder is empty or missing.",
+            )
+
         footer = ttk.Frame(page)
         footer.pack(fill="x", pady=(18, 0))
         ttk.Button(footer, text="Save settings", style="Accent.TButton", command=self._save).pack(side="left")
-        ttk.Button(footer, text="Open data folder", command=self._open_data_folder).pack(side="left", padx=(10, 0))
 
         self.apply_device_lists(_enumerate_devices()[0])
 
