@@ -1,9 +1,9 @@
-"""Speaker-diarized transcription of the system-audio track via a Runpod-hosted WhisperX serverless
-endpoint — opt-in (see config.Settings.diarize_system_audio), since it sends recorded meeting audio to
+"""Cloud transcription via a Runpod-hosted WhisperX serverless endpoint — speaker-diarized for the
+system-audio track, plain for the microphone (only ever the meeting owner, so diarizing it can't identify
+anyone new). Opt-in (see config.Settings.transcribe_in_cloud), since it sends recorded meeting audio to
 two third parties (Runpod's GPU host, and HuggingFace's hosted pyannote diarization models) rather than
-keeping everything on this machine the way transcription.engine.WhisperTranscriber does. Only ever used
-for the system track: the mic track is already just one person, so diarizing it can't identify anyone new
-— see the module note in session.py for where this plugs in.
+keeping everything on this machine the way transcription.engine.WhisperTranscriber does — see
+session._transcribe for where this plugs in.
 
 Needs a Runpod API key and the id of a deployed WhisperX-with-diarization serverless endpoint before it'll
 do anything (see is_configured); a HuggingFace access token that has accepted pyannote's gated model terms
@@ -58,11 +58,14 @@ _CHUNK_OVERLAP_SECONDS = 120.0
 _MIN_SHARED_SPEECH_SECONDS = 2.0
 
 
+_TRACK_NAMES = {"system": "system audio", "mic": "microphone audio"}
+
+
 class RunpodWhisperXError(Exception):
     """Raised for anything that keeps a diarized transcript from coming back: missing configuration, a
     failed/timed-out Runpod job, or audio that's still too large to send after compression. Always safe
     for a caller to catch and fall back to local (undiarized) transcription instead — see
-    session._transcribe_system_track."""
+    session._transcribe."""
 
 
 def is_configured(*, api_key: str | None = None, endpoint_id: str | None = None) -> bool:
@@ -172,6 +175,8 @@ class RunpodWhisperXTranscriber:
         audio_paths: Sequence[Path],
         source: str,
         start_offsets: Mapping[Path, float] | None = None,
+        *,
+        diarize: bool = True,
     ) -> list[TranscriptLine]:
         """Transcribes one capture stream that may have been written as several WAV parts, each placed on
         the meeting's clock the same way WhisperTranscriber.transcribe_parts does (see
@@ -182,11 +187,15 @@ class RunpodWhisperXTranscriber:
         by who was speaking in the overlap (see _link_chunk_speakers). A speaker that can't be matched —
         someone who joined partway through, or anyone in a WAV part after a device change, which shares
         no audio with the part before — is suffixed with the chunk number ("SPEAKER_02 (part 2)") rather
-        than presented as someone already heard."""
+        than presented as someone already heard.
+
+        `diarize=False` transcribes without labelling speakers — for the microphone track, which is only
+        ever the meeting owner — and its lines carry no speaker."""
         if not audio_paths:
             return []
+        track = _TRACK_NAMES.get(source, source)
         # Takes about half a minute for an hour of audio, so say so rather than the log going quiet.
-        self._report("Compressing system audio for Runpod…")
+        self._report(f"Compressing {track} for Runpod…")
         chunks = self._encode(audio_paths, start_offsets)
         if not chunks:
             return []
@@ -195,13 +204,13 @@ class RunpodWhisperXTranscriber:
         total_seconds = sum(chunk.duration_seconds - chunk.overlap_seconds for _, chunk in chunks)
         split_note = f", in {len(chunks)} parts" if len(chunks) > 1 else ""
         self._report(
-            f"Sending system audio to Runpod ({_format_size(total_bytes)}, "
+            f"Sending {track} to Runpod ({_format_size(total_bytes)}, "
             f"{_format_duration(total_seconds)}{split_note})…"
         )
         job_ids: list[str] = []
         try:
             for _offset, chunk in chunks:
-                job_ids.append(self._submit_job(_data_uri(chunk)))
+                job_ids.append(self._submit_job(_data_uri(chunk), diarize=diarize))
             self._report("Runpod job queued." if len(job_ids) == 1 else f"{len(job_ids)} Runpod jobs queued.")
             outputs = self._wait_for_results(job_ids)
             parsed = [_parse_segments(output) for output in outputs]
@@ -222,12 +231,19 @@ class RunpodWhisperXTranscriber:
         if len(chunks) > 1:
             placed = _link_chunk_speakers([(offset, chunk.overlap_seconds) for offset, chunk in chunks], placed)
         lines = [
-            TranscriptLine(timestamp_seconds=segment.start_seconds, source=source, text=segment.text, speaker=segment.speaker)
+            TranscriptLine(
+                timestamp_seconds=segment.start_seconds,
+                source=source,
+                text=segment.text,
+                speaker=segment.speaker if diarize else None,
+            )
             for segments in placed
             for segment in segments
         ]
         speakers = {line.speaker for line in lines}
-        if len(chunks) == 1:
+        if not diarize:
+            self._report(f"Cloud transcript of the {track} received.")
+        elif len(chunks) == 1:
             self._report(f"Diarized transcript received — {_count(len(speakers), 'speaker')}.")
         else:
             self._report(
@@ -263,8 +279,8 @@ class RunpodWhisperXTranscriber:
                 )
         return chunks
 
-    def _submit_job(self, audio_url: str) -> str:
-        payload = _build_payload(audio_url, huggingface_token=self._huggingface_token)
+    def _submit_job(self, audio_url: str, *, diarize: bool = True) -> str:
+        payload = _build_payload(audio_url, huggingface_token=self._huggingface_token, diarize=diarize)
         response = self._session.post(
             f"{self._base_url}/run", headers=self._headers, json=payload, timeout=60
         )
@@ -341,13 +357,13 @@ def _raise_for_bad_response(response) -> None:
         raise RunpodWhisperXError(f"Runpod API call failed ({response.status_code}): {response.text[:500]}")
 
 
-def _build_payload(audio_url: str, *, huggingface_token: str | None) -> dict:
+def _build_payload(audio_url: str, *, huggingface_token: str | None, diarize: bool = True) -> dict:
     """kodxana/whisperx-worker_v2's input schema (verified against its rp_schema.py, not just its README):
     `audio_file` (a URL or base64 audio, not `audio`), `diarization`, and an optional
     `huggingface_access_token` that overrides its endpoint-side `HF_TOKEN` env var when given. Its schema
     validator rejects any key it doesn't recognize — there's no `model` parameter to pick a Whisper size,
     so don't add one. Adjust this function if a different worker image ever replaces it."""
-    payload = {"input": {"audio_file": audio_url, "diarization": True}}
+    payload = {"input": {"audio_file": audio_url, "diarization": diarize}}
     if huggingface_token:
         payload["input"]["huggingface_access_token"] = huggingface_token
     return payload

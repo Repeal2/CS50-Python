@@ -142,11 +142,14 @@ class Settings:
     # elsewhere, so this is opt-in from the Settings page rather than assigned automatically.
     start_meeting_hotkey: HotkeyCombo | None = None
     stop_meeting_hotkey: HotkeyCombo | None = None
-    # Opt-in: sends the system-audio track to a Runpod-hosted WhisperX endpoint for speaker diarization
-    # instead of transcribing it locally — see transcription.runpod_whisperx. Off by default, same
-    # reasoning as the meeting hotkeys above: turning this on sends meeting audio to third parties, so it
+    # Which transcriptions a finished meeting gets — either or both, never neither (see
+    # validate_transcription_choice): on this PC with Whisper, and/or in the cloud on a Runpod-hosted
+    # WhisperX endpoint, which also labels the other side's speakers (see transcription.runpod_whisperx).
+    # With both, the meeting keeps both transcripts side by side, for comparing them. The cloud is off by
+    # default, same reasoning as the meeting hotkeys above: it sends meeting audio to third parties, so it
     # shouldn't happen without the user explicitly choosing it.
-    diarize_system_audio: bool = False
+    transcribe_locally: bool = True
+    transcribe_in_cloud: bool = False
     # Credentials for the above, entered on the Settings page and persisted to settings.json like every
     # other preference here — plaintext either way, so a settings field isn't meaningfully less secure
     # than an environment variable would have been for a single-user desktop app; it's just easier to set.
@@ -233,7 +236,8 @@ def save_user_config(settings: Settings) -> None:
         "whisper_model_size": settings.whisper_model_size,
         "start_meeting_hotkey": _hotkey_to_json(settings.start_meeting_hotkey),
         "stop_meeting_hotkey": _hotkey_to_json(settings.stop_meeting_hotkey),
-        "diarize_system_audio": settings.diarize_system_audio,
+        "transcribe_locally": settings.transcribe_locally,
+        "transcribe_in_cloud": settings.transcribe_in_cloud,
         "runpod_api_key": settings.runpod_api_key,
         "runpod_endpoint_id": settings.runpod_endpoint_id,
         "runpod_huggingface_token": settings.runpod_huggingface_token,
@@ -253,6 +257,13 @@ _BLANK_MEANS_UNSET = (
 )
 
 
+def validate_transcription_choice(transcribe_locally: bool, transcribe_in_cloud: bool) -> None:
+    """Raises ValueError unless at least one transcription is chosen — a meeting with neither would be
+    recorded and never transcribed."""
+    if not (transcribe_locally or transcribe_in_cloud):
+        raise ValueError("Choose at least one way to transcribe meetings: on this PC, in the cloud, or both.")
+
+
 def update_settings(settings: Settings, **changes) -> Settings:
     """Applies and persists edits from the GUI, returning the updated Settings. Takes the same field
     names as Settings; a blank text field is stored as None ("not set"), and copilot_sync_dir may be given
@@ -268,6 +279,7 @@ def update_settings(settings: Settings, **changes) -> Settings:
         sync_dir = changes["copilot_sync_dir"]
         changes["copilot_sync_dir"] = Path(sync_dir) if sync_dir else None
     updated = replace(settings, **changes)
+    validate_transcription_choice(updated.transcribe_locally, updated.transcribe_in_cloud)
     save_user_config(updated)
     return updated
 
@@ -294,6 +306,13 @@ def load_settings() -> Settings:
         "MEETING_SCRIBE_WHISPER_MODEL", "small"
     )
 
+    # "diarize_system_audio" is what versions before the local/cloud choice called the cloud option.
+    transcribe_in_cloud = bool(
+        user_config.get("transcribe_in_cloud", user_config.get("diarize_system_audio", False))
+    )
+    # Neither chosen (a hand-edited settings.json) would transcribe nothing: this PC it is.
+    transcribe_locally = bool(user_config.get("transcribe_locally", True)) or not transcribe_in_cloud
+
     return Settings(
         data_dir=data_dir,
         whisper_model_size=whisper_model_size,
@@ -308,7 +327,8 @@ def load_settings() -> Settings:
         copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None,
         start_meeting_hotkey=_hotkey_from_json(user_config.get("start_meeting_hotkey")),
         stop_meeting_hotkey=_hotkey_from_json(user_config.get("stop_meeting_hotkey")),
-        diarize_system_audio=bool(user_config.get("diarize_system_audio", False)),
+        transcribe_in_cloud=transcribe_in_cloud,
+        transcribe_locally=transcribe_locally,
         runpod_api_key=user_config.get("runpod_api_key"),
         runpod_endpoint_id=user_config.get("runpod_endpoint_id"),
         runpod_huggingface_token=user_config.get("runpod_huggingface_token"),

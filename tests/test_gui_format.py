@@ -108,30 +108,50 @@ def _segment_row(timestamp, source, text, *, speaker=None, engine=None):
     return {"timestamp_seconds": timestamp, "source": source, "text": text, "speaker": speaker, "engine": engine}
 
 
-def test_meeting_transcripts_prefers_runpods_system_lines_when_both_were_saved():
-    # Older meetings saved the system track twice (this PC and Runpod) for comparison.
+def test_meeting_transcripts_keeps_this_pcs_and_the_clouds_apart():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     rows = [
         _segment_row(0.0, "mic", "let's start", engine="local"),
+        _segment_row(0.1, "mic", "let's start", engine="runpod"),
         _segment_row(2.0, "system", "sounds could", engine="local"),
         _segment_row(2.0, "system", "sounds good", speaker="SPEAKER_00", engine="runpod"),
         _segment_row(3.0, "screen_ocr", "Slide: Agenda"),
     ]
 
-    screen, audio = gui_app._meeting_transcripts(rows)
+    screen, local, cloud = gui_app._meeting_transcripts(rows)
 
     assert screen == "[00:03] Screen: Slide: Agenda"
-    assert audio == "[00:00] You: let's start\n[00:02] SPEAKER_00: sounds good"
+    assert local == "[00:00] You: let's start\n[00:02] Others: sounds could"
+    assert cloud == "[00:00] You: let's start\n[00:02] SPEAKER_00: sounds good"
 
 
-def test_meeting_transcripts_uses_local_lines_without_runpod():
+def test_meeting_transcripts_without_the_cloud_has_no_cloud_transcript():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     # Includes a line saved before lines were tagged by engine, which counts as this PC's.
     rows = [_segment_row(0.0, "mic", "hello", engine="local"), _segment_row(1.0, "system", "hi")]
 
-    _screen, audio = gui_app._meeting_transcripts(rows)
+    _screen, local, cloud = gui_app._meeting_transcripts(rows)
 
-    assert audio == "[00:00] You: hello\n[00:01] Others: hi"
+    assert local == "[00:00] You: hello\n[00:01] Others: hi"
+    assert cloud == ""
+
+
+def test_meeting_export_text_heads_each_transcript_when_there_are_two():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    from meeting_scribe.storage.database import Meeting
+
+    meeting = Meeting(
+        id=1, project_id=1, title="Kickoff", started_at="2026-07-25T10:00:00+00:00",
+        ended_at="2026-07-25T10:30:00+00:00", transcript_text=None, notes_markdown=None,
+        manual_notes=None, attendees=None, meeting_code="20260725-1000",
+    )
+
+    both = gui_app._meeting_export_text(meeting, "Acme", "[00:01] You: hi", "", "[00:01] You: hi there")
+    cloud_only = gui_app._meeting_export_text(meeting, "Acme", "", "", "[00:01] You: hi there")
+
+    assert "Transcript (this PC)\n--------------------\n[00:01] You: hi\n" in both
+    assert "Transcript (cloud)\n------------------\n[00:01] You: hi there" in both
+    assert "Transcript\n----------\n[00:01] You: hi there" in cloud_only
 
 
 def test_format_elapsed_shows_minutes_then_hours():

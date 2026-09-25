@@ -41,10 +41,18 @@ from meeting_scribe.screen.meeting_detector import (
 )
 from meeting_scribe.screen.ocr_box import OcrAreaBox, default_area, keep_on_screen, overlaps
 from meeting_scribe.screen.region_picker import RegionTarget, pick_region_interactively
-from meeting_scribe.session import MeetingSession, meeting_in_progress, retry_meeting_transcription
+from meeting_scribe.session import (
+    CLOUD_ENGINE,
+    LOCAL_ENGINE,
+    MeetingSession,
+    add_transcription,
+    meeting_in_progress,
+    meeting_transcripts,
+    retry_meeting_transcription,
+)
 from meeting_scribe.storage.database import Database, Meeting
 from meeting_scribe.storage.documents import UnsupportedDocumentError, extract_text, save_original_copy
-from meeting_scribe.transcription.engine import TranscriptLine, merge_transcript_lines, render_transcript
+from meeting_scribe.transcription.engine import render_transcript
 
 APP_NAME = "Meeting Scribe"
 
@@ -75,29 +83,20 @@ _UNFINISHED_MEETING_NOTICE = (
     "Transcription didn't finish for this meeting, but the recording is safe. Retry to transcribe it."
 )
 _IN_PROGRESS_MEETING_NOTICE = "Still being recorded or transcribed — the transcript appears here when it's done."
+_TRANSCRIBING_AGAIN_NOTICE = "Being transcribed again — the new transcript appears here when it's done."
+_NOT_TRANSCRIBED_NOTICE = "No transcript {where}. Use “{button}” above to make one from the recording."
 _SEARCH_PLACEHOLDER = "Search all meetings…"
 
 
 # --- pure helpers ---------------------------------------------------------------------------------
 
 
-def _meeting_transcripts(rows) -> tuple[str, str]:
-    """(on-screen text, spoken audio) rendered for the Library, from a meeting's saved transcript rows.
-    Older meetings may have the system track saved twice — once per transcriber — in which case the
-    Runpod one (with speaker labels) wins. A line saved before lines were tagged by engine counts as
-    this PC's."""
-    screen, mic, local_system, runpod_system = [], [], [], []
-    for row in rows:
-        line = TranscriptLine(row["timestamp_seconds"], row["source"], row["text"], speaker=row["speaker"])
-        if line.source == "screen_ocr":
-            screen.append(line)
-        elif line.source == "mic":
-            mic.append(line)
-        elif row["engine"] == "runpod":
-            runpod_system.append(line)
-        else:
-            local_system.append(line)
-    return render_transcript(screen), render_transcript(merge_transcript_lines(mic, runpod_system or local_system))
+def _meeting_transcripts(rows) -> tuple[str, str, str]:
+    """(on-screen text, this PC's transcript, the cloud's transcript) rendered for the Library, from a
+    meeting's saved transcript rows — see session.meeting_transcripts. Either transcript is "" if the
+    meeting wasn't transcribed that way."""
+    transcripts = meeting_transcripts(rows)
+    return render_transcript(transcripts.screen), render_transcript(transcripts.local), render_transcript(transcripts.cloud)
 
 
 def _format_meeting_timestamp(iso_string: str) -> str:
@@ -146,16 +145,24 @@ def _notes_timestamp(seconds: float) -> str:
     return f"[{minutes:02d}:{secs:02d}] "
 
 
-def _meeting_export_text(meeting: Meeting, project_name: str, audio: str, screen: str) -> str:
-    """Everything recorded for one meeting as a single plain-text document (Library's Export…)."""
+def _meeting_export_text(
+    meeting: Meeting, project_name: str, local: str, screen: str, cloud: str = ""
+) -> str:
+    """Everything recorded for one meeting as a single plain-text document (Library's Export…). A meeting
+    transcribed both ways gets both transcripts, each headed with where it came from."""
     sections = [
         f"{meeting.title}\n"
         f"Project: {project_name}\n"
         f"Date: {_format_meeting_timestamp(meeting.started_at)}"
         + (f" ({_format_duration(meeting.started_at, meeting.ended_at)})" if meeting.ended_at else "")
     ]
+    transcripts = (
+        (("Transcript (this PC)", local), ("Transcript (cloud)", cloud))
+        if local.strip() and cloud.strip()
+        else (("Transcript", local or cloud),)
+    )
     for heading, body in (
-        ("Transcript", audio),
+        *transcripts,
         ("On-screen text", screen),
         ("Notes", meeting.manual_notes),
         ("Attendees", meeting.attendees),
@@ -1253,13 +1260,16 @@ class RecordPage(ttk.Frame):
         self.manual_notes_editor.configure(state="disabled")
         self.log(f"[{session.title}] Stopped — transcribing in the background.")
         self.close_ocr_box()
+        settings = self.app.settings
 
         def worker() -> None:
             def report(message: str) -> None:
                 self.after(0, self.log, f"[{session.title}] {message}")
 
             try:
-                session.stop(on_progress=report)
+                # The Settings in force now, not when the meeting started: unticking the cloud mid-meeting
+                # applies to this meeting.
+                session.stop(on_progress=report, settings=settings)
             except Exception as exc:
                 self.after(0, self._on_stop_failed, session.title, exc)
                 return
@@ -1444,6 +1454,16 @@ class LibraryPage(ttk.Frame):
             button = ttk.Button(toolbar, text=text, style="Link.TButton", command=command, state="disabled")
             button.pack(side="left", padx=(0, 4))
             self._action_buttons.append(button)
+        # Transcribe a finished meeting's recording again, one way or the other — e.g. to the cloud, for a
+        # meeting only transcribed on this PC.
+        self._transcribe_buttons: dict[str, ttk.Button] = {}
+        for engine, text in ((CLOUD_ENGINE, "Transcribe in cloud"), (LOCAL_ENGINE, "Transcribe on this PC")):
+            button = ttk.Button(
+                toolbar, text=text, style="Link.TButton", state="disabled",
+                command=lambda e=engine: self._transcribe_again(e),
+            )
+            button.pack(side="right", padx=(4, 0))
+            self._transcribe_buttons[engine] = button
 
         # Shown only for a meeting whose recording finished but whose transcription didn't.
         self._banner = ttk.Frame(detail, style="Card.TFrame", borderwidth=0, padding=(18, 0, 12, 8))
@@ -1462,7 +1482,8 @@ class LibraryPage(ttk.Frame):
             "Search looks through every project's titles, transcripts, notes and attendees.",
             style="Card.Muted.TLabel", justify="center", anchor="center",
         )
-        self.audio_text = self._text_tab("Transcript")
+        self.local_text = self._text_tab("Transcript · this PC")
+        self.cloud_text = self._text_tab("Transcript · cloud")
         self.ocr_text = self._text_tab("On screen")
         self.manual_notes_text = self._text_tab("Notes")
         self.attendees_text = self._text_tab("Attendees")
@@ -1607,18 +1628,30 @@ class LibraryPage(ttk.Frame):
         self._title_label.configure(text=meeting.title)
         self._meta_label.configure(text="   ·   ".join(part for part in meta if part))
 
-        screen, audio = _meeting_transcripts(self.app.db.get_segments(meeting.id))
-        _set_readonly_text(self.audio_text, audio or "No speech was transcribed for this meeting.")
+        screen, local, cloud = _meeting_transcripts(self.app.db.get_segments(meeting.id))
+        finished = meeting.ended_at is not None
+        _set_readonly_text(self.local_text, local or (
+            _NOT_TRANSCRIBED_NOTICE.format(where="on this PC", button="Transcribe on this PC") if finished else ""
+        ))
+        _set_readonly_text(self.cloud_text, cloud or (
+            _NOT_TRANSCRIBED_NOTICE.format(where="in the cloud", button="Transcribe in cloud") if finished else ""
+        ))
+        if finished and not local and cloud and self.detail_notebook.index("current") == 0:
+            self.detail_notebook.select(1)  # open on the transcript there is
         _set_readonly_text(self.ocr_text, screen or "No on-screen text was captured.")
         _set_readonly_text(self.manual_notes_text, meeting.manual_notes or "No notes were taken.")
         _set_readonly_text(self.attendees_text, meeting.attendees or "No attendees were captured.")
         self._load_documents(meeting.id)
 
-        if meeting.ended_at is None:
-            in_progress = meeting_in_progress(meeting.id)
-            self._banner_label.configure(text=_IN_PROGRESS_MEETING_NOTICE if in_progress else _UNFINISHED_MEETING_NOTICE)
-            self.retry_button.configure(state="disabled" if in_progress else "normal")
-            self._banner.pack(fill="x")
+        in_progress = meeting_in_progress(meeting.id)
+        for button in self._transcribe_buttons.values():
+            button.configure(state="normal" if finished and not in_progress else "disabled")
+        if not finished:
+            self._show_banner(
+                _IN_PROGRESS_MEETING_NOTICE if in_progress else _UNFINISHED_MEETING_NOTICE, retry=not in_progress
+            )
+        elif in_progress:
+            self._show_banner(_TRANSCRIBING_AGAIN_NOTICE, retry=False)
         self.detail_notebook.pack(fill="both", expand=True, padx=(8, 2), pady=(0, 2))
 
     def _load_documents(self, meeting_id: int | None) -> None:
@@ -1639,7 +1672,10 @@ class LibraryPage(ttk.Frame):
 
     def _copy_current_tab(self) -> None:
         tab = self.detail_notebook.index("current")
-        widget = [self.audio_text, self.ocr_text, self.manual_notes_text, self.attendees_text, self.document_viewer][tab]
+        widget = [
+            self.local_text, self.cloud_text, self.ocr_text, self.manual_notes_text, self.attendees_text,
+            self.document_viewer,
+        ][tab]
         self.clipboard_clear()
         self.clipboard_append(widget.get("1.0", "end-1c"))
         self.app.toast(f"Copied {self.detail_notebook.tab(tab, 'text').lower()} to the clipboard")
@@ -1649,7 +1685,7 @@ class LibraryPage(ttk.Frame):
         if meeting is None:
             return
         project = self.app.db.get_project(meeting.project_id)
-        screen, audio = _meeting_transcripts(self.app.db.get_segments(meeting.id))
+        screen, local, cloud = _meeting_transcripts(self.app.db.get_segments(meeting.id))
         default_name = _safe_filename(f"{meeting.meeting_code or ''} {meeting.title}".strip()) + ".txt"
         path = filedialog.asksaveasfilename(
             title="Export meeting", defaultextension=".txt", initialfile=default_name,
@@ -1658,7 +1694,7 @@ class LibraryPage(ttk.Frame):
         if not path:
             return
         Path(path).write_text(
-            _meeting_export_text(meeting, project.name if project else "", audio, screen), encoding="utf-8"
+            _meeting_export_text(meeting, project.name if project else "", local, screen, cloud), encoding="utf-8"
         )
         self.app.toast(f"Exported to {Path(path).name}")
 
@@ -1681,6 +1717,60 @@ class LibraryPage(ttk.Frame):
         if name is not None:
             self._load_documents(meeting.id)
             self.app.toast(f"Attached {name} to “{meeting.title}”")
+
+    def _show_banner(self, text: str, *, retry: bool) -> None:
+        self._banner_label.configure(text=text)
+        if retry:
+            self.retry_button.configure(state="normal")
+            self.retry_button.pack(side="right", padx=(10, 0), before=self._banner_label)
+        else:
+            self.retry_button.pack_forget()
+        self._banner.pack(fill="x", after=self._detail_top)
+
+    def _transcribe_again(self, engine: str) -> None:
+        """Transcribes the selected finished meeting's recording again, on this PC or in the cloud, in the
+        background — replacing that way's transcript if it already has one."""
+        meeting = self._current
+        if meeting is None:
+            return
+        where = "on this PC" if engine == LOCAL_ENGINE else "in the cloud"
+        widget = self.local_text if engine == LOCAL_ENGINE else self.cloud_text
+        already = _meeting_transcripts(self.app.db.get_segments(meeting.id))[1 if engine == LOCAL_ENGINE else 2]
+        if already and not messagebox.askyesno(
+            APP_NAME, f"“{meeting.title}” already has a transcript made {where}. Replace it with a new one?"
+        ):
+            return
+        if engine == CLOUD_ENGINE and not (self.app.settings.runpod_api_key and self.app.settings.runpod_endpoint_id):
+            messagebox.showerror(APP_NAME, "Set the Runpod API key and endpoint ID in Settings first.")
+            return
+        for button in self._transcribe_buttons.values():
+            button.configure(state="disabled")
+        self._show_banner(f"Transcribing “{meeting.title}” {where}…", retry=False)
+        self.detail_notebook.select(widget.master)
+        settings = self.app.settings
+
+        def report(message: str) -> None:
+            self.after(0, self._show_retry_progress, meeting.id, message)
+
+        def worker() -> None:
+            try:
+                add_transcription(settings, self.app.db, meeting.id, engine, on_progress=report)
+            except Exception as exc:
+                self.after(0, self._on_transcribe_again_failed, meeting.id, meeting.title, where, exc)
+                return
+            self.after(0, self._on_transcribe_again_done, meeting.id, meeting.title, where)
+
+        self.app.run_in_background(worker)
+
+    def _on_transcribe_again_done(self, meeting_id: int, meeting_title: str, where: str) -> None:
+        if self._still_viewing(meeting_id):
+            self._show_meeting(self._current)
+        self.app.toast(f"“{meeting_title}” transcribed {where}")
+
+    def _on_transcribe_again_failed(self, meeting_id: int, meeting_title: str, where: str, exc: Exception) -> None:
+        if self._still_viewing(meeting_id):
+            self._show_meeting(self._current)
+        messagebox.showerror(APP_NAME, f'Couldn\'t transcribe "{meeting_title}" {where}: {exc}')
 
     def _retry_transcription(self) -> None:
         """Re-runs transcription for the selected unfinished meeting in the background."""
@@ -1766,13 +1856,27 @@ class SettingsPage(ttk.Frame):
             "Larger models are more accurate but slower and need much more memory — a long meeting can run out "
             "of memory on medium/large. A size not used before is downloaded on first use.",
         )
-        self.diarize_system_audio_var = tk.BooleanVar(value=settings.diarize_system_audio)
+        # Applied as soon as they're ticked, not on Save: they decide what happens to the meeting being
+        # recorded when it stops, and an unsaved untick used to leave it going to the cloud anyway.
+        self.transcribe_locally_var = tk.BooleanVar(value=settings.transcribe_locally)
+        self.transcribe_in_cloud_var = tk.BooleanVar(value=settings.transcribe_in_cloud)
         ttk.Checkbutton(
-            body, text="Identify speakers with Runpod (sends the other side's audio to the cloud)",
-            variable=self.diarize_system_audio_var, style="Card.TCheckbutton", command=self._sync_runpod_fields,
+            body, text="Transcribe on this PC", variable=self.transcribe_locally_var,
+            style="Card.TCheckbutton", command=self._on_transcription_choice,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Checkbutton(
+            body, text="Transcribe in the cloud with Runpod — names the other side's speakers, and sends the "
+            "meeting's audio (both sides) to the cloud",
+            variable=self.transcribe_in_cloud_var, style="Card.TCheckbutton", command=self._on_transcription_choice,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._hint(
+            body, 4,
+            "At least one has to stay ticked. Tick both to keep both transcripts and compare them in the Library, "
+            "where either can also be made later from a meeting's recording. Takes effect straight away, "
+            "including for a meeting being recorded now.",
+        )
         self._runpod = ttk.Frame(body, style="Card.TFrame", borderwidth=0)
-        self._runpod.grid(row=3, column=0, columnspan=2, sticky="we")
+        self._runpod.grid(row=5, column=0, columnspan=2, sticky="we")
         self._runpod.columnconfigure(1, weight=1)
         self.runpod_api_key_var = tk.StringVar(value=settings.runpod_api_key or "")
         self.runpod_endpoint_id_var = tk.StringVar(value=settings.runpod_endpoint_id or "")
@@ -1785,9 +1889,9 @@ class SettingsPage(ttk.Frame):
         self._hint(
             self._runpod, 3,
             "From Runpod's Serverless dashboard. The HuggingFace token can stay blank if it's set on the "
-            "endpoint. If Runpod fails, the audio is transcribed on this PC instead.",
+            "endpoint. If Runpod fails and this PC isn't transcribing too, the audio is transcribed on this "
+            "PC instead.",
         )
-        self._sync_runpod_fields()
 
         # Copilot Studio
         body = self._section(page, "Copilot Studio handoff")
@@ -1870,11 +1974,16 @@ class SettingsPage(ttk.Frame):
             row=row, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
 
-    def _sync_runpod_fields(self) -> None:
-        if self.diarize_system_audio_var.get():
-            self._runpod.grid()
-        else:
-            self._runpod.grid_remove()
+    def _on_transcription_choice(self) -> None:
+        local, cloud = self.transcribe_locally_var.get(), self.transcribe_in_cloud_var.get()
+        if not (local or cloud):
+            # The last one can't be unticked: a meeting would be recorded and never transcribed.
+            self.transcribe_locally_var.set(self.app.settings.transcribe_locally)
+            self.transcribe_in_cloud_var.set(self.app.settings.transcribe_in_cloud)
+            self.app.toast("At least one way of transcribing has to stay ticked")
+            return
+        self.app.settings = update_settings(self.app.settings, transcribe_locally=local, transcribe_in_cloud=cloud)
+        self.app.toast("Transcription setting saved")
 
     def apply_device_lists(self, input_devices) -> None:
         self.headset_combo["values"] = _device_choices(
@@ -1938,7 +2047,8 @@ class SettingsPage(ttk.Frame):
             auto_switch_audio_devices=self.auto_switch_var.get(),
             headset_microphone_name=_device_from_choice(self.headset_var.get(), AUTO_HEADSET_LABEL),
             whisper_model_size=self.whisper_model_var.get(),
-            diarize_system_audio=self.diarize_system_audio_var.get(),
+            transcribe_locally=self.transcribe_locally_var.get(),
+            transcribe_in_cloud=self.transcribe_in_cloud_var.get(),
             runpod_api_key=self.runpod_api_key_var.get().strip(),
             runpod_endpoint_id=self.runpod_endpoint_id_var.get().strip(),
             runpod_huggingface_token=self.runpod_hf_token_var.get().strip(),

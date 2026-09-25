@@ -229,7 +229,7 @@ class Database:
     ) -> None:
         """`speaker` is a diarized line's label (see TranscriptLine.speaker) — None for everything else.
         `engine` says which transcriber produced a spoken line — "local" (Whisper on this PC) or "runpod"
-        (see session._transcribe_system_track). None for on-screen text, and for lines saved before this
+        (see session.LOCAL_ENGINE/CLOUD_ENGINE). None for on-screen text, and for lines saved before this
         existed."""
         if not text.strip():
             return
@@ -334,13 +334,30 @@ class Database:
                 (meeting_id,),
             ).fetchall()
 
-    def clear_transcript_segments(self, meeting_id: int) -> None:
+    def clear_transcript_segments(self, meeting_id: int, engine: str | None = None) -> None:
         """Deletes every transcript segment recorded for one meeting. Used when retrying a meeting's
         transcription (see session.retry_meeting_transcription) so that retrying twice — the first
         attempt having inserted segments before failing on a later step, like the Copilot push — doesn't
-        leave the first attempt's segments sitting alongside a fresh set from the second."""
+        leave the first attempt's segments sitting alongside a fresh set from the second.
+
+        With `engine`, only the spoken lines that engine produced go — for replacing one of a meeting's
+        two transcripts (see session.add_transcription). A spoken line saved before lines were tagged by
+        engine counts as "local"; on-screen text is never touched."""
         with self._lock:
-            self._conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?", (meeting_id,))
+            if engine is None:
+                self._conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?", (meeting_id,))
+            else:
+                self._conn.execute(
+                    "DELETE FROM transcript_segments WHERE meeting_id = ? AND source != 'screen_ocr' "
+                    "AND (engine = ? OR (engine IS NULL AND ? = 'local'))",
+                    (meeting_id, engine, engine),
+                )
+            self._conn.commit()
+
+    def set_transcript_text(self, meeting_id: int, transcript_text: str) -> None:
+        """Replaces a finished meeting's saved transcript text, leaving when it ended alone."""
+        with self._lock:
+            self._conn.execute("UPDATE meetings SET transcript_text = ? WHERE id = ?", (transcript_text, meeting_id))
             self._conn.commit()
 
     # -- Documents ------------------------------------------------------------

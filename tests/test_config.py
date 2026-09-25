@@ -1,3 +1,4 @@
+import pytest
 import sys
 from pathlib import Path
 
@@ -225,31 +226,61 @@ def test_load_settings_ignores_a_corrupt_hotkey_entry(tmp_path, monkeypatch):
     assert load_settings().start_meeting_hotkey is None
 
 
-def test_load_settings_defaults_diarize_system_audio_to_off(tmp_path, monkeypatch):
-    # Off by default: turning this on sends meeting audio to third parties, so — like the meeting
+def test_load_settings_defaults_to_transcribing_on_this_pc_only(tmp_path, monkeypatch):
+    # The cloud is off by default: it sends meeting audio to third parties, so — like the meeting
     # hotkeys — it shouldn't happen without the user explicitly opting in from the Settings tab.
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    assert load_settings().diarize_system_audio is False
+    settings = load_settings()
+
+    assert (settings.transcribe_locally, settings.transcribe_in_cloud) == (True, False)
 
 
-def test_update_diarize_system_audio_persists_and_reloads(tmp_path, monkeypatch):
+def test_transcription_choices_persist_and_reload(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
-    update_settings(load_settings(), diarize_system_audio=True)
+    update_settings(load_settings(), transcribe_in_cloud=True)
+    assert (load_settings().transcribe_locally, load_settings().transcribe_in_cloud) == (True, True)
 
-    assert load_settings().diarize_system_audio is True
+    update_settings(load_settings(), transcribe_locally=False)
+    assert (load_settings().transcribe_locally, load_settings().transcribe_in_cloud) == (False, True)
 
 
-def test_update_diarize_system_audio_does_not_clobber_other_settings(tmp_path, monkeypatch):
+def test_at_least_one_transcription_has_to_stay_chosen(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    with pytest.raises(ValueError):
+        update_settings(load_settings(), transcribe_locally=False)
+    assert load_settings().transcribe_locally is True  # nothing was saved
+
+
+def test_the_old_cloud_setting_carries_over(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    (tmp_path / "settings.json").write_text('{"diarize_system_audio": true}', encoding="utf-8")
+
+    settings = load_settings()
+
+    assert (settings.transcribe_locally, settings.transcribe_in_cloud) == (True, True)
+
+
+def test_neither_transcription_in_a_hand_edited_file_means_this_pc(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    (tmp_path / "settings.json").write_text(
+        '{"transcribe_locally": false, "transcribe_in_cloud": false}', encoding="utf-8"
+    )
+
+    assert load_settings().transcribe_locally is True
+
+
+def test_update_transcription_choice_does_not_clobber_other_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
     settings = update_settings(load_settings(), mic_device_name="USB Mic", system_device_name=None)
-    update_settings(settings, diarize_system_audio=True)
+    update_settings(settings, transcribe_in_cloud=True)
 
     reloaded = load_settings()
     assert reloaded.mic_device_name == "USB Mic"
-    assert reloaded.diarize_system_audio is True
+    assert reloaded.transcribe_in_cloud is True
 
 
 def test_load_settings_defaults_runpod_settings_to_none(tmp_path, monkeypatch):

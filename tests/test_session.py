@@ -16,7 +16,8 @@ def _settings(
     mic_device_name=None,
     system_device_name=None,
     copilot_sync_dir=None,
-    diarize_system_audio=False,
+    transcribe_in_cloud=False,
+    transcribe_locally=True,
     runpod_api_key=None,
     runpod_endpoint_id=None,
     runpod_huggingface_token=None,
@@ -29,7 +30,8 @@ def _settings(
         mic_device_name=mic_device_name,
         system_device_name=system_device_name,
         copilot_sync_dir=copilot_sync_dir,
-        diarize_system_audio=diarize_system_audio,
+        transcribe_in_cloud=transcribe_in_cloud,
+        transcribe_locally=transcribe_locally,
         runpod_api_key=runpod_api_key,
         runpod_endpoint_id=runpod_endpoint_id,
         runpod_huggingface_token=runpod_huggingface_token,
@@ -122,10 +124,9 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
             assert len(segments) == 3
 
 
-def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_path):
-    """diarize_system_audio=True sends the system track to RunpodWhisperXTranscriber instead of
-    transcribing it locally. The mic track is only ever local — it's always a single speaker, so
-    diarizing it can't identify anyone new."""
+def test_cloud_only_sends_both_tracks_to_runpod_and_nothing_is_transcribed_here(tmp_path):
+    """The system track goes with its speakers labelled; the mic track (only ever the meeting owner)
+    without."""
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
@@ -138,14 +139,11 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
             system_paths=(tmp_path / "system.wav",),
             started_at_monotonic=0.0,
         )
-        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None: (
+        MockRunpod.return_value.transcribe_parts.side_effect = lambda paths, source, **kwargs: (
             [TranscriptLine(1.0, "mic", "let's get started")]
             if source == "mic"
-            else [TranscriptLine(2.0, "system", "sounds could")]  # local Whisper, mishearing a little
+            else [TranscriptLine(2.0, "system", "sounds good", speaker="SPEAKER_00")]
         )
-        MockRunpod.return_value.transcribe_parts.return_value = [
-            TranscriptLine(2.0, "system", "sounds good", speaker="SPEAKER_00")
-        ]
 
         from meeting_scribe.session import MeetingSession
 
@@ -153,7 +151,8 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
             session = MeetingSession(
                 _settings(
                     tmp_path,
-                    diarize_system_audio=True,
+                    transcribe_in_cloud=True,
+                    transcribe_locally=False,
                     runpod_api_key="rp-key",
                     runpod_endpoint_id="rp-endpoint",
                     runpod_huggingface_token="hf-token",
@@ -170,9 +169,8 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
                 for row in db.get_segments(session.meeting_id)
             )
 
-        # Saved tagged by engine, with Runpod's speaker labels.
         assert saved == [
-            ("local", "mic", None, "let's get started"),
+            ("runpod", "mic", None, "let's get started"),
             ("runpod", "system", "SPEAKER_00", "sounds good"),
         ]
         # Credentials come from Settings, not environment variables.
@@ -185,15 +183,109 @@ def test_session_uses_cloud_diarization_for_the_system_track_when_opted_in(tmp_p
         # Its progress lines go to the same place as the rest of stop()'s — the activity log.
         kwargs["on_progress"]("Runpod job queued.")
         assert progress[-1] == "Runpod job queued."
-        MockRunpod.return_value.transcribe_parts.assert_called_once_with(
-            recorder_instance.stop.return_value.system_paths, source="system", start_offsets={}
-        )
-        # Only the mic track was transcribed locally — the system track isn't transcribed twice.
-        assert MockTranscriber.return_value.transcribe_parts.call_args_list == [
-            (((tmp_path / "mic.wav",),), {"source": "mic", "start_offsets": {}}),
+        assert MockRunpod.return_value.transcribe_parts.call_args_list == [
+            ((recorder_instance.stop.return_value.system_paths,), {"source": "system", "start_offsets": {}}),
+            ((recorder_instance.stop.return_value.mic_paths,), {"source": "mic", "start_offsets": {}, "diarize": False}),
         ]
+        MockTranscriber.return_value.transcribe_parts.assert_not_called()
+        assert "You: let's get started" in result
         assert "SPEAKER_00: sounds good" in result
-        assert "sounds could" not in result
+
+
+def test_with_both_chosen_the_meeting_keeps_both_transcripts(tmp_path):
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod,
+    ):
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=(tmp_path / "mic.wav",), system_paths=(tmp_path / "system.wav",), started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None: [
+            TranscriptLine(1.0, source, f"local {source}")
+        ]
+        MockRunpod.return_value.transcribe_parts.side_effect = lambda paths, source, **kwargs: [
+            TranscriptLine(1.0, source, f"cloud {source}", speaker="SPEAKER_00" if source == "system" else None)
+        ]
+
+        from meeting_scribe.session import MeetingSession, meeting_transcripts
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(
+                _settings(tmp_path, transcribe_in_cloud=True, runpod_api_key="k", runpod_endpoint_id="e"),
+                db, "Test Project", "Kickoff",
+            )
+            session.start()
+            result = session.stop()
+            transcripts = meeting_transcripts(db.get_segments(session.meeting_id))
+
+    assert [line.text for line in transcripts.local] == ["local mic", "local system"]
+    assert [line.text for line in transcripts.cloud] == ["cloud mic", "cloud system"]
+    # Where only one fits — the saved transcript, the Copilot push — the cloud's, which names speakers.
+    assert "SPEAKER_00: cloud system" in result and "local system" not in result
+
+
+def test_a_cloud_failure_with_both_chosen_keeps_this_pcs_transcript(tmp_path):
+    from meeting_scribe.transcription.runpod_whisperx import RunpodWhisperXError
+
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch(
+            "meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber",
+            side_effect=RunpodWhisperXError("not configured"),
+        ),
+    ):
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=(tmp_path / "mic.wav",), system_paths=(tmp_path / "system.wav",), started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None: [
+            TranscriptLine(1.0, source, f"local {source}")
+        ]
+
+        from meeting_scribe.session import MeetingSession
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path, transcribe_in_cloud=True), db, "Test Project", "Kickoff")
+            session.start()
+            progress = []
+            result = session.stop(on_progress=progress.append)
+
+    assert "local system" in result
+    assert any("keeping this PC's transcript only" in line for line in progress)
+    assert MockTranscriber.return_value.transcribe_parts.call_count == 2  # once per track, not twice
+
+
+def test_the_transcription_choice_in_force_when_stop_is_pressed_is_the_one_used(tmp_path):
+    # The field case: the cloud was unticked in Settings mid-meeting, and the meeting still went to the
+    # cloud — the session had kept the Settings it started with.
+    from dataclasses import replace
+
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod,
+    ):
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=(tmp_path / "mic.wav",), system_paths=(tmp_path / "system.wav",), started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+
+        from meeting_scribe.session import MeetingSession
+
+        started_with = _settings(
+            tmp_path, transcribe_in_cloud=True, transcribe_locally=False, runpod_api_key="k", runpod_endpoint_id="e"
+        )
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(started_with, db, "Test Project", "Kickoff")
+            session.start()
+            session.stop(settings=replace(started_with, transcribe_in_cloud=False, transcribe_locally=True))
+
+    MockRunpod.assert_not_called()
+    assert MockTranscriber.return_value.transcribe_parts.call_count == 2
 
 
 def test_session_falls_back_to_local_transcription_when_cloud_diarization_fails(tmp_path):
@@ -225,7 +317,7 @@ def test_session_falls_back_to_local_transcription_when_cloud_diarization_fails(
         from meeting_scribe.session import MeetingSession
 
         with Database(tmp_path / "test.db") as db:
-            session = MeetingSession(_settings(tmp_path, diarize_system_audio=True), db, "Test Project", "Kickoff")
+            session = MeetingSession(_settings(tmp_path, transcribe_in_cloud=True, transcribe_locally=False), db, "Test Project", "Kickoff")
             session.start()
 
             progress_messages = []
@@ -1041,12 +1133,7 @@ def test_session_leaves_out_an_empty_system_track_instead_of_failing(tmp_path, _
         from meeting_scribe.session import MeetingSession
 
         with Database(tmp_path / "test.db") as db:
-            session = MeetingSession(
-                _settings(tmp_path, diarize_system_audio=True, runpod_api_key="k", runpod_endpoint_id="e"),
-                db,
-                "Test Project",
-                "Kickoff",
-            )
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
             session.start()
             progress = []
             result = session.stop(on_progress=progress.append)
@@ -1251,3 +1338,112 @@ def test_a_meeting_where_ocr_was_never_started_says_so(tmp_path):
             session.stop(on_progress=messages.append)
 
         assert any("Start OCR was never pressed" in message for message in messages)
+
+
+# --- a second transcription after the fact ----------------------------------------------------------------
+
+
+def _finished_locally(settings, db):
+    """A meeting transcribed on this PC only, with its audio still on disk."""
+    project, meeting_id = _stuck_meeting(settings, db)
+    db.add_transcript_segment(meeting_id, "screen_ocr", 0.5, "Agenda slide")
+    db.add_transcript_segment(meeting_id, "mic", 1.0, "local mic", engine="local")
+    db.add_transcript_segment(meeting_id, "system", 2.0, "local system", engine="local")
+    db.finish_meeting(meeting_id, transcript_text="old")
+    return meeting_id
+
+
+def test_a_meeting_transcribed_here_can_be_sent_to_the_cloud_afterwards(tmp_path):
+    with patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod:
+        MockRunpod.return_value.transcribe_parts.side_effect = lambda paths, source, **kwargs: [
+            TranscriptLine(1.5, source, f"cloud {source}", speaker="SPEAKER_00" if source == "system" else None)
+        ]
+        from meeting_scribe.session import CLOUD_ENGINE, add_transcription, meeting_transcripts
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path, runpod_api_key="k", runpod_endpoint_id="e")  # cloud not ticked
+            meeting_id = _finished_locally(settings, db)
+
+            result = add_transcription(settings, db, meeting_id, CLOUD_ENGINE)
+            transcripts = meeting_transcripts(db.get_segments(meeting_id))
+            meeting = db.get_meeting(meeting_id)
+
+    assert [line.text for line in transcripts.local] == ["local mic", "local system"]
+    assert [line.text for line in transcripts.cloud] == ["cloud mic", "cloud system"]
+    assert [line.text for line in transcripts.screen] == ["Agenda slide"]
+    assert result == "[00:01] You: cloud mic\n[00:01] SPEAKER_00: cloud system"
+    # The saved transcript is now the cloud's, with the on-screen text still merged in.
+    assert "SPEAKER_00: cloud system" in meeting.transcript_text and "Agenda slide" in meeting.transcript_text
+
+
+def test_transcribing_again_replaces_only_that_engines_lines(tmp_path):
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None: [
+            TranscriptLine(1.0, source, f"new local {source}")
+        ]
+        from meeting_scribe.session import LOCAL_ENGINE, add_transcription, meeting_transcripts
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            meeting_id = _finished_locally(settings, db)
+            db.add_transcript_segment(meeting_id, "system", 3.0, "cloud system", speaker="SPEAKER_00", engine="runpod")
+
+            add_transcription(settings, db, meeting_id, LOCAL_ENGINE)
+            transcripts = meeting_transcripts(db.get_segments(meeting_id))
+
+    assert [line.text for line in transcripts.local] == ["new local mic", "new local system"]
+    assert [line.text for line in transcripts.cloud] == ["new local mic", "cloud system"]  # borrows the mic
+    assert [line.text for line in transcripts.screen] == ["Agenda slide"]
+
+
+def test_a_cloud_failure_after_the_fact_is_raised_not_papered_over(tmp_path):
+    from meeting_scribe.transcription.runpod_whisperx import RunpodWhisperXError
+
+    with (
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch(
+            "meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber",
+            side_effect=RunpodWhisperXError("not configured"),
+        ),
+    ):
+        from meeting_scribe.session import CLOUD_ENGINE, add_transcription, meeting_in_progress
+
+        with Database(tmp_path / "test.db") as db:
+            settings = _settings(tmp_path)
+            meeting_id = _finished_locally(settings, db)
+
+            with pytest.raises(RunpodWhisperXError):
+                add_transcription(settings, db, meeting_id, CLOUD_ENGINE)
+            remaining = [row["text"] for row in db.get_segments(meeting_id)]
+
+    MockTranscriber.return_value.transcribe_parts.assert_not_called()
+    assert remaining == ["Agenda slide", "local mic", "local system"]  # nothing lost
+    assert not meeting_in_progress(meeting_id)
+
+
+def test_an_unfinished_meeting_is_retried_rather_than_transcribed_again(tmp_path):
+    from meeting_scribe.session import LOCAL_ENGINE, add_transcription
+
+    with Database(tmp_path / "test.db") as db:
+        settings = _settings(tmp_path)
+        _project, meeting_id = _stuck_meeting(settings, db)
+
+        with pytest.raises(ValueError, match="Retry"):
+            add_transcription(settings, db, meeting_id, LOCAL_ENGINE)
+
+
+def test_a_meeting_from_before_the_mic_went_to_the_cloud_shows_a_whole_cloud_transcript(tmp_path):
+    from meeting_scribe.session import meeting_transcripts
+
+    with Database(tmp_path / "test.db") as db:
+        project = db.get_or_create_project("P")
+        meeting_id = db.create_meeting(project.id, "Old")
+        db.add_transcript_segment(meeting_id, "mic", 1.0, "you, locally", engine="local")
+        db.add_transcript_segment(meeting_id, "system", 2.0, "them, in the cloud", speaker="SPEAKER_00", engine="runpod")
+        db.add_transcript_segment(meeting_id, "mic", 3.0, "you, untagged")  # saved before lines were tagged
+
+        transcripts = meeting_transcripts(db.get_segments(meeting_id))
+
+    assert [line.text for line in transcripts.local] == ["you, locally", "you, untagged"]
+    assert [line.text for line in transcripts.cloud] == ["you, locally", "them, in the cloud", "you, untagged"]
+    assert transcripts.preferred == transcripts.cloud

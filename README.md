@@ -39,16 +39,20 @@ Windows' light/dark app setting.
 - **Captures attendees and documents.** "Capture attendees" reads a participants panel you drag a box
   around. "Attach document" files a PDF, Word doc, image or text file under the project (and the meeting,
   while one is recording, or the selected meeting in the Library).
-- **Transcribes locally in the background** after Stop, so the next meeting can start straight away. The
+- **Transcribes in the background** after Stop, so the next meeting can start straight away. The
   sidebar shows how many meetings are still finishing, and the running recording clock is shown on the
-  Record page and in the window title (so it's visible from the taskbar). Optionally, the system-audio
-  track goes to a Runpod WhisperX endpoint for speaker labels instead, and is transcribed locally if that
-  fails. Lines are split wherever the speaker changes mid-sentence, and a long meeting's 45-minute chunks
-  overlap by two minutes so each speaker keeps one label across them.
+  Record page and in the window title (so it's visible from the taskbar). Settings has two ticks — on
+  this PC, and in the cloud on a Runpod WhisperX endpoint, which also labels the other side's speakers —
+  and at least one stays ticked; tick both to keep both transcripts and compare them. They apply as soon
+  as they're ticked, including to the meeting being recorded. If the cloud fails and this PC wasn't
+  transcribing too, it does instead. Cloud lines are split wherever the speaker changes mid-sentence, and
+  a long meeting's 45-minute chunks overlap by two minutes so each speaker keeps one label across them.
 - **Keeps a searchable local library.** The Library lists meetings by project, and its search box
   (**Ctrl+F**) looks through every project's titles, transcripts, notes and attendees. Each meeting shows
-  its transcript, on-screen text, notes, attendees and documents, with **Copy**, **Export…** (one plain-text
-  file with every section), **Attach document** and **Open folder**. A meeting whose transcription didn't
+  its transcripts (this PC's and the cloud's, on tabs of their own), on-screen text, notes, attendees and
+  documents, with **Copy**, **Export…** (one plain-text file with every section), **Attach document**,
+  **Open folder**, and **Transcribe on this PC** / **Transcribe in cloud** to make (or remake) either
+  transcript from the meeting's recording afterwards. A meeting whose transcription didn't
   finish keeps its recording and offers **Retry**.
 - **Pushes each finished meeting to Copilot Studio** as a named file package dropped into a folder
   OneDrive/SharePoint is already syncing (see "The Copilot push" below). This is one-way: the app doesn't
