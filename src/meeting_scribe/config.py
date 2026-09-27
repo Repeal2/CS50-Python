@@ -183,6 +183,9 @@ class Settings:
     # Words to spell the way they're given — client and product names, jargon — added to every meeting's
     # transcription, along with its project, title and attendees (see session._meeting_vocabulary).
     custom_vocabulary: tuple[str, ...] = ()
+    # Once a meeting is transcribed, replace its WAV recording with a much smaller Opus copy (see
+    # audio.archive) — about 14 MB an hour per track instead of 0.7 GB. Off keeps the WAVs as recorded.
+    compress_recordings: bool = True
     # Where the on-screen OCR box was last left — (left, top, width, height) in screen pixels — so the
     # next meeting's box appears in the same place instead of needing to be set up again. None until
     # the box has been moved or resized once. See screen.ocr_box.
@@ -267,6 +270,7 @@ def save_user_config(settings: Settings) -> None:
         "runpod_huggingface_token": settings.runpod_huggingface_token,
         "transcription_language": settings.transcription_language,
         "custom_vocabulary": list(settings.custom_vocabulary),
+        "compress_recordings": settings.compress_recordings,
         "ocr_area": list(settings.ocr_area) if settings.ocr_area else None,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -381,6 +385,7 @@ def load_settings() -> Settings:
         runpod_huggingface_token=user_config.get("runpod_huggingface_token"),
         transcription_language=_transcription_language_from_json(user_config),
         custom_vocabulary=_vocabulary_from_json(user_config.get("custom_vocabulary")),
+        compress_recordings=bool(user_config.get("compress_recordings", True)),
         ocr_area=_ocr_area_from_json(user_config.get("ocr_area")),
         moved_from=moved_from,
     )

@@ -868,13 +868,24 @@ def load_part_offsets(base_path: Path) -> dict[Path, float]:
     try:
         record = json.loads(part_offsets_path(base_path).read_text(encoding="utf-8"))
         return {
-            base_path.with_name(str(part["file"])): float(part["start_seconds"]) for part in record["parts"]
+            _existing_form(base_path.with_name(str(part["file"]))): float(part["start_seconds"])
+            for part in record["parts"]
         }
     except (OSError, ValueError, KeyError, TypeError):
         return {}
 
 
-def discover_wav_parts(base_path: Path) -> tuple[Path, ...]:
+def _existing_form(wav_path: Path) -> Path:
+    """`wav_path` as it's on disk now: the WAV as recorded, or — once the meeting was transcribed and its
+    recording compressed (see audio.archive) — the Opus file that replaced it."""
+    from meeting_scribe.audio.archive import archive_path
+
+    if not wav_path.exists() and archive_path(wav_path).exists():
+        return archive_path(wav_path)
+    return wav_path
+
+
+def discover_recording_parts(base_path: Path) -> tuple[Path, ...]:
     """The inverse of _SegmentedWavWriter's part naming: given "mic.wav", finds however many parts of
     that stream were actually written to disk ("mic.wav", "mic.part2.wav", ...) and returns them in
     order. Stops at the first missing number, which is safe because parts are always written
@@ -882,12 +893,13 @@ def discover_wav_parts(base_path: Path) -> tuple[Path, ...]:
 
     This is what lets a stream be re-transcribed later from just its base path — no live
     _SegmentedWavWriter or Recorder needed — which retrying a meeting whose transcription failed (see
-    session.retry_meeting_transcription) relies on."""
+    session.retry_meeting_transcription) relies on. A part that has since been compressed (see
+    audio.archive) is returned as its ".opus" file instead."""
     parts: list[Path] = []
     number = 1
     while True:
-        path = base_path if number == 1 else base_path.with_name(
-            f"{base_path.stem}.part{number}{base_path.suffix}"
+        path = _existing_form(
+            base_path if number == 1 else base_path.with_name(f"{base_path.stem}.part{number}{base_path.suffix}")
         )
         if not path.exists():
             return tuple(parts)

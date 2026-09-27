@@ -428,3 +428,12 @@ def test_an_unknown_transcription_language_falls_back_to_english(tmp_path, monke
 
     assert settings.transcription_language == "en"
     assert settings.custom_vocabulary == ()
+
+
+def test_recordings_are_compressed_unless_turned_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    assert load_settings().compress_recordings is True
+
+    update_settings(load_settings(), compress_recordings=False)
+
+    assert load_settings().compress_recordings is False

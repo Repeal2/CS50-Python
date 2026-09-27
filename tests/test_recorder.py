@@ -26,7 +26,7 @@ from meeting_scribe.audio.recorder import (
     PartTiming,
     describe_input_problems,
     describe_part_timing,
-    discover_wav_parts,
+    discover_recording_parts,
     load_part_offsets,
     part_offsets_path,
 )
@@ -161,13 +161,13 @@ def test_empty_writes_do_not_start_a_new_part(tmp_path):
     assert _wav_frames(tmp_path / "mic.wav") == b""
 
 
-def test_discover_wav_parts_finds_a_single_unsuffixed_file(tmp_path):
+def test_discover_recording_parts_finds_a_single_unsuffixed_file(tmp_path):
     (tmp_path / "mic.wav").write_bytes(b"fake wav bytes")
 
-    assert discover_wav_parts(tmp_path / "mic.wav") == (tmp_path / "mic.wav",)
+    assert discover_recording_parts(tmp_path / "mic.wav") == (tmp_path / "mic.wav",)
 
 
-def test_discover_wav_parts_finds_every_part_a_writer_actually_wrote(tmp_path):
+def test_discover_recording_parts_finds_every_part_a_writer_actually_wrote(tmp_path):
     # Regression test for session.retry_meeting_transcription: given just the base path, this has to
     # reconstruct exactly what _SegmentedWavWriter would have reported as .paths while it was live —
     # since retrying happens after that writer (and the whole Recorder) is long gone.
@@ -176,21 +176,21 @@ def test_discover_wav_parts_finds_every_part_a_writer_actually_wrote(tmp_path):
         writer.write(b"\x02\x00" * 50)
     writer.close()
 
-    assert discover_wav_parts(tmp_path / "system.wav") == writer.paths
+    assert discover_recording_parts(tmp_path / "system.wav") == writer.paths
 
 
-def test_discover_wav_parts_returns_empty_when_nothing_was_ever_recorded(tmp_path):
-    assert discover_wav_parts(tmp_path / "mic.wav") == ()
+def test_discover_recording_parts_returns_empty_when_nothing_was_ever_recorded(tmp_path):
+    assert discover_recording_parts(tmp_path / "mic.wav") == ()
 
 
-def test_discover_wav_parts_stops_at_the_first_gap(tmp_path):
+def test_discover_recording_parts_stops_at_the_first_gap(tmp_path):
     # Parts are always written sequentially with no gaps, so a "part3" with no "part2" beside it isn't a
     # real scenario — but stopping at the first missing number rather than scanning past it is still the
     # safer contract to document and test.
     (tmp_path / "mic.wav").write_bytes(b"first part")
     (tmp_path / "mic.part3.wav").write_bytes(b"orphaned part")
 
-    assert discover_wav_parts(tmp_path / "mic.wav") == (tmp_path / "mic.wav",)
+    assert discover_recording_parts(tmp_path / "mic.wav") == (tmp_path / "mic.wav",)
 
 
 def test_capture_notices_start_empty(tmp_path):

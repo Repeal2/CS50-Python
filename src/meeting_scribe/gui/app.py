@@ -2657,6 +2657,16 @@ class SettingsPage(ttk.Frame):
             side="left", padx=(10, 0)
         )
         self._field(body, 0, "Data folder", line)
+        self.compress_recordings_var = tk.BooleanVar(value=settings.compress_recordings)
+        ttk.Checkbutton(
+            body, text="Compress recordings once transcribed", variable=self.compress_recordings_var,
+            style="Card.TCheckbutton",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self._hint(
+            body, 3,
+            "Keeps each meeting's audio at about 14 MB an hour per track instead of 0.7 GB — plenty for "
+            "listening back or transcribing again. Untick to keep the original WAV files.",
+        )
         if _is_store_python_private(real_data_dir):
             self._hint(
                 body, 1,
@@ -2766,6 +2776,7 @@ class SettingsPage(ttk.Frame):
             whisper_model_size=self.whisper_model_var.get(),
             transcription_language=_language_code(self.language_var.get()),
             custom_vocabulary=self.vocabulary_var.get(),
+            compress_recordings=self.compress_recordings_var.get(),
             transcribe_locally=self.transcribe_locally_var.get(),
             transcribe_in_cloud=self.transcribe_in_cloud_var.get(),
             runpod_api_key=self.runpod_api_key_var.get().strip(),

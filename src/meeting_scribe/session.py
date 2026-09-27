@@ -18,8 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from meeting_scribe.audio.archive import archive_recording
 from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
-from meeting_scribe.audio.recorder import Recorder, discover_wav_parts, load_part_offsets
+from meeting_scribe.audio.recorder import Recorder, discover_recording_parts, load_part_offsets
 from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
 from meeting_scribe.screen.region_picker import RegionTarget
@@ -37,7 +38,7 @@ from meeting_scribe.transcription.engine import (
     render_transcript,
     split_word_list,
     transcription_slot,
-    wav_duration_seconds,
+    audio_duration_seconds,
 )
 
 _WAITING_FOR_TRANSCRIPTION_MESSAGE = "Waiting for another meeting's transcription to finish first…"
@@ -261,8 +262,8 @@ def _transcribe_locally(
 
     # Progress is how much of both tracks' audio Whisper has worked through: the microphone first, then
     # system audio.
-    mic_seconds = sum(wav_duration_seconds(path) for path in tracks.mic_paths)
-    total_seconds = mic_seconds + sum(wav_duration_seconds(path) for path in tracks.system_paths)
+    mic_seconds = sum(audio_duration_seconds(path) for path in tracks.mic_paths)
+    total_seconds = mic_seconds + sum(audio_duration_seconds(path) for path in tracks.system_paths)
 
     def progress(before: float) -> Callable[[float], None] | None:
         if job is None or total_seconds <= 0:
@@ -353,7 +354,7 @@ def _parts_with_audio(paths: Sequence[Path], label: str, report: Callable[[str],
     message, rather than failing transcription for the whole meeting, including the track that's fine."""
     kept = []
     for path in paths:
-        if wav_duration_seconds(path) > 0:
+        if audio_duration_seconds(path) > 0:
             kept.append(path)
         else:
             report(f"{label}: {path.name} has no audio in it, so that track is left out of the transcript.")
@@ -417,6 +418,13 @@ def _finish_meeting(
 
     db.finish_meeting(meeting_id, transcript_text=transcript_text)
     report("Meeting saved.")
+    if settings.compress_recordings:
+        # Only now: until the meeting is saved, a failed transcription's Retry may still need them, and
+        # compressing never touches a part it couldn't copy faithfully (see audio.archive).
+        _stage(job, jobs.COMPRESSING)
+        summary = archive_recording((*tracks.mic_paths, *tracks.system_paths)).summary()
+        if summary is not None:
+            report(summary)
     return transcript_text
 
 
@@ -712,8 +720,8 @@ def _retry_meeting_transcription(
         raise ValueError(f"Meeting {meeting_id}'s project no longer exists")
 
     meeting_dir = settings.meeting_dir(meeting_id)
-    mic_paths = discover_wav_parts(meeting_dir / "mic.wav")
-    system_paths = discover_wav_parts(meeting_dir / "system.wav")
+    mic_paths = discover_recording_parts(meeting_dir / "mic.wav")
+    system_paths = discover_recording_parts(meeting_dir / "system.wav")
     if not mic_paths and not system_paths:
         raise FileNotFoundError(
             f'No recorded audio found for "{meeting.title}" in {meeting_dir} — nothing to retranscribe.'
@@ -772,8 +780,8 @@ def add_transcription(
             raise ValueError(f"\"{meeting.title}\" hasn't finished transcribing — use Retry first.")
         meeting_dir = settings.meeting_dir(meeting_id)
         tracks = _Tracks(
-            _parts_with_audio(discover_wav_parts(meeting_dir / "mic.wav"), "Microphone", report),
-            _parts_with_audio(discover_wav_parts(meeting_dir / "system.wav"), "System audio", report),
+            _parts_with_audio(discover_recording_parts(meeting_dir / "mic.wav"), "Microphone", report),
+            _parts_with_audio(discover_recording_parts(meeting_dir / "system.wav"), "System audio", report),
             load_part_offsets(meeting_dir / "mic.wav"),
             load_part_offsets(meeting_dir / "system.wav"),
         )

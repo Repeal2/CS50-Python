@@ -14,7 +14,7 @@ from meeting_scribe.transcription.engine import (
     merge_transcript_lines,
     render_transcript,
     split_word_list,
-    wav_duration_seconds,
+    audio_duration_seconds,
 )
 
 
@@ -134,12 +134,12 @@ def _write_wav(path, seconds, framerate=16000):
         wav_file.writeframes(b"\x00\x00" * int(framerate * seconds))
 
 
-def test_wav_duration_seconds_reads_the_header(tmp_path):
+def test_audio_duration_seconds_reads_the_header(tmp_path):
     _write_wav(tmp_path / "mic.wav", seconds=2.5)
-    assert wav_duration_seconds(tmp_path / "mic.wav") == 2.5
+    assert audio_duration_seconds(tmp_path / "mic.wav") == 2.5
 
 
-def test_wav_duration_seconds_tolerates_a_file_it_cannot_read(tmp_path):
+def test_audio_duration_seconds_tolerates_a_file_it_cannot_read(tmp_path):
     missing = tmp_path / "nope.wav"
     not_a_wav = tmp_path / "junk.wav"
     not_a_wav.write_bytes(b"not audio")
@@ -147,9 +147,9 @@ def test_wav_duration_seconds_tolerates_a_file_it_cannot_read(tmp_path):
     empty = tmp_path / "empty.wav"  # what a capture stream that never received anything leaves behind
     empty.write_bytes(b"")
 
-    assert wav_duration_seconds(missing) == 0.0
-    assert wav_duration_seconds(not_a_wav) == 0.0
-    assert wav_duration_seconds(empty) == 0.0
+    assert audio_duration_seconds(missing) == 0.0
+    assert audio_duration_seconds(not_a_wav) == 0.0
+    assert audio_duration_seconds(empty) == 0.0
 
 
 def test_transcribe_parts_puts_every_part_back_on_the_meetings_clock(tmp_path, monkeypatch):

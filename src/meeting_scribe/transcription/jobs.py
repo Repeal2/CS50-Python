@@ -34,6 +34,7 @@ QUEUED = "Queued — another meeting is being transcribed on this PC"
 CLOUD = "Transcribing in the cloud"
 LOCAL = "Transcribing on this PC"
 SAVING = "Saving"
+COMPRESSING = "Compressing the recording"
 
 RUNNING, DONE, FAILED = "running", "done", "failed"
 

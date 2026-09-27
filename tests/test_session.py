@@ -55,7 +55,7 @@ def _plenty_of_memory(monkeypatch):
 def _recordings_have_audio(monkeypatch):
     """Most tests here name WAV paths that don't exist (the transcriber is mocked, so nothing reads
     them). Tests of what happens to an empty or missing track use `_real_durations` to undo this."""
-    monkeypatch.setattr("meeting_scribe.session.wav_duration_seconds", lambda path: 60.0)
+    monkeypatch.setattr("meeting_scribe.session.audio_duration_seconds", lambda path: 60.0)
 
 
 @pytest.fixture(autouse=True)
@@ -71,9 +71,9 @@ def _no_meetings_in_progress():
 
 @pytest.fixture
 def _real_durations(monkeypatch):
-    from meeting_scribe.transcription.engine import wav_duration_seconds
+    from meeting_scribe.transcription.engine import audio_duration_seconds
 
-    monkeypatch.setattr("meeting_scribe.session.wav_duration_seconds", wav_duration_seconds)
+    monkeypatch.setattr("meeting_scribe.session.audio_duration_seconds", audio_duration_seconds)
 
 
 def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
@@ -635,6 +635,7 @@ def test_stop_tells_the_job_its_stages_and_how_far_along_this_pc_is(tmp_path):
         ("stage", jobs.SAVING, None),
         ("log", "Copilot sync folder not configured — nothing pushed."),
         ("log", "Meeting saved."),
+        ("stage", jobs.COMPRESSING, None),
     ]
     # The caller's own on_progress still hears every message.
     assert messages == [event[1] for event in job.events if event[0] == "log"]
@@ -675,7 +676,7 @@ def test_a_job_waiting_for_another_transcription_is_marked_queued(tmp_path):
             other.join(5)
 
     stages = [event[1] for event in job.events if event[0] == "stage"]
-    assert stages == [jobs.QUEUED, jobs.LOCAL, jobs.SAVING]
+    assert stages == [jobs.QUEUED, jobs.LOCAL, jobs.SAVING, jobs.COMPRESSING]
 
 
 def test_a_cloud_job_is_marked_as_in_the_cloud(tmp_path):
@@ -1705,3 +1706,47 @@ def test_the_disk_running_low_is_shown_live_and_kept_in_the_meetings_log(tmp_pat
 
     assert any(problem.startswith("Disk nearly full: 300 MB left") for problem in problems)
     assert any("disk ran low while recording (300 MB free at its lowest)" in line for line in progress)
+
+
+def test_a_saved_meetings_recording_is_compressed_and_can_still_be_transcribed_again(tmp_path):
+    from meeting_scribe.session import LOCAL_ENGINE, add_transcription, retry_meeting_transcription
+
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
+        settings = _settings(tmp_path)
+        with Database(tmp_path / "test.db") as db:
+            _project, meeting_id = _stuck_meeting(settings, db)
+            meeting_dir = settings.meeting_dir(meeting_id)
+            _write_wav(meeting_dir / "mic.wav", seconds=2.0)
+            _write_wav(meeting_dir / "system.wav", seconds=2.0)
+            progress = []
+
+            retry_meeting_transcription(settings, db, meeting_id, on_progress=progress.append)
+            compressed = sorted(path.name for path in meeting_dir.iterdir() if path.suffix in (".wav", ".opus"))
+
+            MockTranscriber.return_value.transcribe_parts.reset_mock()
+            add_transcription(settings, db, meeting_id, LOCAL_ENGINE)
+            read_again = [call.args[0] for call in MockTranscriber.return_value.transcribe_parts.call_args_list]
+
+    assert compressed == ["mic.opus", "system.opus"]
+    assert any(line.startswith("Recording compressed for keeping: ") for line in progress)
+    assert read_again == [(meeting_dir / "mic.opus",), (meeting_dir / "system.opus",)]
+
+
+def test_recordings_are_kept_as_wav_when_compression_is_turned_off(tmp_path):
+    from dataclasses import replace
+
+    from meeting_scribe.session import retry_meeting_transcription
+
+    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+        settings = replace(_settings(tmp_path), compress_recordings=False)
+        with Database(tmp_path / "test.db") as db:
+            _project, meeting_id = _stuck_meeting(settings, db)
+            meeting_dir = settings.meeting_dir(meeting_id)
+            _write_wav(meeting_dir / "mic.wav", seconds=1.0)
+
+            retry_meeting_transcription(settings, db, meeting_id)
+
+    assert (meeting_dir / "mic.wav").exists()
+    assert not (meeting_dir / "mic.opus").exists()

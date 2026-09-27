@@ -344,7 +344,7 @@ class WhisperTranscriber:
                     audio_path, source=source, on_progress=part_progress, language=language, vocabulary=vocabulary
                 )
             )
-            done_seconds += wav_duration_seconds(audio_path)
+            done_seconds += audio_duration_seconds(audio_path)
             if on_progress is not None:
                 on_progress(done_seconds)  # the silence after its last segment counts as done too
         return lines
@@ -370,19 +370,38 @@ def part_start_offsets(
         if start is None:
             start = next_start
         offsets.append(start)
-        next_start = start + wav_duration_seconds(audio_path)
+        next_start = start + audio_duration_seconds(audio_path)
     return offsets
 
 
-def wav_duration_seconds(path: Path) -> float:
-    """Length of a WAV file in seconds, or 0.0 if it can't be read — a missing or unreadable part
+def audio_duration_seconds(path: Path) -> float:
+    """Length of a recording part in seconds — a WAV as recorded, or the Opus file it was compressed to
+    once transcribed (see audio.archive) — or 0.0 if it can't be read: a missing or unreadable part
     shouldn't sink a transcript that otherwise came out fine."""
+    if Path(path).suffix.lower() != ".wav":
+        return _compressed_duration_seconds(path)
     try:
         with contextlib.closing(wave.open(str(path), "rb")) as wav_file:
             framerate = wav_file.getframerate()
             return wav_file.getnframes() / framerate if framerate else 0.0
     except (OSError, EOFError, wave.Error):  # EOFError: a 0-byte file, which never got a header
         return 0.0
+
+
+def _compressed_duration_seconds(path: Path) -> float:
+    """Duration of a compressed audio file, read by PyAV (which faster-whisper already depends on)."""
+    try:
+        import av
+
+        with av.open(str(path)) as container:
+            if container.duration is not None:
+                return container.duration / av.time_base
+            stream = container.streams.audio[0]
+            if stream.duration is not None and stream.time_base is not None:
+                return float(stream.duration * stream.time_base)
+    except Exception:  # av raises its own error types for a missing, empty or corrupt file
+        return 0.0
+    return 0.0
 
 
 def merge_transcript_lines(*line_groups: list[TranscriptLine]) -> list[TranscriptLine]:
