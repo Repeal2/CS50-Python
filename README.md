@@ -55,7 +55,15 @@ Windows' light/dark app setting.
   opens on silence or hold music isn't mistaken for another language) and **Your words** — client,
   product and team names, acronyms. Both engines are steered towards those words plus each meeting's
   project, title and captured attendees. Every 30 seconds of audio is transcribed on its own rather than
-  following on from the last, so one misheard line can't repeat itself for minutes.
+  following on from the last, so one misheard line can't repeat itself for minutes, and lines Whisper
+  invents over silence ("Thanks for watching", "Subtitles by…") are left out.
+- **Keeps a crash in transcription to itself.** Transcription on this PC runs in a process of its own, so
+  if it runs out of memory on a long meeting, that transcription fails (and can be retried) while the app,
+  and any meeting being recorded, carries on.
+- **Watches the disk.** A meeting won't start with under 2 GB free, and one that runs the disk under 1 GB
+  shows a warning while there's still time to free space. Once a meeting is transcribed its recording is
+  compressed to Opus — about 14 MB an hour per track instead of 0.7 GB (Settings → Storage turns this
+  off). Audio a device dropped along the way is reported with the meeting.
 - **Shows transcription progress and history.** The Transcriptions page lists what's being transcribed
   right now, one bar each: a measured percentage while this PC transcribes (how much of both tracks'
   audio Whisper has worked through), how long it's taken so far and roughly how long is left, or a
@@ -103,6 +111,7 @@ src/meeting_scribe/
   session.py          # orchestrates one meeting: start/stop recording, merge, push, save
   audio/recorder.py   # mic + WASAPI loopback capture (Windows-only at runtime)
   audio/device_picker.py  # enumerates mic/speaker devices so one can be picked instead of the OS default
+  audio/archive.py    # compresses a transcribed meeting's WAV parts to Opus, safely
   screen/capture.py   # periodic screenshot + OCR, deduplicated, optionally scoped to one window or area
   screen/ocr_box.py   # the on-screen OCR box: drag to move, handles to resize, Start/Stop OCR button
   screen/window_picker.py  # finds the Teams call window (meeting name, where to place prompts and the box)
@@ -110,10 +119,12 @@ src/meeting_scribe/
   screen/meeting_detector.py  # notices a Teams call starting/ending, for the start/stop prompts
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
   transcription/jobs.py    # running transcriptions: stage, percentage, estimate — for the Transcriptions page
+  transcription/worker.py  # runs faster-whisper in a child process, so a native crash can't take the app down
   ai/copilot_push.py    # one-way, named-file-package drop of a finished meeting to Copilot Studio
   ai/minutes_import.py  # files the minutes Copilot Studio writes back against their meetings
   storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents, transcription runs
   storage/documents.py  # Text extraction for uploaded PDFs/docx/images/text
+  storage/disk_space.py # free-space checks before and during recording
   gui/app.py             # Tkinter window: Record, Library, Transcriptions and Settings pages
   gui/theme.py           # palette (light/dark), fonts and ttk styles
   gui/meeting_prompt.py  # the "Teams meeting detected" / "Meeting ended" prompts

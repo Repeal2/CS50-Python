@@ -143,4 +143,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # In a frozen build, a child process (local transcription runs in one — see transcription.worker) is
+    # this same executable started again with arguments saying so; this runs the child's work and exits
+    # instead of opening a second copy of the app. A no-op everywhere else.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     raise SystemExit(main())

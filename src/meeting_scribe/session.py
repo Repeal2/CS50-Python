@@ -2,9 +2,9 @@
 transcribe, merge into one transcript, push it to Copilot Studio, and file everything locally under the
 meeting's project so there's a record of it in this app regardless of what happens to the pushed copy.
 
-Each MeetingSession is self-contained (its own Recorder, ScreenWatcher, WhisperTranscriber, and meeting
-directory) with no shared mutable state between instances, so one session's stop() — the slow part, given
-local transcription — can safely keep running on a background thread while a new MeetingSession starts
+Each MeetingSession is self-contained (its own Recorder, ScreenWatcher, IsolatedWhisperTranscriber, and
+meeting directory) with no shared mutable state between instances, so one session's stop() — the slow part,
+given local transcription — can safely keep running on a background thread while a new MeetingSession starts
 and records the next meeting. The GUI relies on this for back-to-back meetings: starting the next one
 doesn't wait for the previous one to finish transcribing/saving.
 """
@@ -28,9 +28,9 @@ from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.disk_space import LowDiskWatch, check_room_to_record
 from meeting_scribe.transcription import jobs
 from meeting_scribe.transcription.jobs import TranscriptionJob
+from meeting_scribe.transcription.worker import IsolatedWhisperTranscriber
 from meeting_scribe.transcription.engine import (
     TranscriptLine,
-    WhisperTranscriber,
     available_memory_mb,
     build_vocabulary,
     low_memory_warning,
@@ -208,6 +208,13 @@ def _meeting_vocabulary(settings: Settings, db: Database, meeting_id: int) -> st
     )
 
 
+def _local_transcriber(settings: Settings) -> IsolatedWhisperTranscriber:
+    """This PC's transcriber, run in a process of its own so a native crash in it (an out-of-memory abort
+    on a long meeting) fails that transcription rather than the whole app — see transcription.worker.
+    A crash there is logged beside the app's own (see main._install_crash_logging)."""
+    return IsolatedWhisperTranscriber(settings.whisper_model_size, crash_log=settings.data_dir / "crash.log")
+
+
 class _Tracks:
     """One meeting's recorded audio: each stream's parts, and where each part started."""
 
@@ -250,7 +257,7 @@ def _transcribe_in_cloud(
 
 def _transcribe_locally(
     settings: Settings,
-    transcriber: WhisperTranscriber,
+    transcriber: IsolatedWhisperTranscriber,
     tracks: _Tracks,
     report: Callable[[str], None],
     job: TranscriptionJob | None = None,
@@ -305,7 +312,7 @@ def _transcribe_locally(
 
 def _transcribe(
     settings: Settings,
-    transcriber: WhisperTranscriber,
+    transcriber: IsolatedWhisperTranscriber,
     engines: Sequence[str],
     tracks: _Tracks,
     report: Callable[[str], None],
@@ -366,7 +373,7 @@ def _finish_meeting(
     db: Database,
     meeting_id: int,
     *,
-    transcriber: WhisperTranscriber,
+    transcriber: IsolatedWhisperTranscriber,
     mic_paths: Sequence[Path],
     system_paths: Sequence[Path],
     screen_events: Sequence[ScreenTextEvent],
@@ -512,7 +519,7 @@ class MeetingSession:
             target=screen_target,
             reading=read_screen,
         )
-        self._transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
+        self._transcriber = _local_transcriber(settings)
 
     def start(self) -> None:
         _claim_meeting(self.meeting_id)
@@ -637,7 +644,7 @@ class MeetingSession:
 
     def _use_settings(self, settings: Settings) -> None:
         if settings.whisper_model_size != self._settings.whisper_model_size:
-            self._transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
+            self._transcriber = _local_transcriber(settings)
         self._settings = settings
 
     def _stop(self, report: Callable[[str], None], job: TranscriptionJob | None) -> str:
@@ -737,7 +744,7 @@ def _retry_meeting_transcription(
         settings,
         db,
         meeting_id,
-        transcriber=WhisperTranscriber(model_size=settings.whisper_model_size),
+        transcriber=_local_transcriber(settings),
         mic_paths=mic_paths,
         system_paths=system_paths,
         mic_offsets=load_part_offsets(meeting_dir / "mic.wav"),
@@ -789,7 +796,7 @@ def add_transcription(
             raise FileNotFoundError(
                 f'The recorded audio for "{meeting.title}" is no longer in {meeting_dir} — nothing to transcribe.'
             )
-        transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
+        transcriber = _local_transcriber(settings)
         results = _transcribe(
             settings,
             transcriber,

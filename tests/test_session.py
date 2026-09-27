@@ -80,7 +80,7 @@ def test_session_merges_audio_and_screen_into_saved_transcript(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
@@ -134,7 +134,7 @@ def test_cloud_only_sends_both_tracks_to_runpod_and_nothing_is_transcribed_here(
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
         patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod,
     ):
         recorder_instance = MockRecorder.return_value
@@ -200,7 +200,7 @@ def test_with_both_chosen_the_meeting_keeps_both_transcripts(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
         patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod,
     ):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
@@ -236,7 +236,7 @@ def test_a_cloud_failure_with_both_chosen_keeps_this_pcs_transcript(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
         patch(
             "meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber",
             side_effect=RunpodWhisperXError("not configured"),
@@ -270,7 +270,7 @@ def test_the_transcription_choice_in_force_when_stop_is_pressed_is_the_one_used(
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
         patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod,
     ):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
@@ -298,7 +298,7 @@ def test_session_falls_back_to_local_transcription_when_cloud_diarization_fails(
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
         patch(
             "meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber",
             side_effect=RunpodWhisperXError("not configured"),
@@ -337,7 +337,7 @@ def test_session_passes_chosen_devices_to_recorder(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -354,7 +354,7 @@ def test_session_audio_levels_reads_through_to_recorder(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -371,7 +371,7 @@ def test_session_pushes_a_named_file_package_when_sync_dir_configured(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
@@ -412,7 +412,7 @@ def test_session_pushes_a_meetings_reference_documents_under_their_original_file
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
@@ -455,7 +455,7 @@ def test_session_pushes_manual_notes_and_attendees_as_reference_docs(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
@@ -498,7 +498,7 @@ def test_session_omits_manual_notes_and_attendees_from_the_push_when_neither_was
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
@@ -527,7 +527,7 @@ def test_session_pushes_nothing_without_a_copilot_sync_dir(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
@@ -552,7 +552,7 @@ def test_session_stop_reports_progress_through_each_stage(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
@@ -607,7 +607,7 @@ def test_stop_tells_the_job_its_stages_and_how_far_along_this_pc_is(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
             mic_paths=(tmp_path / "mic.wav",), system_paths=(tmp_path / "system.wav",), started_at_monotonic=0.0
@@ -647,7 +647,7 @@ def test_a_job_waiting_for_another_transcription_is_marked_queued(tmp_path):
     from meeting_scribe.transcription import jobs
     from meeting_scribe.transcription.engine import transcription_slot
 
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.return_value = []
         from meeting_scribe.session import retry_meeting_transcription
 
@@ -700,7 +700,7 @@ def test_stop_reports_a_low_memory_warning_before_transcribing(tmp_path, monkeyp
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
             mic_paths=(tmp_path / "mic.wav",),
@@ -730,7 +730,7 @@ def test_session_stop_reports_skip_message_without_a_copilot_sync_dir(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
@@ -761,7 +761,7 @@ def test_session_stop_works_without_an_on_progress_callback(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         recorder_instance = MockRecorder.return_value
         recorder_instance.stop.return_value = RecordedAudio(
@@ -785,7 +785,7 @@ def test_session_exposes_its_title(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder"),
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -798,7 +798,7 @@ def test_session_set_project_moves_the_meeting_to_an_existing_project(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder"),
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -816,7 +816,7 @@ def test_session_set_project_creates_a_new_project_if_the_name_is_new(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder"),
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -840,7 +840,7 @@ def test_session_set_project_does_not_move_the_meetings_recording_directory(tmp_
     with (
         patch("meeting_scribe.session.Recorder"),
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -861,7 +861,7 @@ def test_two_sessions_can_be_active_at_once_without_interfering(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
             mic_paths=(tmp_path / "mic.wav",),
@@ -900,7 +900,7 @@ def test_session_reports_a_capture_stream_that_died_mid_meeting(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
             mic_paths=(tmp_path / "mic.wav",),
@@ -928,7 +928,7 @@ def test_session_transcribes_every_recorded_part(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         mic_paths = (tmp_path / "mic.wav", tmp_path / "mic.part2.wav")
         MockRecorder.return_value.stop.return_value = RecordedAudio(
@@ -963,7 +963,7 @@ def _stuck_meeting(settings: Settings, db: Database, project_name="Test Project"
 
 
 def test_retry_transcribes_recorded_audio_and_finishes_the_meeting(tmp_path):
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
 
         def fake_transcribe(paths, source, start_offsets=None, on_progress=None, **hints):
             if source == "mic":
@@ -1025,7 +1025,7 @@ def test_retry_raises_when_no_audio_was_ever_recorded(tmp_path):
 def test_retry_transcribes_every_recorded_part(tmp_path):
     # A meeting long enough to overflow a WAV header left several numbered part files behind — retry has
     # to rediscover all of them from disk, not just the plainly-named first one.
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.return_value = []
 
         from meeting_scribe.session import retry_meeting_transcription
@@ -1043,7 +1043,7 @@ def test_retry_transcribes_every_recorded_part(tmp_path):
 
 
 def test_retry_places_parts_where_the_recording_noted_they_started(tmp_path):
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.return_value = []
 
         from meeting_scribe.session import retry_meeting_transcription
@@ -1074,7 +1074,7 @@ def test_session_passes_each_parts_recorded_start_time_to_transcription(tmp_path
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         mic_paths = (tmp_path / "mic.wav", tmp_path / "mic.part2.wav")
         offsets = {mic_paths[0]: 0.0, mic_paths[1]: 12.0}
@@ -1099,7 +1099,7 @@ def test_session_passes_each_parts_recorded_start_time_to_transcription(tmp_path
 
 
 def test_retry_pushes_to_copilot_studio_when_a_sync_dir_is_configured(tmp_path):
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import retry_meeting_transcription
@@ -1117,7 +1117,7 @@ def test_retry_pushes_to_copilot_studio_when_a_sync_dir_is_configured(tmp_path):
 
 
 def test_retry_reports_progress(tmp_path):
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
 
         from meeting_scribe.session import retry_meeting_transcription
@@ -1137,7 +1137,7 @@ def test_retry_reports_progress(tmp_path):
 
 
 def test_retry_reports_a_low_memory_warning_before_transcribing(tmp_path, monkeypatch):
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.return_value = []
         monkeypatch.setattr("meeting_scribe.session.available_memory_mb", lambda: 10.0)
 
@@ -1159,7 +1159,7 @@ def test_retry_replaces_segments_left_by_an_earlier_partial_attempt(tmp_path):
     # Simulates a retry that transcribed fine but then failed later (e.g. pushing to Copilot Studio) —
     # its segments were already committed to the DB even though the meeting was never marked finished. A
     # second retry has to replace those, not add to them.
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
 
         def fake_transcribe(paths, source, start_offsets=None, on_progress=None, **hints):
             return [TranscriptLine(1.0, "mic", "hello")] if source == "mic" else []
@@ -1185,7 +1185,7 @@ def test_session_reads_input_health_through_to_the_recorder(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -1206,7 +1206,7 @@ def test_abandon_stops_capture_without_transcribing_and_leaves_the_meeting_retry
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher") as MockWatcher,
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -1244,7 +1244,7 @@ def test_session_leaves_out_an_empty_system_track_instead_of_failing(tmp_path, _
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
         patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod,
     ):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
@@ -1270,7 +1270,7 @@ def test_session_leaves_out_an_empty_system_track_instead_of_failing(tmp_path, _
 
 
 def test_retry_recovers_a_meeting_whose_system_track_is_empty(tmp_path, _real_durations):
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
         from meeting_scribe.session import retry_meeting_transcription
 
@@ -1311,7 +1311,7 @@ def test_a_meeting_that_is_still_recording_cannot_be_retried(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder"),
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         from meeting_scribe.session import MeetingSession, meeting_in_progress, retry_meeting_transcription
 
@@ -1336,7 +1336,7 @@ def test_a_meeting_is_released_even_when_finishing_it_fails(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession, meeting_in_progress
 
@@ -1353,7 +1353,7 @@ def test_a_meeting_that_failed_to_start_is_not_left_in_progress(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession, meeting_in_progress
 
@@ -1372,7 +1372,7 @@ def test_on_screen_text_is_written_to_disk_as_it_arrives(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder"),
         patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession, load_screen_text_events
 
@@ -1398,7 +1398,7 @@ def test_a_cut_off_last_line_of_on_screen_text_is_skipped(tmp_path):
 
 
 def test_retry_brings_back_the_on_screen_text_saved_during_the_meeting(tmp_path):
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.side_effect = (
             lambda paths, source, start_offsets=None, on_progress=None, **hints: [TranscriptLine(1.0, source, f"{source} speech")]
         )
@@ -1423,7 +1423,7 @@ def test_on_screen_reading_can_start_later_and_follow_the_box(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder"),
         patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
-        patch("meeting_scribe.session.WhisperTranscriber"),
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber"),
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -1445,7 +1445,7 @@ def test_a_meeting_where_ocr_was_never_started_says_so(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher") as MockScreenWatcher,
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         from meeting_scribe.session import MeetingSession
 
@@ -1499,7 +1499,7 @@ def test_a_meeting_transcribed_here_can_be_sent_to_the_cloud_afterwards(tmp_path
 
 
 def test_transcribing_again_replaces_only_that_engines_lines(tmp_path):
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, start_offsets=None, on_progress=None, **hints: [
             TranscriptLine(1.0, source, f"new local {source}")
         ]
@@ -1522,7 +1522,7 @@ def test_a_cloud_failure_after_the_fact_is_raised_not_papered_over(tmp_path):
     from meeting_scribe.transcription.runpod_whisperx import RunpodWhisperXError
 
     with (
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
         patch(
             "meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber",
             side_effect=RunpodWhisperXError("not configured"),
@@ -1639,7 +1639,7 @@ def test_transcription_is_steered_towards_the_meetings_own_words(tmp_path):
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
         patch("meeting_scribe.transcription.runpod_whisperx.RunpodWhisperXTranscriber") as MockRunpod,
     ):
         MockRecorder.return_value.stop.return_value = RecordedAudio(
@@ -1688,7 +1688,7 @@ def test_the_disk_running_low_is_shown_live_and_kept_in_the_meetings_log(tmp_pat
     with (
         patch("meeting_scribe.session.Recorder") as MockRecorder,
         patch("meeting_scribe.session.ScreenWatcher"),
-        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
     ):
         MockRecorder.return_value.input_problems.return_value = ()
         MockRecorder.return_value.stop.return_value = RecordedAudio(
@@ -1711,7 +1711,7 @@ def test_the_disk_running_low_is_shown_live_and_kept_in_the_meetings_log(tmp_pat
 def test_a_saved_meetings_recording_is_compressed_and_can_still_be_transcribed_again(tmp_path):
     from meeting_scribe.session import LOCAL_ENGINE, add_transcription, retry_meeting_transcription
 
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.return_value = [TranscriptLine(1.0, "mic", "hello")]
         settings = _settings(tmp_path)
         with Database(tmp_path / "test.db") as db:
@@ -1738,7 +1738,7 @@ def test_recordings_are_kept_as_wav_when_compression_is_turned_off(tmp_path):
 
     from meeting_scribe.session import retry_meeting_transcription
 
-    with patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber:
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
         MockTranscriber.return_value.transcribe_parts.return_value = []
         settings = replace(_settings(tmp_path), compress_recordings=False)
         with Database(tmp_path / "test.db") as db:
