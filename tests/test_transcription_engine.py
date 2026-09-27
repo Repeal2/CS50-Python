@@ -10,6 +10,7 @@ from meeting_scribe.transcription.engine import (
     available_memory_mb,
     build_vocabulary,
     is_invented_line,
+    notable_terms,
     low_memory_warning,
     merge_transcript_lines,
     render_transcript,
@@ -421,3 +422,27 @@ def test_is_invented_line_matches_whole_stock_phrases_only():
     # Common invented one-word segments, but just as often really said — kept.
     assert not is_invented_line("So.")
     assert not is_invented_line("You")
+
+
+def test_notable_terms_finds_names_acronyms_and_jargon_in_typed_notes():
+    notes = """# Budget Review
+- [00:12] Priya Shah wants the ARR numbers by Friday.
+- Tom Jones: move the **SharePoint** site. Acme Corp signed the SOW.
+Next steps: We agreed Q3 targets with Contoso.
+**Action:** chase Priya about the iPhone rollout. The deck is fine."""
+
+    terms = notable_terms(notes)
+
+    assert terms == ["Priya Shah", "ARR", "Tom Jones", "SharePoint", "Acme Corp", "SOW", "Q3", "Contoso", "iPhone"]
+
+
+def test_notable_terms_leaves_out_ordinary_capitalised_words():
+    # Sentence starts, headings, days, "Next Steps" and everyday acronyms are not what needs steering.
+    terms = notable_terms("# Weekly Sync\nThe plan is fine. Next Steps agreed on Monday.\nOK, see you at 3 PM.")
+
+    assert terms == []
+
+
+def test_notable_terms_puts_the_most_mentioned_first():
+    assert notable_terms("We met Contoso.\nAsk Fabrikam.\nContoso again, and Contoso.")[:2] == ["Contoso", "Fabrikam"]
+    assert notable_terms(None) == []

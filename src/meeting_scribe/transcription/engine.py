@@ -127,6 +127,94 @@ def build_vocabulary(*word_groups: Iterable[str | None]) -> str | None:
     return ", ".join(words) or None
 
 
+# Capitalised words that start sentences, headings and bullets all the time without being names — and
+# acronyms Whisper already spells right. Only single words are checked against these: "Next Steps" as a
+# pair is still skipped (see notable_terms), and anything longer is a name more often than not.
+_COMMON_CAPITALISED = frozenset(
+    """a an and are as at be but by can could did do does for from had has have he her his how i if in
+    is it its let lets may me my no not of on or our she so that the their them then there these they
+    this those to up us was we were what when where which who why will with would yes you your also
+    action actions agenda agreed next steps notes summary update updates todo follow decision decisions
+    monday tuesday wednesday thursday friday saturday sunday january february march april may june july
+    august september october november december today tomorrow yesterday week month quarter
+    ok am pm fyi asap tbd eod eta aob nb re cc bcc na tba
+    ask call send check email meet met chase review discuss confirm share schedule book move set get make
+    see need please thanks thank hi hello dear per via""".split()
+)
+_TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'&.-]*[A-Za-z0-9]|[A-Za-z]")
+_SENTENCE_END_RE = re.compile(r"[.!?:;]\s*$")
+_MAX_TERMS_PER_TEXT = 25
+
+
+def _is_capitalised_word(word: str) -> bool:
+    return word[:1].isupper() and word.casefold() not in _COMMON_CAPITALISED
+
+
+def _is_distinctive(word: str) -> bool:
+    """An acronym ("ARR", "Q3") or a word with a capital inside it ("SharePoint", "iPhone")."""
+    if word.casefold() in _COMMON_CAPITALISED:
+        return False
+    letters = [char for char in word if char.isalpha()]
+    uppercase = sum(char.isupper() for char in letters)
+    if word.isupper() and 2 <= len(word) <= 6 and (uppercase >= 2 or any(char.isdigit() for char in word)):
+        return True
+    return uppercase >= 1 and any(char.isupper() for char in word[1:]) and any(char.islower() for char in word)
+
+
+def notable_terms(text: str | None) -> list[str]:
+    """The names and jargon in text someone typed — meeting notes, a previous meeting's minutes — for
+    steering transcription towards (see build_vocabulary): runs of capitalised words ("Priya Shah",
+    "Acme Corp"), acronyms ("ARR", "Q3"), words with inner capitals ("SharePoint"), and a capitalised word
+    wherever it isn't just starting a sentence or line. Most frequent first, at most _MAX_TERMS_PER_TEXT.
+    Markdown markers, time stamps and heading lines are ignored."""
+    counts: dict[str, int] = {}
+    for raw_line in (text or "").splitlines():
+        line = re.sub(r"\[\d{1,2}:\d{2}(?::\d{2})?\]", " ", raw_line)
+        line = re.sub(r"[*_`]+", "", line).strip()
+        if not line or line.startswith("#"):
+            continue
+        line = re.sub(r"^(?:[-+>]|\d+[.)])\s+", "", line)
+        run: list[str] = []
+        at_start = True
+
+        def close_run() -> None:
+            # "Ask Fabrikam", "Thanks Priya": an ordinary word that opens or closes a run isn't part of the name.
+            while run and run[0].casefold() in _COMMON_CAPITALISED:
+                run.pop(0)
+                run_started_sentence[0] = False
+            while run and run[-1].casefold() in _COMMON_CAPITALISED:
+                run.pop()
+            if len(run) >= 2:
+                term = " ".join(run)
+                counts[term] = counts.get(term, 0) + 1
+            elif len(run) == 1 and not run_started_sentence[0] and _is_capitalised_word(run[0]):
+                counts[run[0]] = counts.get(run[0], 0) + 1
+            run.clear()
+
+        run_started_sentence = [False]
+        for match in _TERM_TOKEN_RE.finditer(line):
+            word = match.group().rstrip(".")
+            preceding = line[: match.start()]
+            if preceding.strip() and _SENTENCE_END_RE.search(preceding):
+                close_run()
+                at_start = True
+            if _is_distinctive(word):
+                close_run()
+                counts[word] = counts.get(word, 0) + 1
+            elif word[:1].isupper() and len(run) < 4 and not (preceding.endswith(", ") and run):
+                if not run:
+                    run_started_sentence[0] = at_start
+                run.append(word)
+            else:
+                close_run()
+            at_start = False
+        close_run()
+    # "Priya" on its own adds nothing once "Priya Shah" is in.
+    in_longer = {word for term in counts if " " in term for word in term.split()}
+    ranked = sorted(counts, key=lambda term: -counts[term])  # stable: ties keep first appearance
+    return [term for term in ranked if term not in in_longer][:_MAX_TERMS_PER_TEXT]
+
+
 def split_word_list(text: str | None) -> list[str]:
     """Splits a list typed by hand, or an attendee list read off the screen, into its entries — one per
     line, or separated by commas or semicolons."""

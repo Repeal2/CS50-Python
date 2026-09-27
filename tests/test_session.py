@@ -1787,3 +1787,23 @@ def test_the_other_sides_lines_are_named_from_teams_captions(tmp_path):
     assert "[00:12] Priya Shah: Let's look at the budget." in transcript
     assert "Speakers named from Teams' captions (on this PC): Priya Shah." in progress
     assert "Priya Shah" in vocabulary
+
+
+def test_names_typed_in_notes_and_last_times_minutes_steer_transcription(tmp_path):
+    from meeting_scribe.session import retry_meeting_transcription
+
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+        settings = _settings(tmp_path)
+        with Database(tmp_path / "test.db") as db:
+            project = db.get_or_create_project("Test Project")
+            last_time = db.create_meeting(project.id, "Kickoff", started_at="2026-09-01T10:00:00+00:00")
+            db.set_minutes(last_time, "We owe Contoso the SOW by Friday.")
+            _project, meeting_id = _stuck_meeting(settings, db)
+            db.set_manual_notes(meeting_id, "- Priya Shah to send the ARR figures")
+            _write_wav(settings.meeting_dir(meeting_id) / "mic.wav")
+
+            retry_meeting_transcription(settings, db, meeting_id)
+            vocabulary = MockTranscriber.return_value.transcribe_parts.call_args.kwargs["vocabulary"]
+
+    assert vocabulary == "Test Project, Kickoff, Priya Shah, ARR, Contoso, SOW"

@@ -36,6 +36,7 @@ from meeting_scribe.transcription.engine import (
     build_vocabulary,
     low_memory_warning,
     merge_transcript_lines,
+    notable_terms,
     render_transcript,
     split_word_list,
     transcription_slot,
@@ -211,16 +212,20 @@ def _meeting_vocabulary(
     """The words a meeting's transcription is steered towards (see transcription.engine.build_vocabulary):
     the ones added in Settings first, as the most deliberate, then the meeting's project and title, then
     whoever was captured as attending or named on Teams' captions — the names a transcript most often
-    gets wrong."""
+    gets wrong — and last, the names and jargon typed into the meeting's notes and the previous
+    occurrence's minutes, which are what the people in it actually call things."""
     meeting = db.get_meeting(meeting_id)
     if meeting is None:
         return build_vocabulary(settings.custom_vocabulary)
     project = db.get_project(meeting.project_id)
+    previous = db.get_previous_occurrence(meeting.project_id, meeting.title, exclude_meeting_id=meeting_id)
     return build_vocabulary(
         settings.custom_vocabulary,
         [project.name if project else None, meeting.title],
         split_word_list(meeting.attendees),
         caption_names(screen_events),
+        notable_terms(meeting.manual_notes),
+        notable_terms(previous.minutes if previous else None),
     )
 
 
