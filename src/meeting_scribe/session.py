@@ -15,10 +15,12 @@ import json
 import shutil
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from meeting_scribe.audio.archive import archive_recording
+from meeting_scribe import outlook_calendar
 from meeting_scribe.ai.copilot_push import ReferenceDocument, TextReferenceDocument, push_meeting_package
 from meeting_scribe.audio.recorder import Recorder, discover_recording_parts, load_part_offsets
 from meeting_scribe.config import Settings
@@ -206,13 +208,50 @@ def meeting_transcripts(rows) -> MeetingTranscripts:
     return MeetingTranscripts(screen=screen, local=local, cloud=cloud)
 
 
+CALENDAR_FILENAME = "calendar.json"
+
+
+def _calendar_invitees(settings: Settings, db: Database, meeting_id: int, report: Callable[[str], None]) -> list[str]:
+    """Who the Outlook invite for this meeting went to, if Settings says to look (see outlook_calendar).
+    Kept in the meeting's folder once found, so transcribing it again doesn't depend on the calendar
+    still having the entry — or on Outlook being open."""
+    path = settings.meeting_dir(meeting_id) / CALENDAR_FILENAME
+    try:
+        return [str(name) for name in json.loads(path.read_text(encoding="utf-8"))["invitees"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    meeting = db.get_meeting(meeting_id)
+    if not settings.read_outlook_calendar or meeting is None:
+        return []
+    try:
+        started_at = datetime.fromisoformat(meeting.started_at)
+    except ValueError:
+        return []
+    entry = outlook_calendar.find_meeting(started_at, meeting.title)
+    names = outlook_calendar.invitees(entry)
+    if entry is None:
+        report("No Outlook meeting found for this time — nobody's names added from the calendar.")
+        return []
+    try:
+        path.write_text(json.dumps({"subject": entry.subject, "invitees": names}), encoding="utf-8")
+    except OSError:
+        pass
+    report(f'Outlook meeting "{entry.subject}": {len(names)} invitees\' names added to the words to listen for.')
+    return names
+
+
 def _meeting_vocabulary(
-    settings: Settings, db: Database, meeting_id: int, screen_events: Sequence[ScreenTextEvent] = ()
+    settings: Settings,
+    db: Database,
+    meeting_id: int,
+    screen_events: Sequence[ScreenTextEvent] = (),
+    invited: Sequence[str] = (),
 ) -> str | None:
     """The words a meeting's transcription is steered towards (see transcription.engine.build_vocabulary):
     the ones added in Settings first, as the most deliberate, then the meeting's project and title, then
     whoever was captured as attending or named on Teams' captions — the names a transcript most often
-    gets wrong — and last, the names and jargon typed into the meeting's notes and the previous
+    gets wrong (captured attendees, then the Outlook invite's, then caption badges) — and last, the names
+    and jargon typed into the meeting's notes and the previous
     occurrence's minutes, which are what the people in it actually call things."""
     meeting = db.get_meeting(meeting_id)
     if meeting is None:
@@ -223,6 +262,7 @@ def _meeting_vocabulary(
         settings.custom_vocabulary,
         [project.name if project else None, meeting.title],
         split_word_list(meeting.attendees),
+        invited,
         caption_names(screen_events),
         notable_terms(meeting.manual_notes),
         notable_terms(previous.minutes if previous else None),
@@ -435,7 +475,9 @@ def _finish_meeting(
         report,
         fall_back=True,
         job=job,
-        vocabulary=_meeting_vocabulary(settings, db, meeting_id, screen_events),
+        vocabulary=_meeting_vocabulary(
+            settings, db, meeting_id, screen_events, _calendar_invitees(settings, db, meeting_id, report)
+        ),
     )
     _name_from_captions(results, screen_events, report)
     report("Transcription complete.")
@@ -842,7 +884,9 @@ def add_transcription(
             report,
             fall_back=False,
             job=job,
-            vocabulary=_meeting_vocabulary(settings, db, meeting_id, screen_events),
+            vocabulary=_meeting_vocabulary(
+                settings, db, meeting_id, screen_events, _calendar_invitees(settings, db, meeting_id, report)
+            ),
         )
         _name_from_captions(results, screen_events, report)
         _stage(job, jobs.SAVING)

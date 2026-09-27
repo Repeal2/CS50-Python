@@ -437,3 +437,12 @@ def test_recordings_are_compressed_unless_turned_off(tmp_path, monkeypatch):
     update_settings(load_settings(), compress_recordings=False)
 
     assert load_settings().compress_recordings is False
+
+
+def test_reading_the_outlook_calendar_is_off_until_turned_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    assert load_settings().read_outlook_calendar is False
+
+    update_settings(load_settings(), read_outlook_calendar=True)
+
+    assert load_settings().read_outlook_calendar is True

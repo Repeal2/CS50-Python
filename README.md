@@ -54,9 +54,14 @@ Windows' light/dark app setting.
 - **Spells your names right.** Settings has a **Language** (English unless changed, so a recording that
   opens on silence or hold music isn't mistaken for another language) and **Your words** — client,
   product and team names, acronyms. Both engines are steered towards those words plus each meeting's
-  project, title and captured attendees. Every 30 seconds of audio is transcribed on its own rather than
+  project, title and captured attendees, the names on Teams' live captions, and the names and jargon
+  typed into its notes and the last occurrence's minutes. Optionally (Settings, off by default), the
+  names on the meeting's Outlook invite too, read from Outlook on this PC. Every 30 seconds of audio is transcribed on its own rather than
   following on from the last, so one misheard line can't repeat itself for minutes, and lines Whisper
   invents over silence ("Thanks for watching", "Subtitles by…") are left out.
+- **Names the other side from Teams' captions.** The OCR box reads the name badge above each live
+  caption, so the transcript's "Others" lines — and the cloud's SPEAKER_01-style labels — get the name
+  Teams showed while they were said, wherever the captions clearly cover them.
 - **Keeps a crash in transcription to itself.** Transcription on this PC runs in a process of its own, so
   if it runs out of memory on a long meeting, that transcription fails (and can be retried) while the app,
   and any meeting being recorded, carries on.
@@ -120,6 +125,8 @@ src/meeting_scribe/
   transcription/engine.py  # faster-whisper wrapper, merges audio + screen text by timestamp
   transcription/jobs.py    # running transcriptions: stage, percentage, estimate — for the Transcriptions page
   transcription/worker.py  # runs faster-whisper in a child process, so a native crash can't take the app down
+  transcription/speaker_names.py  # names the other side's lines from Teams' caption badges, by time
+  outlook_calendar.py     # finds the meeting's Outlook invite (locally, over COM) for its invitees' names
   ai/copilot_push.py    # one-way, named-file-package drop of a finished meeting to Copilot Studio
   ai/minutes_import.py  # files the minutes Copilot Studio writes back against their meetings
   storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents, transcription runs

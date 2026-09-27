@@ -2571,7 +2571,18 @@ class SettingsPage(ttk.Frame):
         self._hint(
             body, 4,
             "Names and terms to spell the way you type them, separated by commas — clients, products, "
-            "acronyms. Each meeting's project, title and attendees are added on their own.",
+            "acronyms. Each meeting's project, title, attendees, the names on Teams' captions and what you "
+            "type in its notes are added on their own.",
+        )
+        self.read_outlook_var = tk.BooleanVar(value=settings.read_outlook_calendar)
+        ttk.Checkbutton(
+            body, text="Add the names on the meeting's Outlook invite", variable=self.read_outlook_var,
+            style="Card.TCheckbutton",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self._hint(
+            body, 6,
+            "Reads the invite from Outlook on this PC when the meeting is transcribed — nothing leaves the "
+            "computer. Outlook must be open, and may ask once whether to allow it.",
         )
         # Applied as soon as they're ticked, not on Save: they decide what happens to the meeting being
         # recorded when it stops, and an unsaved untick used to leave it going to the cloud anyway.
@@ -2580,20 +2591,20 @@ class SettingsPage(ttk.Frame):
         ttk.Checkbutton(
             body, text="Transcribe on this PC", variable=self.transcribe_locally_var,
             style="Card.TCheckbutton", command=self._on_transcription_choice,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Checkbutton(
             body, text="Transcribe in the cloud with Runpod — names the other side's speakers, and sends the "
             "meeting's audio (both sides) to the cloud",
             variable=self.transcribe_in_cloud_var, style="Card.TCheckbutton", command=self._on_transcription_choice,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self._hint(
-            body, 7,
+            body, 9,
             "At least one has to stay ticked. Tick both to keep both transcripts and compare them in the Library, "
             "where either can also be made later from a meeting's recording. Takes effect straight away, "
             "including for a meeting being recorded now.",
         )
         self._runpod = ttk.Frame(body, style="Card.TFrame", borderwidth=0)
-        self._runpod.grid(row=8, column=0, columnspan=2, sticky="we")
+        self._runpod.grid(row=10, column=0, columnspan=2, sticky="we")
         self._runpod.columnconfigure(1, weight=1)
         self.runpod_api_key_var = tk.StringVar(value=settings.runpod_api_key or "")
         self.runpod_endpoint_id_var = tk.StringVar(value=settings.runpod_endpoint_id or "")
@@ -2777,6 +2788,7 @@ class SettingsPage(ttk.Frame):
             transcription_language=_language_code(self.language_var.get()),
             custom_vocabulary=self.vocabulary_var.get(),
             compress_recordings=self.compress_recordings_var.get(),
+            read_outlook_calendar=self.read_outlook_var.get(),
             transcribe_locally=self.transcribe_locally_var.get(),
             transcribe_in_cloud=self.transcribe_in_cloud_var.get(),
             runpod_api_key=self.runpod_api_key_var.get().strip(),

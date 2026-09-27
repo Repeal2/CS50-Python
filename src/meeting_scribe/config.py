@@ -186,6 +186,10 @@ class Settings:
     # Once a meeting is transcribed, replace its WAV recording with a much smaller Opus copy (see
     # audio.archive) — about 14 MB an hour per track instead of 0.7 GB. Off keeps the WAVs as recorded.
     compress_recordings: bool = True
+    # Look the meeting up in the Outlook calendar running on this PC and add its invitees' names to the
+    # words transcription is steered towards (see outlook_calendar). Off by default: Outlook can ask the
+    # user to allow it, and that shouldn't come as a surprise.
+    read_outlook_calendar: bool = False
     # Where the on-screen OCR box was last left — (left, top, width, height) in screen pixels — so the
     # next meeting's box appears in the same place instead of needing to be set up again. None until
     # the box has been moved or resized once. See screen.ocr_box.
@@ -271,6 +275,7 @@ def save_user_config(settings: Settings) -> None:
         "transcription_language": settings.transcription_language,
         "custom_vocabulary": list(settings.custom_vocabulary),
         "compress_recordings": settings.compress_recordings,
+        "read_outlook_calendar": settings.read_outlook_calendar,
         "ocr_area": list(settings.ocr_area) if settings.ocr_area else None,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -386,6 +391,7 @@ def load_settings() -> Settings:
         transcription_language=_transcription_language_from_json(user_config),
         custom_vocabulary=_vocabulary_from_json(user_config.get("custom_vocabulary")),
         compress_recordings=bool(user_config.get("compress_recordings", True)),
+        read_outlook_calendar=bool(user_config.get("read_outlook_calendar", False)),
         ocr_area=_ocr_area_from_json(user_config.get("ocr_area")),
         moved_from=moved_from,
     )

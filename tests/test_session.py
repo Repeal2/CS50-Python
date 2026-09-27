@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import ANY, patch
 
@@ -1807,3 +1808,48 @@ def test_names_typed_in_notes_and_last_times_minutes_steer_transcription(tmp_pat
             vocabulary = MockTranscriber.return_value.transcribe_parts.call_args.kwargs["vocabulary"]
 
     assert vocabulary == "Test Project, Kickoff, Priya Shah, ARR, Contoso, SOW"
+
+
+def test_the_outlook_invites_names_steer_transcription_and_are_kept_with_the_meeting(tmp_path):
+    from dataclasses import replace
+
+    from meeting_scribe.outlook_calendar import CalendarEntry
+    from meeting_scribe.session import LOCAL_ENGINE, add_transcription, retry_meeting_transcription
+
+    entry = CalendarEntry("Kickoff", datetime(2026, 9, 7, 10), datetime(2026, 9, 7, 11), ("Shah, Priya",), True)
+    with (
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.outlook_calendar.find_meeting", return_value=entry) as find_meeting,
+    ):
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+        settings = replace(_settings(tmp_path), read_outlook_calendar=True)
+        with Database(tmp_path / "test.db") as db:
+            _project, meeting_id = _stuck_meeting(settings, db)
+            _write_wav(settings.meeting_dir(meeting_id) / "mic.wav")
+            progress = []
+
+            retry_meeting_transcription(settings, db, meeting_id, on_progress=progress.append)
+            first = MockTranscriber.return_value.transcribe_parts.call_args.kwargs["vocabulary"]
+            add_transcription(settings, db, meeting_id, LOCAL_ENGINE)  # later, maybe with Outlook closed
+            second = MockTranscriber.return_value.transcribe_parts.call_args.kwargs["vocabulary"]
+
+    assert first == second == "Test Project, Kickoff, Priya Shah"
+    assert find_meeting.call_count == 1  # the second time came from the meeting's own folder
+    assert 'Outlook meeting "Kickoff": 1 invitees\' names added to the words to listen for.' in progress
+
+
+def test_outlook_isnt_asked_unless_settings_say_so(tmp_path):
+    from meeting_scribe.session import retry_meeting_transcription
+
+    with (
+        patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber,
+        patch("meeting_scribe.outlook_calendar.find_meeting") as find_meeting,
+    ):
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+        settings = _settings(tmp_path)
+        with Database(tmp_path / "test.db") as db:
+            _project, meeting_id = _stuck_meeting(settings, db)
+            _write_wav(settings.meeting_dir(meeting_id) / "mic.wav")
+            retry_meeting_transcription(settings, db, meeting_id)
+
+    find_meeting.assert_not_called()
