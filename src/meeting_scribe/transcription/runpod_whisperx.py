@@ -141,7 +141,8 @@ class RunpodWhisperXTranscriber:
     can use either one interchangeably for the system track.
 
     The audio is compressed and split into chunks first (see speech_encoding), sent inline as base64 —
-    one Runpod job per chunk. `on_progress`, if given, gets a short status line at each step, for the
+    one Runpod job per chunk. `language` and `vocabulary` mean what they do for
+    WhisperTranscriber.transcribe, and go to every job. `on_progress`, if given, gets a short status line at each step, for the
     activity log. `session` is injectable (anything with _HttpSession's get/post) so tests don't make real
     network calls; it defaults to _HttpSession.
     """
@@ -152,6 +153,8 @@ class RunpodWhisperXTranscriber:
         api_key: str | None = None,
         endpoint_id: str | None = None,
         huggingface_token: str | None = None,
+        language: str | None = None,
+        vocabulary: str | None = None,
         on_progress: Callable[[str], None] | None = None,
         session=None,
         poll_seconds: float = 5.0,
@@ -162,6 +165,8 @@ class RunpodWhisperXTranscriber:
         self._api_key = api_key or os.environ.get(_API_KEY_ENV)
         self._endpoint_id = endpoint_id or os.environ.get(_ENDPOINT_ID_ENV)
         self._huggingface_token = huggingface_token or os.environ.get(_HF_TOKEN_ENV)
+        self._language = language
+        self._vocabulary = vocabulary
         self._on_progress = on_progress
         self._session = session if session is not None else _HttpSession()
         self._poll_seconds = poll_seconds
@@ -326,7 +331,13 @@ class RunpodWhisperXTranscriber:
             self._sleep(delay)
 
     def _submit_job(self, audio_url: str, *, step: str = "uploading audio", diarize: bool = True) -> str:
-        payload = _build_payload(audio_url, huggingface_token=self._huggingface_token, diarize=diarize)
+        payload = _build_payload(
+            audio_url,
+            huggingface_token=self._huggingface_token,
+            diarize=diarize,
+            language=self._language,
+            vocabulary=self._vocabulary,
+        )
         # If a connection drops after Runpod has taken the job but before its reply arrives, trying again
         # queues the chunk a second time; the spare job's result is simply never collected. Worth it, over
         # losing the meeting's cloud transcript to one dropped connection.
@@ -438,15 +449,28 @@ def _describe_network_error(error: BaseException) -> str:
     return f"network error: {cause}"
 
 
-def _build_payload(audio_url: str, *, huggingface_token: str | None, diarize: bool = True) -> dict:
+def _build_payload(
+    audio_url: str,
+    *,
+    huggingface_token: str | None,
+    diarize: bool = True,
+    language: str | None = None,
+    vocabulary: str | None = None,
+) -> dict:
     """kodxana/whisperx-worker_v2's input schema (verified against its rp_schema.py, not just its README):
-    `audio_file` (a URL or base64 audio, not `audio`), `diarization`, and an optional
-    `huggingface_access_token` that overrides its endpoint-side `HF_TOKEN` env var when given. Its schema
-    validator rejects any key it doesn't recognize — there's no `model` parameter to pick a Whisper size,
-    so don't add one. Adjust this function if a different worker image ever replaces it."""
+    `audio_file` (a URL or base64 audio, not `audio`), `diarization`, and optionally
+    `huggingface_access_token`, which overrides its endpoint-side `HF_TOKEN` env var when given,
+    `language` (left out to have the worker detect it) and `initial_prompt`, which carries the vocabulary —
+    WhisperX decodes every window on its own, so the prompt reaches all of them, not just the first. Its
+    schema validator rejects any key it doesn't recognize — there's no `model` parameter to pick a Whisper
+    size, so don't add one. Adjust this function if a different worker image ever replaces it."""
     payload = {"input": {"audio_file": audio_url, "diarization": diarize}}
     if huggingface_token:
         payload["input"]["huggingface_access_token"] = huggingface_token
+    if language:
+        payload["input"]["language"] = language
+    if vocabulary:
+        payload["input"]["initial_prompt"] = vocabulary
     return payload
 
 

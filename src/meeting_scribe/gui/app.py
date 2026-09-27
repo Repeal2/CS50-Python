@@ -23,7 +23,15 @@ from typing import Callable
 from meeting_scribe import __version__
 from meeting_scribe.ai.minutes_import import MinutesImporter
 from meeting_scribe.audio.device_watch import device_signature
-from meeting_scribe.config import WHISPER_MODEL_SIZES, Settings, default_data_dir, load_settings, update_settings
+from meeting_scribe.config import (
+    DEFAULT_TRANSCRIPTION_LANGUAGE,
+    TRANSCRIPTION_LANGUAGES,
+    WHISPER_MODEL_SIZES,
+    Settings,
+    default_data_dir,
+    load_settings,
+    update_settings,
+)
 from meeting_scribe.gui.meeting_prompt import PromptCard, start_recording_prompt, stop_recording_prompt
 from meeting_scribe.gui.theme import Palette, apply_theme, style_text
 from meeting_scribe.hotkeys import (
@@ -293,6 +301,14 @@ def _device_from_choice(choice: str, default_label: str = SYSTEM_DEFAULT_LABEL) 
 
 def _hotkey_label(combo: HotkeyCombo | None) -> str:
     return combo.label if combo is not None else "Not set"
+
+
+def _language_label(code: str | None) -> str:
+    return dict(TRANSCRIPTION_LANGUAGES).get(code, dict(TRANSCRIPTION_LANGUAGES)[DEFAULT_TRANSCRIPTION_LANGUAGE])
+
+
+def _language_code(label: str) -> str | None:
+    return next((code for code, name in TRANSCRIPTION_LANGUAGES if name == label), DEFAULT_TRANSCRIPTION_LANGUAGE)
 
 
 def _enumerate_devices() -> tuple[list, list]:
@@ -2542,7 +2558,20 @@ class SettingsPage(ttk.Frame):
         self._hint(
             body, 1,
             "Larger models are more accurate but slower and need much more memory — a long meeting can run out "
-            "of memory on medium/large. A size not used before is downloaded on first use.",
+            "of memory on medium/large. A size not used before is downloaded on first use. A \".en\" size only "
+            "does English, a little more accurately than the one before it.",
+        )
+        self.language_var = tk.StringVar(value=_language_label(settings.transcription_language))
+        self._field(body, 2, "Language", ttk.Combobox(
+            body, textvariable=self.language_var, values=[name for _code, name in TRANSCRIPTION_LANGUAGES],
+            state="readonly", width=20,
+        ))
+        self.vocabulary_var = tk.StringVar(value=", ".join(settings.custom_vocabulary))
+        self._field(body, 3, "Your words", ttk.Entry(body, textvariable=self.vocabulary_var))
+        self._hint(
+            body, 4,
+            "Names and terms to spell the way you type them, separated by commas — clients, products, "
+            "acronyms. Each meeting's project, title and attendees are added on their own.",
         )
         # Applied as soon as they're ticked, not on Save: they decide what happens to the meeting being
         # recorded when it stops, and an unsaved untick used to leave it going to the cloud anyway.
@@ -2551,20 +2580,20 @@ class SettingsPage(ttk.Frame):
         ttk.Checkbutton(
             body, text="Transcribe on this PC", variable=self.transcribe_locally_var,
             style="Card.TCheckbutton", command=self._on_transcription_choice,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Checkbutton(
             body, text="Transcribe in the cloud with Runpod — names the other side's speakers, and sends the "
             "meeting's audio (both sides) to the cloud",
             variable=self.transcribe_in_cloud_var, style="Card.TCheckbutton", command=self._on_transcription_choice,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self._hint(
-            body, 4,
+            body, 7,
             "At least one has to stay ticked. Tick both to keep both transcripts and compare them in the Library, "
             "where either can also be made later from a meeting's recording. Takes effect straight away, "
             "including for a meeting being recorded now.",
         )
         self._runpod = ttk.Frame(body, style="Card.TFrame", borderwidth=0)
-        self._runpod.grid(row=5, column=0, columnspan=2, sticky="we")
+        self._runpod.grid(row=8, column=0, columnspan=2, sticky="we")
         self._runpod.columnconfigure(1, weight=1)
         self.runpod_api_key_var = tk.StringVar(value=settings.runpod_api_key or "")
         self.runpod_endpoint_id_var = tk.StringVar(value=settings.runpod_endpoint_id or "")
@@ -2735,6 +2764,8 @@ class SettingsPage(ttk.Frame):
             auto_switch_audio_devices=self.auto_switch_var.get(),
             headset_microphone_name=_device_from_choice(self.headset_var.get(), AUTO_HEADSET_LABEL),
             whisper_model_size=self.whisper_model_var.get(),
+            transcription_language=_language_code(self.language_var.get()),
+            custom_vocabulary=self.vocabulary_var.get(),
             transcribe_locally=self.transcribe_locally_var.get(),
             transcribe_in_cloud=self.transcribe_in_cloud_var.get(),
             runpod_api_key=self.runpod_api_key_var.get().strip(),

@@ -8,9 +8,11 @@ from meeting_scribe.transcription.engine import (
     TranscriptLine,
     WhisperTranscriber,
     available_memory_mb,
+    build_vocabulary,
     low_memory_warning,
     merge_transcript_lines,
     render_transcript,
+    split_word_list,
     wav_duration_seconds,
 )
 
@@ -157,7 +159,7 @@ def test_transcribe_parts_puts_every_part_back_on_the_meetings_clock(tmp_path, m
     _write_wav(first, seconds=60.0)
     _write_wav(second, seconds=30.0)
 
-    def fake_transcribe(self, audio_path, source, on_progress=None):
+    def fake_transcribe(self, audio_path, source, on_progress=None, **hints):
         said = "first part" if audio_path == first else "second part"
         return [TranscriptLine(5.0, source, said)]
 
@@ -182,7 +184,7 @@ def test_transcribe_parts_places_each_part_where_the_recorder_says_it_started(tm
     monkeypatch.setattr(
         WhisperTranscriber,
         "transcribe",
-        lambda self, audio_path, source, on_progress=None: [TranscriptLine(1.0, source, audio_path.name)],
+        lambda self, audio_path, source, on_progress=None, **hints: [TranscriptLine(1.0, source, audio_path.name)],
     )
 
     lines = WhisperTranscriber(model_size="tiny").transcribe_parts(
@@ -203,7 +205,7 @@ def test_transcribe_parts_of_a_single_file_leaves_timestamps_alone(tmp_path, mon
     monkeypatch.setattr(
         WhisperTranscriber,
         "transcribe",
-        lambda self, audio_path, source, on_progress=None: [TranscriptLine(3.0, source, "hello")],
+        lambda self, audio_path, source, on_progress=None, **hints: [TranscriptLine(3.0, source, "hello")],
     )
 
     lines = WhisperTranscriber(model_size="tiny").transcribe_parts([only], source="mic")
@@ -217,7 +219,7 @@ def test_transcribe_reports_how_far_into_the_file_it_has_got(monkeypatch):
             self.start, self.end, self.text = start, end, text
 
     class Model:
-        def transcribe(self, path, vad_filter):
+        def transcribe(self, path, vad_filter, **options):
             return iter([Segment(0.0, 4.0, "hello"), Segment(4.0, 9.5, "  "), Segment(9.5, 12.0, "bye")]), None
 
     transcriber = WhisperTranscriber(model_size="tiny")
@@ -235,7 +237,7 @@ def test_transcribe_parts_reports_progress_across_every_part(tmp_path, monkeypat
     _write_wav(first, seconds=60.0)
     _write_wav(second, seconds=30.0)
 
-    def fake_transcribe(self, audio_path, source, on_progress=None):
+    def fake_transcribe(self, audio_path, source, on_progress=None, **hints):
         on_progress(10.0)
         return []
 
@@ -303,3 +305,69 @@ def test_unload_drops_the_loaded_model():
     transcriber._model = object()
     transcriber.unload()
     assert transcriber._model is None
+
+
+def test_transcribe_decodes_each_window_on_its_own_with_the_language_and_vocabulary(monkeypatch):
+    # Conditioning each window on the text before it is what lets one misheard line repeat for minutes; with
+    # it off, only hotwords (not initial_prompt) reach every window, so that's where the vocabulary goes.
+    seen = {}
+
+    class Model:
+        def transcribe(self, path, **options):
+            seen.update(options)
+            return iter([]), None
+
+    transcriber = WhisperTranscriber(model_size="tiny")
+    monkeypatch.setattr(transcriber, "_ensure_model", lambda: Model())
+
+    transcriber.transcribe(Path("mic.wav"), "mic", language="en", vocabulary="Acme, Kubernetes")
+
+    assert seen == {
+        "vad_filter": True,
+        "condition_on_previous_text": False,
+        "language": "en",
+        "hotwords": "Acme, Kubernetes",
+    }
+
+
+def test_transcribe_parts_gives_every_part_the_language_and_vocabulary(tmp_path, monkeypatch):
+    first, second = tmp_path / "mic.wav", tmp_path / "mic.part2.wav"
+    _write_wav(first, seconds=1.0)
+    _write_wav(second, seconds=1.0)
+    seen = []
+
+    def fake_transcribe(self, audio_path, source, on_progress=None, **hints):
+        seen.append((audio_path.name, hints))
+        return []
+
+    monkeypatch.setattr(WhisperTranscriber, "transcribe", fake_transcribe)
+
+    WhisperTranscriber(model_size="tiny").transcribe_parts([first, second], "mic", language=None, vocabulary="Acme")
+
+    assert seen == [
+        ("mic.wav", {"language": None, "vocabulary": "Acme"}),
+        ("mic.part2.wav", {"language": None, "vocabulary": "Acme"}),
+    ]
+
+
+def test_build_vocabulary_keeps_order_and_drops_blanks_and_repeats():
+    assert build_vocabulary(["Acme", " ", None, "kubernetes"], ["ACME", "Priya  Shah", "Kubernetes"]) == (
+        "Acme, kubernetes, Priya Shah"
+    )
+
+
+def test_build_vocabulary_is_none_when_there_are_no_words():
+    assert build_vocabulary([], [None, ""]) is None
+
+
+def test_build_vocabulary_leaves_out_what_comes_after_the_limit():
+    vocabulary = build_vocabulary(["first"], [f"word{number:03d}" for number in range(500)])
+
+    assert vocabulary.startswith("first, word000, ")
+    assert len(vocabulary) <= 600
+    assert "word499" not in vocabulary
+
+
+def test_split_word_list_takes_commas_semicolons_and_lines():
+    assert split_word_list("Acme, Kubernetes;ARR\n Priya Shah \n\n") == ["Acme", "Kubernetes", "ARR", "Priya Shah"]
+    assert split_word_list(None) == []

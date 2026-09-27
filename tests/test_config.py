@@ -399,3 +399,32 @@ def test_a_malformed_saved_ocr_box_position_is_ignored():
     assert _ocr_area_from_json([1, 2, 0, 5]) is None
     assert _ocr_area_from_json("nope") is None
     assert _ocr_area_from_json([1, 2, "3", 4]) == (1, 2, 3, 4)
+
+
+def test_transcription_language_defaults_to_english(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    assert load_settings().transcription_language == "en"
+
+
+def test_transcription_language_and_vocabulary_persist_and_reload(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+
+    update_settings(load_settings(), transcription_language=None, custom_vocabulary="Acme, Kubernetes\nARR, ")
+
+    reloaded = load_settings()
+    assert reloaded.transcription_language is None  # detect automatically, kept as chosen
+    assert reloaded.custom_vocabulary == ("Acme", "Kubernetes", "ARR")
+
+
+def test_an_unknown_transcription_language_falls_back_to_english(tmp_path, monkeypatch):
+    # Whisper refuses the whole transcription over a language code it doesn't know.
+    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
+    (tmp_path / "settings.json").write_text(
+        '{"transcription_language": "klingon", "custom_vocabulary": "not a list"}', encoding="utf-8"
+    )
+
+    settings = load_settings()
+
+    assert settings.transcription_language == "en"
+    assert settings.custom_vocabulary == ()

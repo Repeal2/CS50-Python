@@ -30,9 +30,11 @@ from meeting_scribe.transcription.engine import (
     TranscriptLine,
     WhisperTranscriber,
     available_memory_mb,
+    build_vocabulary,
     low_memory_warning,
     merge_transcript_lines,
     render_transcript,
+    split_word_list,
     transcription_slot,
     wav_duration_seconds,
 )
@@ -189,6 +191,21 @@ def meeting_transcripts(rows) -> MeetingTranscripts:
     return MeetingTranscripts(screen=screen, local=local, cloud=cloud)
 
 
+def _meeting_vocabulary(settings: Settings, db: Database, meeting_id: int) -> str | None:
+    """The words a meeting's transcription is steered towards (see transcription.engine.build_vocabulary):
+    the ones added in Settings first, as the most deliberate, then the meeting's project and title, then
+    whoever was captured as attending — the names a transcript most often gets wrong."""
+    meeting = db.get_meeting(meeting_id)
+    if meeting is None:
+        return build_vocabulary(settings.custom_vocabulary)
+    project = db.get_project(meeting.project_id)
+    return build_vocabulary(
+        settings.custom_vocabulary,
+        [project.name if project else None, meeting.title],
+        split_word_list(meeting.attendees),
+    )
+
+
 class _Tracks:
     """One meeting's recorded audio: each stream's parts, and where each part started."""
 
@@ -198,7 +215,11 @@ class _Tracks:
 
 
 def _transcribe_in_cloud(
-    settings: Settings, tracks: _Tracks, report: Callable[[str], None], job: TranscriptionJob | None = None
+    settings: Settings,
+    tracks: _Tracks,
+    report: Callable[[str], None],
+    job: TranscriptionJob | None = None,
+    vocabulary: str | None = None,
 ) -> tuple[list[TranscriptLine], list[TranscriptLine]]:
     """(microphone lines, system lines) from Runpod — the system track with its speakers labelled.
     Raises RunpodWhisperXError for anything that stops that, including missing credentials."""
@@ -209,6 +230,8 @@ def _transcribe_in_cloud(
         api_key=settings.runpod_api_key,
         endpoint_id=settings.runpod_endpoint_id,
         huggingface_token=settings.runpod_huggingface_token,
+        language=settings.transcription_language,
+        vocabulary=vocabulary,
         on_progress=report,
     )
     system_lines = mic_lines = []
@@ -229,6 +252,7 @@ def _transcribe_locally(
     tracks: _Tracks,
     report: Callable[[str], None],
     job: TranscriptionJob | None = None,
+    vocabulary: str | None = None,
 ) -> tuple[list[TranscriptLine], list[TranscriptLine]]:
     def on_wait() -> None:
         _stage(job, jobs.QUEUED)
@@ -256,7 +280,12 @@ def _transcribe_locally(
             mic_lines = system_lines = []
             if tracks.mic_paths:
                 mic_lines = transcriber.transcribe_parts(
-                    tracks.mic_paths, source="mic", start_offsets=tracks.mic_offsets, on_progress=progress(0.0)
+                    tracks.mic_paths,
+                    source="mic",
+                    start_offsets=tracks.mic_offsets,
+                    on_progress=progress(0.0),
+                    language=settings.transcription_language,
+                    vocabulary=vocabulary,
                 )
             if tracks.system_paths:
                 system_lines = transcriber.transcribe_parts(
@@ -264,6 +293,8 @@ def _transcribe_locally(
                     source="system",
                     start_offsets=tracks.system_offsets,
                     on_progress=progress(mic_seconds),
+                    language=settings.transcription_language,
+                    vocabulary=vocabulary,
                 )
         finally:
             transcriber.unload()
@@ -279,18 +310,20 @@ def _transcribe(
     *,
     fall_back: bool,
     job: TranscriptionJob | None = None,
+    vocabulary: str | None = None,
 ) -> dict[str, tuple[list[TranscriptLine], list[TranscriptLine]]]:
     """{engine: (microphone lines, system lines)} for each engine asked for. A cloud failure is reported
     rather than raised when `fall_back` is set: if this PC wasn't going to transcribe too, it does
     instead — a third-party outage or a missing API key shouldn't cost a meeting its transcript. Without
-    `fall_back` (a transcription asked for by hand, after the fact) it's raised."""
+    `fall_back` (a transcription asked for by hand, after the fact) it's raised. `vocabulary` goes to
+    every engine (see _meeting_vocabulary)."""
     from meeting_scribe.transcription.runpod_whisperx import RunpodWhisperXError
 
     engines = list(engines)
     results: dict[str, tuple[list[TranscriptLine], list[TranscriptLine]]] = {}
     if CLOUD_ENGINE in engines:
         try:
-            results[CLOUD_ENGINE] = _transcribe_in_cloud(settings, tracks, report, job)
+            results[CLOUD_ENGINE] = _transcribe_in_cloud(settings, tracks, report, job, vocabulary)
         except RunpodWhisperXError as error:
             if not fall_back:
                 raise
@@ -300,7 +333,7 @@ def _transcribe(
                 report(f"Cloud transcription failed ({error}) — transcribing on this PC instead.")
                 engines.append(LOCAL_ENGINE)
     if LOCAL_ENGINE in engines:
-        results[LOCAL_ENGINE] = _transcribe_locally(settings, transcriber, tracks, report, job)
+        results[LOCAL_ENGINE] = _transcribe_locally(settings, transcriber, tracks, report, job, vocabulary)
     return results
 
 
@@ -351,7 +384,14 @@ def _finish_meeting(
         system_offsets,
     )
     results = _transcribe(
-        settings, transcriber, chosen_engines(settings), tracks, report, fall_back=True, job=job
+        settings,
+        transcriber,
+        chosen_engines(settings),
+        tracks,
+        report,
+        fall_back=True,
+        job=job,
+        vocabulary=_meeting_vocabulary(settings, db, meeting_id),
     )
     report("Transcription complete.")
     _stage(job, jobs.SAVING)
@@ -731,7 +771,16 @@ def add_transcription(
                 f'The recorded audio for "{meeting.title}" is no longer in {meeting_dir} — nothing to transcribe.'
             )
         transcriber = WhisperTranscriber(model_size=settings.whisper_model_size)
-        results = _transcribe(settings, transcriber, (engine,), tracks, report, fall_back=False, job=job)
+        results = _transcribe(
+            settings,
+            transcriber,
+            (engine,),
+            tracks,
+            report,
+            fall_back=False,
+            job=job,
+            vocabulary=_meeting_vocabulary(settings, db, meeting_id),
+        )
         _stage(job, jobs.SAVING)
         db.clear_transcript_segments(meeting_id, engine=engine)
         _save_transcription(db, meeting_id, engine, results[engine])

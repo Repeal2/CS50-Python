@@ -285,3 +285,16 @@ def test_meeting_transcription_status_names_which_transcripts_a_meeting_has():
     assert status(finished, set(), False) == "No speech found"
     assert status(unfinished, set(), False) == "Not transcribed"
     assert status(unfinished, set(), True) == "In progress"
+
+
+def test_language_label_and_code_round_trip():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._language_label("fr") == "French"
+    assert gui_app._language_code("French") == "fr"
+    assert gui_app._language_label(None) == "Detect automatically"
+    assert gui_app._language_code("Detect automatically") is None
+
+
+def test_language_label_shows_english_for_a_code_not_offered():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    assert gui_app._language_label("xx") == "English"

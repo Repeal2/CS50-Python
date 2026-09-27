@@ -51,6 +51,11 @@ Windows' light/dark app setting.
   as they're ticked, including to the meeting being recorded. If the cloud fails and this PC wasn't
   transcribing too, it does instead. Cloud lines are split wherever the speaker changes mid-sentence, and
   a long meeting's 45-minute chunks overlap by two minutes so each speaker keeps one label across them.
+- **Spells your names right.** Settings has a **Language** (English unless changed, so a recording that
+  opens on silence or hold music isn't mistaken for another language) and **Your words** — client,
+  product and team names, acronyms. Both engines are steered towards those words plus each meeting's
+  project, title and captured attendees. Every 30 seconds of audio is transcribed on its own rather than
+  following on from the last, so one misheard line can't repeat itself for minutes.
 - **Shows transcription progress and history.** The Transcriptions page lists what's being transcribed
   right now, one bar each: a measured percentage while this PC transcribes (how much of both tracks'
   audio Whisper has worked through), how long it's taken so far and roughly how long is left, or a

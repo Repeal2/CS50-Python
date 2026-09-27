@@ -136,6 +136,20 @@ def test_build_payload_omits_huggingface_token_when_not_given():
     assert "huggingface_access_token" not in payload["input"]
 
 
+def test_build_payload_sends_the_language_and_vocabulary_when_given():
+    payload = _build_payload(
+        "https://example.com/a.wav", huggingface_token=None, language="en", vocabulary="Acme, Kubernetes"
+    )
+    assert payload["input"]["language"] == "en"
+    assert payload["input"]["initial_prompt"] == "Acme, Kubernetes"
+
+
+def test_build_payload_leaves_the_language_to_the_worker_when_not_given():
+    payload = _build_payload("https://example.com/a.wav", huggingface_token=None)
+    assert "language" not in payload["input"]
+    assert "initial_prompt" not in payload["input"]
+
+
 def test_parse_segments_skips_blank_text_and_defaults_unknown_speaker():
     output = {
         "segments": [
@@ -183,6 +197,19 @@ def test_transcribe_parts_sends_compressed_audio_and_parses_the_result(tmp_path,
     assert sent[:4] == b"OggS"
     # Compressed far below the WAV it came from (5 s of 48 kHz stereo is ~940 KB).
     assert len(sent) < audio.stat().st_size / 20
+
+
+def test_every_job_carries_the_language_and_vocabulary(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+    runpod = FakeRunpod([_completed((0.5, "SPEAKER_00", "hi"))])
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0, language="en", vocabulary="Acme")
+
+    transcriber.transcribe_parts([audio], source="system")
+
+    (payload,) = runpod.submitted_payloads
+    assert (payload["input"]["language"], payload["input"]["initial_prompt"]) == ("en", "Acme")
 
 
 def test_a_long_recording_is_split_into_chunks_placed_on_the_meetings_clock(tmp_path, monkeypatch):

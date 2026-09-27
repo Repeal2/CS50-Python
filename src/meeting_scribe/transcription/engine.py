@@ -5,12 +5,13 @@ event stream into one time-ordered meeting transcript.
 from __future__ import annotations
 
 import contextlib
+import re
 import sys
 import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Mapping, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
 SOURCE_LABELS = {"mic": "You", "system": "Others", "screen_ocr": "Screen"}
 
@@ -27,6 +28,10 @@ _APPROXIMATE_MODEL_MEMORY_MB = {
     "medium": 1800,
     "large-v3": 3200,
     "large-v3-turbo": 1800,
+    # English-only variants: the same weights' size as their multilingual counterparts.
+    "base.en": 400,
+    "small.en": 700,
+    "medium.en": 1800,
 }
 # Used for a model name that isn't in the table above (e.g. a distil-*/.en variant set directly via
 # MEETING_SCRIBE_WHISPER_MODEL rather than picked from the Settings page) — assumes something in the
@@ -93,6 +98,40 @@ def low_memory_warning(model_size: str, available_mb: float | None) -> str | Non
     )
 
 
+# Whisper reads a prompt of at most 223 tokens (half its 448-token context, less one — see faster-whisper's
+# WhisperModel.get_prompt, which cuts hotwords off there). A token is roughly four characters of English, so
+# this keeps the whole list inside that window rather than letting the end of it be silently dropped.
+_MAX_VOCABULARY_CHARS = 600
+
+
+def build_vocabulary(*word_groups: Iterable[str | None]) -> str | None:
+    """The words to steer Whisper's spelling towards — names, products, jargon — as one comma-separated
+    string, or None if there are none. Groups are taken in order, so put the most important first: once
+    the list reaches _MAX_VOCABULARY_CHARS, whatever comes after is left out. Blank entries and repeats
+    (ignoring case) are dropped."""
+    words: list[str] = []
+    seen: set[str] = set()
+    length = 0
+    for group in word_groups:
+        for word in group:
+            word = " ".join((word or "").split())
+            if not word or word.casefold() in seen:
+                continue
+            added = len(word) + (2 if words else 0)  # ", " between words
+            if length + added > _MAX_VOCABULARY_CHARS:
+                return ", ".join(words) or None
+            words.append(word)
+            seen.add(word.casefold())
+            length += added
+    return ", ".join(words) or None
+
+
+def split_word_list(text: str | None) -> list[str]:
+    """Splits a list typed by hand, or an attendee list read off the screen, into its entries — one per
+    line, or separated by commas or semicolons."""
+    return [part.strip() for part in re.split(r"[,;\n]", text or "") if part.strip()]
+
+
 # One transcription at a time, process-wide. Back-to-back meetings (session.py) and a Projects-tab retry
 # each run on their own background thread with their own WhisperTranscriber, and each loads its own copy
 # of the model — two at once doubles the memory needed, which is exactly the `mkl_malloc: failed to
@@ -154,14 +193,37 @@ class WhisperTranscriber:
         self._model = None
 
     def transcribe(
-        self, audio_path: Path, source: str, on_progress: Callable[[float], None] | None = None
+        self,
+        audio_path: Path,
+        source: str,
+        on_progress: Callable[[float], None] | None = None,
+        *,
+        language: str | None = None,
+        vocabulary: str | None = None,
     ) -> list[TranscriptLine]:
         """Runs Whisper over a recorded WAV file, returning one TranscriptLine per detected segment.
 
         `on_progress`, if given, is called with how far into the file (in seconds) Whisper has got, as
-        each segment comes out — faster-whisper decodes lazily as the segments are read, so this is live."""
+        each segment comes out — faster-whisper decodes lazily as the segments are read, so this is live.
+
+        `language` is an ISO code ("en"), or None to let Whisper guess from the first 30 seconds — which
+        a part that opens on silence or hold music can get wrong, turning the whole part into another
+        language. An English-only model (".en") is English whatever this says. `vocabulary` is words to
+        spell the way they're given (see build_vocabulary).
+
+        Each 30-second window is decoded on its own (condition_on_previous_text=False) rather than being
+        prompted with the text before it: over a long meeting, conditioning lets one misheard line repeat
+        itself for minutes, or text be invented across a quiet stretch. That also means an initial_prompt
+        would only reach the first window, so the vocabulary goes in as hotwords, which faster-whisper
+        puts in front of every window."""
         model = self._ensure_model()
-        segments, _info = model.transcribe(str(audio_path), vad_filter=True)
+        segments, _info = model.transcribe(
+            str(audio_path),
+            vad_filter=True,
+            condition_on_previous_text=False,
+            language=language,
+            hotwords=vocabulary,
+        )
         lines = []
         for segment in segments:
             if on_progress is not None:
@@ -176,6 +238,9 @@ class WhisperTranscriber:
         source: str,
         start_offsets: Mapping[Path, float] | None = None,
         on_progress: Callable[[float], None] | None = None,
+        *,
+        language: str | None = None,
+        vocabulary: str | None = None,
     ) -> list[TranscriptLine]:
         """Transcribes one capture stream that may have been written as several WAV parts.
 
@@ -184,7 +249,7 @@ class WhisperTranscriber:
         each part is shifted to where it started on the meeting's clock — see part_start_offsets.
 
         `on_progress`, if given, is called with how many seconds of this stream's audio are done so far,
-        across all its parts (see transcribe)."""
+        across all its parts (see transcribe), which also says what `language` and `vocabulary` do."""
         lines: list[TranscriptLine] = []
         done_seconds = 0.0
         for audio_path, offset_seconds in zip(audio_paths, part_start_offsets(audio_paths, start_offsets)):
@@ -193,7 +258,9 @@ class WhisperTranscriber:
                 part_progress = lambda seconds, before=done_seconds: on_progress(before + seconds)  # noqa: E731
             lines.extend(
                 TranscriptLine(line.timestamp_seconds + offset_seconds, line.source, line.text)
-                for line in self.transcribe(audio_path, source=source, on_progress=part_progress)
+                for line in self.transcribe(
+                    audio_path, source=source, on_progress=part_progress, language=language, vocabulary=vocabulary
+                )
             )
             done_seconds += wav_duration_seconds(audio_path)
             if on_progress is not None:

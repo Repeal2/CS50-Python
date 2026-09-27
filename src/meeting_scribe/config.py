@@ -13,16 +13,34 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from meeting_scribe.hotkeys import HotkeyCombo
+from meeting_scribe.transcription.engine import split_word_list
 
 USER_CONFIG_FILENAME = "settings.json"
 
-# The sizes offered in the Settings page's model dropdown, smallest/fastest first. faster-whisper also
-# supports .en (English-only) and distil-* (distilled, English-only) variants, but those are left out
-# here to keep the dropdown to one choice per accuracy/memory tradeoff rather than a long list most users
-# won't need — MEETING_SCRIBE_WHISPER_MODEL can still be set to any faster-whisper model name directly for
-# anyone who wants one of those. Larger sizes transcribe more accurately but need proportionally more
-# memory and CPU time; see transcription.engine.WhisperTranscriber for how this is used.
-WHISPER_MODEL_SIZES = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo")
+# The sizes offered in the Settings page's model dropdown, smallest/fastest first. Each ".en" size is the
+# English-only version of the one before it: the same memory and speed, somewhat more accurate on English,
+# and English whatever the transcription language says. faster-whisper's distil-* variants are left out to
+# keep the list short — MEETING_SCRIBE_WHISPER_MODEL can still be set to any faster-whisper model name
+# directly. Larger sizes transcribe more accurately but need proportionally more memory and CPU time; see
+# transcription.engine.WhisperTranscriber for how this is used.
+WHISPER_MODEL_SIZES = (
+    "tiny", "base", "base.en", "small", "small.en", "medium", "medium.en", "large-v3", "large-v3-turbo"
+)
+
+# The languages offered for transcription, as (Whisper language code, name shown in Settings). None lets
+# Whisper guess each recording's language from its first 30 seconds, which silence or hold music at the
+# start of a recording can throw off — so a language is set by default (see Settings.transcription_language).
+TRANSCRIPTION_LANGUAGES = (
+    ("en", "English"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("es", "Spanish"),
+    ("it", "Italian"),
+    ("pt", "Portuguese"),
+    ("nl", "Dutch"),
+    (None, "Detect automatically"),
+)
+DEFAULT_TRANSCRIPTION_LANGUAGE = "en"
 
 
 DB_FILENAME = "meeting_scribe.db"
@@ -159,6 +177,12 @@ class Settings:
     runpod_api_key: str | None = None
     runpod_endpoint_id: str | None = None
     runpod_huggingface_token: str | None = None
+    # The language meetings are transcribed in, locally and in the cloud — a code from
+    # TRANSCRIPTION_LANGUAGES, or None to detect it.
+    transcription_language: str | None = DEFAULT_TRANSCRIPTION_LANGUAGE
+    # Words to spell the way they're given — client and product names, jargon — added to every meeting's
+    # transcription, along with its project, title and attendees (see session._meeting_vocabulary).
+    custom_vocabulary: tuple[str, ...] = ()
     # Where the on-screen OCR box was last left — (left, top, width, height) in screen pixels — so the
     # next meeting's box appears in the same place instead of needing to be set up again. None until
     # the box has been moved or resized once. See screen.ocr_box.
@@ -241,6 +265,8 @@ def save_user_config(settings: Settings) -> None:
         "runpod_api_key": settings.runpod_api_key,
         "runpod_endpoint_id": settings.runpod_endpoint_id,
         "runpod_huggingface_token": settings.runpod_huggingface_token,
+        "transcription_language": settings.transcription_language,
+        "custom_vocabulary": list(settings.custom_vocabulary),
         "ocr_area": list(settings.ocr_area) if settings.ocr_area else None,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -267,7 +293,8 @@ def validate_transcription_choice(transcribe_locally: bool, transcribe_in_cloud:
 def update_settings(settings: Settings, **changes) -> Settings:
     """Applies and persists edits from the GUI, returning the updated Settings. Takes the same field
     names as Settings; a blank text field is stored as None ("not set"), and copilot_sync_dir may be given
-    as a string (blank disables pushing — meetings are still recorded and saved locally).
+    as a string (blank disables pushing — meetings are still recorded and saved locally), and
+    custom_vocabulary as the text typed on the Settings page (see transcription.engine.split_word_list).
 
     Whisper model size and diarization are read once when a meeting starts, so a change only affects
     meetings started after it; device choices are also applied live to a recording in progress by the
@@ -278,6 +305,8 @@ def update_settings(settings: Settings, **changes) -> Settings:
     if "copilot_sync_dir" in changes:
         sync_dir = changes["copilot_sync_dir"]
         changes["copilot_sync_dir"] = Path(sync_dir) if sync_dir else None
+    if isinstance(changes.get("custom_vocabulary"), str):
+        changes["custom_vocabulary"] = tuple(split_word_list(changes["custom_vocabulary"]))
     updated = replace(settings, **changes)
     validate_transcription_choice(updated.transcribe_locally, updated.transcribe_in_cloud)
     save_user_config(updated)
@@ -292,6 +321,24 @@ def _ocr_area_from_json(data: object) -> tuple[int, int, int, int] | None:
     except (TypeError, ValueError):
         return None
     return (left, top, width, height) if width > 0 and height > 0 else None
+
+
+def _transcription_language_from_json(user_config: dict) -> str | None:
+    """The saved language, the default if none was ever saved, and the default again for anything not
+    offered in TRANSCRIPTION_LANGUAGES (a hand-edited settings.json) — an unknown code would make Whisper
+    refuse the whole transcription."""
+    if "transcription_language" not in user_config:
+        return DEFAULT_TRANSCRIPTION_LANGUAGE
+    language = user_config["transcription_language"]
+    if language in {code for code, _name in TRANSCRIPTION_LANGUAGES}:
+        return language
+    return DEFAULT_TRANSCRIPTION_LANGUAGE
+
+
+def _vocabulary_from_json(data: object) -> tuple[str, ...]:
+    if not isinstance(data, list):
+        return ()
+    return tuple(word.strip() for word in data if isinstance(word, str) and word.strip())
 
 
 def load_settings() -> Settings:
@@ -332,6 +379,8 @@ def load_settings() -> Settings:
         runpod_api_key=user_config.get("runpod_api_key"),
         runpod_endpoint_id=user_config.get("runpod_endpoint_id"),
         runpod_huggingface_token=user_config.get("runpod_huggingface_token"),
+        transcription_language=_transcription_language_from_json(user_config),
+        custom_vocabulary=_vocabulary_from_json(user_config.get("custom_vocabulary")),
         ocr_area=_ocr_area_from_json(user_config.get("ocr_area")),
         moved_from=moved_from,
     )
