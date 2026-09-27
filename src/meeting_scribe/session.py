@@ -28,6 +28,7 @@ from meeting_scribe.storage.database import Database
 from meeting_scribe.storage.disk_space import LowDiskWatch, check_room_to_record
 from meeting_scribe.transcription import jobs
 from meeting_scribe.transcription.jobs import TranscriptionJob
+from meeting_scribe.transcription.speaker_names import caption_names, name_speakers
 from meeting_scribe.transcription.worker import IsolatedWhisperTranscriber
 from meeting_scribe.transcription.engine import (
     TranscriptLine,
@@ -111,7 +112,10 @@ class _ScreenTextLog:
             self.events.append(event)
             try:
                 with open(self._path, "a", encoding="utf-8") as file:
-                    file.write(json.dumps({"t": event.timestamp_seconds, "text": event.text}) + "\n")
+                    record = {"t": event.timestamp_seconds, "text": event.text}
+                    if event.speaker is not None:
+                        record.update(speaker=event.speaker, since=event.started_seconds)
+                    file.write(json.dumps(record) + "\n")
             except OSError:
                 pass  # the in-memory copy still makes it into the transcript
 
@@ -132,7 +136,15 @@ def load_screen_text_events(meeting_dir: Path) -> list[ScreenTextEvent]:
     for line in lines:
         try:
             record = json.loads(line)
-            events.append(ScreenTextEvent(float(record["t"]), str(record["text"])))
+            since = record.get("since")
+            events.append(
+                ScreenTextEvent(
+                    float(record["t"]),
+                    str(record["text"]),
+                    speaker=record.get("speaker"),
+                    started_seconds=float(since) if since is not None else None,
+                )
+            )
         except (ValueError, KeyError, TypeError):
             continue
     return events
@@ -193,10 +205,13 @@ def meeting_transcripts(rows) -> MeetingTranscripts:
     return MeetingTranscripts(screen=screen, local=local, cloud=cloud)
 
 
-def _meeting_vocabulary(settings: Settings, db: Database, meeting_id: int) -> str | None:
+def _meeting_vocabulary(
+    settings: Settings, db: Database, meeting_id: int, screen_events: Sequence[ScreenTextEvent] = ()
+) -> str | None:
     """The words a meeting's transcription is steered towards (see transcription.engine.build_vocabulary):
     the ones added in Settings first, as the most deliberate, then the meeting's project and title, then
-    whoever was captured as attending — the names a transcript most often gets wrong."""
+    whoever was captured as attending or named on Teams' captions — the names a transcript most often
+    gets wrong."""
     meeting = db.get_meeting(meeting_id)
     if meeting is None:
         return build_vocabulary(settings.custom_vocabulary)
@@ -205,7 +220,22 @@ def _meeting_vocabulary(settings: Settings, db: Database, meeting_id: int) -> st
         settings.custom_vocabulary,
         [project.name if project else None, meeting.title],
         split_word_list(meeting.attendees),
+        caption_names(screen_events),
     )
+
+
+def _name_from_captions(
+    results: dict[str, tuple[list[TranscriptLine], list[TranscriptLine]]],
+    screen_events: Sequence[ScreenTextEvent],
+    report: Callable[[str], None],
+) -> None:
+    """Names the other side's lines in each engine's transcript from Teams' caption badges, where they
+    clearly can be (see transcription.speaker_names)."""
+    for engine, (mic_lines, system_lines) in results.items():
+        named_lines, names = name_speakers(mic_lines, system_lines, screen_events)
+        results[engine] = (mic_lines, named_lines)
+        if names:
+            report(f"Speakers named from Teams' captions ({ENGINE_NAMES[engine]}): {', '.join(names)}.")
 
 
 def _local_transcriber(settings: Settings) -> IsolatedWhisperTranscriber:
@@ -400,8 +430,9 @@ def _finish_meeting(
         report,
         fall_back=True,
         job=job,
-        vocabulary=_meeting_vocabulary(settings, db, meeting_id),
+        vocabulary=_meeting_vocabulary(settings, db, meeting_id, screen_events),
     )
+    _name_from_captions(results, screen_events, report)
     report("Transcription complete.")
     _stage(job, jobs.SAVING)
 
@@ -797,6 +828,7 @@ def add_transcription(
                 f'The recorded audio for "{meeting.title}" is no longer in {meeting_dir} — nothing to transcribe.'
             )
         transcriber = _local_transcriber(settings)
+        screen_events = load_screen_text_events(meeting_dir)
         results = _transcribe(
             settings,
             transcriber,
@@ -805,8 +837,9 @@ def add_transcription(
             report,
             fall_back=False,
             job=job,
-            vocabulary=_meeting_vocabulary(settings, db, meeting_id),
+            vocabulary=_meeting_vocabulary(settings, db, meeting_id, screen_events),
         )
+        _name_from_captions(results, screen_events, report)
         _stage(job, jobs.SAVING)
         db.clear_transcript_segments(meeting_id, engine=engine)
         _save_transcription(db, meeting_id, engine, results[engine])

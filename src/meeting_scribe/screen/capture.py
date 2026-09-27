@@ -17,7 +17,9 @@ growing — see `_reconcile_lines`. Events are timestamped relative to when watc
 interleaved with the audio transcript by `transcription.engine`.
 
 The speaker name badge Teams renders alongside each caption line (see `_looks_like_speaker_badge`) is
-filtered out of that caption text as chrome.
+filtered out of that caption text as chrome — but not thrown away: each caption line remembers the badge
+above it, and when it first appeared, so the finished transcript can put names to the other side's
+voices (see transcription.speaker_names).
 """
 
 from __future__ import annotations
@@ -86,6 +88,42 @@ def _looks_like_speaker_badge(line: str) -> bool:
     return bool(_NAME_BADGE_RE.match(line))
 
 
+def speaker_name_from_badge(line: str) -> str | None:
+    """The person's name in a caption's speaker badge ("Priya Shah | Acme" -> "Priya Shah", "Shah, Priya"
+    -> "Priya Shah"), or None if `line` doesn't look like a badge."""
+    if not line or not _looks_like_speaker_badge(line):
+        return None
+    name = re.split(r"\s+[|I]\s+|\s*\|\s*", line, maxsplit=1)[0]
+    name = re.sub(r"\s+[^\sA-Za-z]{1,3}$", "", name).strip(" ,")
+    last_first = name.split(",")
+    if len(last_first) == 2 and all(part.strip() for part in last_first):
+        name = f"{last_first[1].strip()} {last_first[0].strip()}"
+    name = " ".join(name.split())
+    if len(name.split()) < 2 or not any(char.islower() for char in name):
+        return None  # "OK OK": all-caps spoken fragments match the badge shape too, names don't look like that
+    return name
+
+
+def _caption_lines(text: str, already_seen: set[str]) -> list[tuple[str, str | None]]:
+    """_new_lines for the live caption stream, with each line paired with the speaker whose badge came
+    before it in this capture (None before the first badge, or where there are none)."""
+    lines: list[tuple[str, str | None]] = []
+    seen_now: set[str] = set()
+    speaker: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or _looks_like_ui_noise(line):
+            continue
+        if _looks_like_speaker_badge(line):
+            speaker = speaker_name_from_badge(line) or speaker
+            continue
+        if line in already_seen or line in seen_now:
+            continue
+        seen_now.add(line)
+        lines.append((line, speaker))
+    return lines
+
+
 def _new_lines(text: str, already_seen: set[str], *, filter_speaker_badges: bool = True) -> list[str]:
     """Splits one capture's OCR text into lines and returns only the ones that are new: not blank, not
     UI noise, not (when `filter_speaker_badges`) a speaker name badge, and not in `already_seen` (or
@@ -129,6 +167,10 @@ def _find_growth_match(candidate: str, pending: list[str]) -> str | None:
 class ScreenTextEvent:
     timestamp_seconds: float
     text: str
+    # For a caption: whose badge it was shown under, and when it first appeared on screen (it's emitted
+    # once it has stopped growing, a few seconds later — see _reconcile_lines). None otherwise.
+    speaker: str | None = None
+    started_seconds: float | None = None
 
 
 class ScreenWatcher:
@@ -154,8 +196,11 @@ class ScreenWatcher:
         self._started_at: float | None = None
         self._last_frame_hash: str | None = None
         self._finalized_lines: set[str] = set()
-        # Lines seen in the last capture that hadn't stopped growing yet — see module docstring.
+        # Lines seen in the last capture that hadn't stopped growing yet — see module docstring — with the
+        # speaker badge each was shown under and when it first appeared.
         self._pending_lines: list[str] = []
+        self._pending_speakers: dict[str, str | None] = {}
+        self._pending_since: dict[str, float] = {}
         self._unsettled_captures = 0
         self._reading = threading.Event()
         if reading:
@@ -301,36 +346,63 @@ class ScreenWatcher:
         cycle's pending line having grown replaces it (still pending, not emitted yet). A pending line
         that *didn't* reappear or grow this round has settled — it's finalized and included in this
         cycle's event, so a real caption is only ever emitted once, in its most-complete form."""
-        candidates = _new_lines(text, self._finalized_lines)
+        elapsed = time.monotonic() - self._started_at
+        candidates = _caption_lines(text, self._finalized_lines)
         still_pending = list(self._pending_lines)
         new_pending: list[str] = []
-        for candidate in candidates:
+        speakers: dict[str, str | None] = {}
+        since: dict[str, float] = {}
+        for candidate, speaker in candidates:
+            first_seen = elapsed
             match = _find_growth_match(candidate, still_pending)
             if match is not None:
                 still_pending.remove(match)
                 # Keep whichever is longer: normally that's `candidate` (the caption grew), but an
                 # occasional OCR misread can make a later capture look like it *shrank* — don't let that
                 # downgrade a pending line we already had in fuller form.
+                speaker = speaker or self._pending_speakers.get(match)
+                first_seen = self._pending_since.get(match, elapsed)
                 candidate = max(candidate, match, key=len)
             new_pending.append(candidate)
+            speakers[candidate] = speaker
+            since[candidate] = first_seen
 
-        self._pending_lines = new_pending
-        if not still_pending:
-            return
-        self._finalized_lines.update(still_pending)
-        elapsed = time.monotonic() - self._started_at
-        self._on_text(ScreenTextEvent(timestamp_seconds=elapsed, text="\n".join(still_pending)))
+        settled = self._take_settled(still_pending)
+        self._pending_lines, self._pending_speakers, self._pending_since = new_pending, speakers, since
+        self._emit(settled, elapsed)
+
+    def _take_settled(self, lines: list[str]) -> list[tuple[str, str | None, float | None]]:
+        """`lines` with the speaker and first-seen time noted for each, marked as finalized."""
+        self._finalized_lines.update(lines)
+        return [(line, self._pending_speakers.get(line), self._pending_since.get(line)) for line in lines]
+
+    def _emit(self, settled: list[tuple[str, str | None, float | None]], elapsed: float) -> None:
+        """One event per run of consecutive settled lines under the same speaker badge — just one, as
+        before, for text that has no badges at all (slides, chat, a caption area with names turned off)."""
+        run: list[tuple[str, str | None, float | None]] = []
+        for item in [*settled, None]:
+            if run and (item is None or item[1] != run[-1][1]):
+                starts = [first_seen for _, _, first_seen in run if first_seen is not None]
+                self._on_text(
+                    ScreenTextEvent(
+                        timestamp_seconds=elapsed,
+                        text="\n".join(line for line, _, _ in run),
+                        speaker=run[0][1],
+                        started_seconds=min(starts) if starts and run[0][1] is not None else None,
+                    )
+                )
+                run = []
+            if item is not None:
+                run.append(item)
 
     def _flush_pending(self) -> None:
         """Finalizes whatever's still pending when watching stops, so the last caption on screen isn't
         silently dropped just because nothing arrived afterward to confirm it had stopped growing."""
         if not self._pending_lines:
             return
-        self._finalized_lines.update(self._pending_lines)
-        elapsed = time.monotonic() - self._started_at
-        text = "\n".join(self._pending_lines)
-        self._pending_lines = []
-        self._on_text(ScreenTextEvent(timestamp_seconds=elapsed, text=text))
+        settled = self._take_settled(self._pending_lines)
+        self._pending_lines, self._pending_speakers, self._pending_since = [], {}, {}
+        self._emit(settled, time.monotonic() - self._started_at)
 
 
 def ocr_region(region: dict, tesseract_cmd: str | None = None) -> str:

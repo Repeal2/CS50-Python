@@ -1750,3 +1750,40 @@ def test_recordings_are_kept_as_wav_when_compression_is_turned_off(tmp_path):
 
     assert (meeting_dir / "mic.wav").exists()
     assert not (meeting_dir / "mic.opus").exists()
+
+
+def test_captions_speakers_survive_the_screen_text_log(tmp_path):
+    from meeting_scribe.session import _ScreenTextLog, load_screen_text_events
+
+    log = _ScreenTextLog(tmp_path / "screen_text.jsonl")
+    log.append(ScreenTextEvent(16.0, "Let's look at the budget.", speaker="Priya Shah", started_seconds=10.0))
+    log.append(ScreenTextEvent(19.0, "Slide 4"))
+
+    assert load_screen_text_events(tmp_path) == log.snapshot()
+
+
+def test_the_other_sides_lines_are_named_from_teams_captions(tmp_path):
+    from meeting_scribe.session import retry_meeting_transcription
+
+    with patch("meeting_scribe.session.IsolatedWhisperTranscriber") as MockTranscriber:
+        MockTranscriber.return_value.transcribe_parts.side_effect = lambda paths, source, **kwargs: (
+            [] if source == "mic" else [TranscriptLine(12.0, "system", "Let's look at the budget.")]
+        )
+        settings = _settings(tmp_path)
+        with Database(tmp_path / "test.db") as db:
+            _project, meeting_id = _stuck_meeting(settings, db)
+            meeting_dir = settings.meeting_dir(meeting_id)
+            _write_wav(meeting_dir / "mic.wav")
+            _write_wav(meeting_dir / "system.wav")
+            (meeting_dir / "screen_text.jsonl").write_text(
+                json.dumps({"t": 20.0, "text": "Let's look at the budget.", "speaker": "Priya Shah", "since": 11.0}) + "\n",
+                encoding="utf-8",
+            )
+            progress = []
+
+            transcript = retry_meeting_transcription(settings, db, meeting_id, on_progress=progress.append)
+            vocabulary = MockTranscriber.return_value.transcribe_parts.call_args.kwargs["vocabulary"]
+
+    assert "[00:12] Priya Shah: Let's look at the budget." in transcript
+    assert "Speakers named from Teams' captions (on this PC): Priya Shah." in progress
+    assert "Priya Shah" in vocabulary

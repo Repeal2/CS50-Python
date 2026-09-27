@@ -4,6 +4,7 @@ from meeting_scribe.screen.capture import (
     _looks_like_ui_noise,
     _new_lines,
     _ocr_region_once,
+    speaker_name_from_badge,
 )
 from meeting_scribe.screen.region_picker import RegionTarget
 
@@ -367,3 +368,37 @@ def test_pausing_lets_the_lines_still_on_screen_through():
     watcher.set_reading(False)
     watcher._flush_pending()  # what the capture thread does on its next pass while paused
     assert [event.text for event in events] == ["Last caption before the pause."]
+
+
+def test_speaker_name_from_badge_reads_the_name_and_drops_the_rest():
+    assert speaker_name_from_badge("Priya Shah") == "Priya Shah"
+    assert speaker_name_from_badge("Priya Shah | Acme Corp") == "Priya Shah"
+    assert speaker_name_from_badge("Priya Shah I Acme") == "Priya Shah"  # the pipe OCR'd as "I"
+    assert speaker_name_from_badge("Shah, Priya") == "Priya Shah"
+    assert speaker_name_from_badge("Tom Jones ©") == "Tom Jones"
+    assert speaker_name_from_badge("Let's look at the budget.") is None
+    assert speaker_name_from_badge("OK OK") is None
+
+
+def test_each_caption_remembers_its_speaker_and_when_it_first_appeared(monkeypatch):
+    from meeting_scribe.screen import capture
+
+    clock = [10.0]
+    monkeypatch.setattr(capture.time, "monotonic", lambda: clock[0])
+    events = []
+    watcher = _watcher(on_text=events.append)
+
+    watcher._reconcile_lines("Priya Shah\nLet's look at")
+    clock[0] = 13.0
+    watcher._reconcile_lines("Priya Shah\nLet's look at the budget.\nTom Jones | Acme\nSounds")
+    clock[0] = 16.0
+    watcher._reconcile_lines("Tom Jones | Acme\nSounds good to me.\nAnd the dates?")
+    clock[0] = 19.0
+    watcher._reconcile_lines("Slide 4")
+    watcher._flush_pending()
+
+    assert [(e.text, e.speaker, e.started_seconds, e.timestamp_seconds) for e in events] == [
+        ("Let's look at the budget.", "Priya Shah", 10.0, 16.0),
+        ("Sounds good to me.\nAnd the dates?", "Tom Jones", 13.0, 19.0),
+        ("Slide 4", None, None, 19.0),
+    ]
