@@ -384,10 +384,28 @@ _PART_EXCESS_AUDIO_SECONDS = 5.0
 _PART_EXCESS_AUDIO_RATIO = 1.1
 
 
+# ...and one holding this much *less* audio than the time it was open lost audio along the way: the device
+# delivered less than real time, or buffers overflowed because the capture thread fell behind (a busy or
+# throttled CPU) — PyAudio's blocking read drops that audio silently rather than saying so. The machine
+# sleeping mid-meeting shows up the same way. Transcription still places the next part by the clock, but
+# lines later in this part come out early by up to the amount lost. Small shortfalls are normal (the last
+# buffer when a part closes), hence the floor; the ratio keeps an hour-long part's ordinary jitter quiet.
+_PART_MISSING_AUDIO_SECONDS = 5.0
+_PART_MISSING_AUDIO_RATIO = 0.02
+
+
 def describe_part_timing(label: str, timing: PartTiming) -> str | None:
-    """A ready-to-show sentence if one WAV part holds clearly more audio than the time it was recording
-    for, else None."""
+    """A ready-to-show sentence if one WAV part holds clearly more or clearly less audio than the time it
+    was recording for, else None."""
     wall = max(0.0, timing.ended_seconds - timing.started_seconds)
+    missing = wall - timing.audio_seconds
+    if missing > max(_PART_MISSING_AUDIO_SECONDS, wall * _PART_MISSING_AUDIO_RATIO):
+        return (
+            f"{label}: about {_format_seconds(missing)} of audio was lost from {timing.path.name} — it holds "
+            f"{_format_seconds(timing.audio_seconds)} of audio from {_format_seconds(wall)} of recording. "
+            "The device fell behind or dropped audio, or the computer slept; lines later in that part may "
+            "be timed early, and anything said while it was lost isn't in the transcript."
+        )
     if timing.audio_seconds <= wall * _PART_EXCESS_AUDIO_RATIO + _PART_EXCESS_AUDIO_SECONDS:
         return None
     return (

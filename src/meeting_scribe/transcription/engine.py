@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import re
 import sys
+import unicodedata
 import threading
 import wave
 from dataclasses import dataclass
@@ -132,6 +133,83 @@ def split_word_list(text: str | None) -> list[str]:
     return [part.strip() for part in re.split(r"[,;\n]", text or "") if part.strip()]
 
 
+# Whisper was trained largely on subtitled video, so on silence, music or noise it tends to write out what
+# a video's subtitles would have said there — credits, sign-offs, calls to subscribe. A segment whose whole
+# text is one of these (compared after normalize_for_matching) is dropped wherever it comes from, this PC or
+# the cloud. Deliberately only the phrases nobody says in a meeting — not "you" or "so", which are also
+# common invented one-word segments but just as often real.
+_INVENTED_PHRASES = frozenset(
+    (
+        "thank you for watching",
+        "thanks for watching",
+        "thank you so much for watching",
+        "thank you for watching and see you next time",
+        "please subscribe",
+        "please like and subscribe",
+        "like and subscribe",
+        "subscribe to my channel",
+        "dont forget to like and subscribe",
+        "see you in the next video",
+        "subtitles by the amara org community",
+        "amara org",
+        "gracias por ver el video",
+        "subtitulos realizados por la comunidad de amara org",
+        "merci davoir regarde cette video",
+        "untertitel im auftrag des zdf fur funk 2017",
+        "untertitel der amara org community",
+    )
+)
+# ...and ones that only ever start a subtitle credit line, whatever follows ("Subtitles by <someone>").
+_INVENTED_PREFIXES = (
+    "subtitles by",
+    "captions by",
+    "transcribed by",
+    "subtitulos realizados por",
+    "sous titrage",
+    "sous titres realises par",
+    "untertitel im auftrag",
+    "untertitelung",
+)
+
+# faster-whisper's own per-segment confidence signals, with the thresholds Whisper itself uses to decide a
+# window was silence (no_speech_prob over 0.6 *and* avg_logprob under -1: the model both thinks there was
+# no speech and wasn't sure of the words it wrote) or a stuck repetition (a compression_ratio over 2.4
+# means the text is unusually repetitive — "the the the the"). Whisper retries such windows at a higher
+# temperature but still returns what the last try produced.
+_NO_SPEECH_PROB_MAX = 0.6
+_AVG_LOGPROB_MIN = -1.0
+_COMPRESSION_RATIO_MAX = 2.4
+
+
+def normalize_for_matching(text: str) -> str:
+    """Lowercase, accents and punctuation stripped, whitespace collapsed — "Thanks for watching!" and
+    "thanks for watching" compare equal."""
+    plain = unicodedata.normalize("NFKD", text.casefold())
+    plain = "".join(char for char in plain if not unicodedata.combining(char))
+    plain = re.sub(r"['\u2019]", "", plain)  # "don't" -> "dont", "d'avoir" -> "davoir"
+    plain = re.sub(r"[^\w\s]", " ", plain)  # "Amara.org" -> "amara org", "Sous-titrage" -> "sous titrage"
+    return " ".join(plain.split())
+
+
+def is_invented_line(text: str) -> bool:
+    """Whether a transcript line is one of the stock phrases Whisper writes over silence or noise (see
+    _INVENTED_PHRASES) rather than something said."""
+    plain = normalize_for_matching(text)
+    return plain in _INVENTED_PHRASES or plain.startswith(_INVENTED_PREFIXES)
+
+
+def _is_unreliable_segment(segment) -> bool:
+    """Whether faster-whisper's own confidence signals say this segment wasn't really speech, or is stuck
+    repeating itself. A segment without the signals (never the case with faster-whisper itself) is kept."""
+    no_speech_prob = getattr(segment, "no_speech_prob", None)
+    avg_logprob = getattr(segment, "avg_logprob", None)
+    compression_ratio = getattr(segment, "compression_ratio", None)
+    if no_speech_prob is not None and avg_logprob is not None:
+        if no_speech_prob > _NO_SPEECH_PROB_MAX and avg_logprob < _AVG_LOGPROB_MIN:
+            return True
+    return compression_ratio is not None and compression_ratio > _COMPRESSION_RATIO_MAX
+
+
 # One transcription at a time, process-wide. Back-to-back meetings (session.py) and a Projects-tab retry
 # each run on their own background thread with their own WhisperTranscriber, and each loads its own copy
 # of the model — two at once doubles the memory needed, which is exactly the `mkl_malloc: failed to
@@ -215,7 +293,10 @@ class WhisperTranscriber:
         prompted with the text before it: over a long meeting, conditioning lets one misheard line repeat
         itself for minutes, or text be invented across a quiet stretch. That also means an initial_prompt
         would only reach the first window, so the vocabulary goes in as hotwords, which faster-whisper
-        puts in front of every window."""
+        puts in front of every window.
+
+        Segments Whisper most likely invented are left out: ones its own confidence signals mark as
+        silence or a stuck repetition, and stock subtitle phrases (see is_invented_line)."""
         model = self._ensure_model()
         segments, _info = model.transcribe(
             str(audio_path),
@@ -228,8 +309,9 @@ class WhisperTranscriber:
         for segment in segments:
             if on_progress is not None:
                 on_progress(segment.end)
-            if segment.text.strip():
-                lines.append(TranscriptLine(timestamp_seconds=segment.start, source=source, text=segment.text.strip()))
+            if not segment.text.strip() or _is_unreliable_segment(segment) or is_invented_line(segment.text):
+                continue
+            lines.append(TranscriptLine(timestamp_seconds=segment.start, source=source, text=segment.text.strip()))
         return lines
 
     def transcribe_parts(

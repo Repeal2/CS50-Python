@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from meeting_scribe.transcription.engine import TranscriptLine, part_start_offsets
+from meeting_scribe.transcription.engine import TranscriptLine, is_invented_line, part_start_offsets
 from meeting_scribe.transcription.speech_encoding import EncodedChunk, encode_speech_chunks
 
 _API_KEY_ENV = "MEETING_SCRIBE_RUNPOD_API_KEY"
@@ -268,6 +268,8 @@ class RunpodWhisperXTranscriber:
             )
             for segments in placed
             for segment in segments
+            # WhisperX invents the same stock subtitle phrases local Whisper does (see engine.is_invented_line).
+            if not is_invented_line(segment.text)
         ]
         speakers = {line.speaker for line in lines}
         if not diarize:

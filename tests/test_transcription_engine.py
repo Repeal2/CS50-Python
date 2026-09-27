@@ -9,6 +9,7 @@ from meeting_scribe.transcription.engine import (
     WhisperTranscriber,
     available_memory_mb,
     build_vocabulary,
+    is_invented_line,
     low_memory_warning,
     merge_transcript_lines,
     render_transcript,
@@ -371,3 +372,52 @@ def test_build_vocabulary_leaves_out_what_comes_after_the_limit():
 def test_split_word_list_takes_commas_semicolons_and_lines():
     assert split_word_list("Acme, Kubernetes;ARR\n Priya Shah \n\n") == ["Acme", "Kubernetes", "ARR", "Priya Shah"]
     assert split_word_list(None) == []
+
+
+class _Segment:
+    def __init__(self, text, start=0.0, end=1.0, no_speech_prob=0.1, avg_logprob=-0.3, compression_ratio=1.5):
+        self.text, self.start, self.end = text, start, end
+        self.no_speech_prob, self.avg_logprob, self.compression_ratio = no_speech_prob, avg_logprob, compression_ratio
+
+
+def _transcribe_segments(monkeypatch, segments):
+    class Model:
+        def transcribe(self, path, **options):
+            return iter(segments), None
+
+    transcriber = WhisperTranscriber(model_size="tiny")
+    monkeypatch.setattr(transcriber, "_ensure_model", lambda: Model())
+    return [line.text for line in transcriber.transcribe(Path("system.wav"), "system")]
+
+
+def test_transcribe_leaves_out_what_whisper_marks_as_silence_or_a_stuck_repetition(monkeypatch):
+    texts = _transcribe_segments(
+        monkeypatch,
+        [
+            _Segment("Let's start with the budget."),
+            _Segment("Mm.", no_speech_prob=0.9, avg_logprob=-1.4),  # silence, and unsure of the words
+            _Segment("Quiet but sure of it.", no_speech_prob=0.9, avg_logprob=-0.2),  # kept: confident
+            _Segment("the the the the the the the the", compression_ratio=3.1),
+            _Segment("Sounds good."),
+        ],
+    )
+
+    assert texts == ["Let's start with the budget.", "Quiet but sure of it.", "Sounds good."]
+
+
+def test_transcribe_leaves_out_stock_subtitle_phrases(monkeypatch):
+    texts = _transcribe_segments(
+        monkeypatch, [_Segment("Thanks for watching!"), _Segment("Subtitles by the Amara.org community"), _Segment("Bye.")]
+    )
+
+    assert texts == ["Bye."]
+
+
+def test_is_invented_line_matches_whole_stock_phrases_only():
+    assert is_invented_line("Thank you for watching.")
+    assert is_invented_line("Sous-titrage ST' 501")
+    assert is_invented_line("Merci d'avoir regardé cette vidéo !")
+    assert not is_invented_line("Thanks for watching the demo earlier, it helped.")
+    # Common invented one-word segments, but just as often really said — kept.
+    assert not is_invented_line("So.")
+    assert not is_invented_line("You")

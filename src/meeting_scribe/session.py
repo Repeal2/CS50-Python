@@ -24,6 +24,7 @@ from meeting_scribe.config import Settings
 from meeting_scribe.screen.capture import ScreenTextEvent, ScreenWatcher
 from meeting_scribe.screen.region_picker import RegionTarget
 from meeting_scribe.storage.database import Database
+from meeting_scribe.storage.disk_space import LowDiskWatch, check_room_to_record
 from meeting_scribe.transcription import jobs
 from meeting_scribe.transcription.jobs import TranscriptionJob
 from meeting_scribe.transcription.engine import (
@@ -469,9 +470,14 @@ class MeetingSession:
 
         `read_screen=False` starts the meeting without reading anything on screen yet — the OCR box's
         flow (see screen.ocr_box): the box is put in place first, then its Start button calls
-        set_screen_reading(True)."""
+        set_screen_reading(True).
+
+        Raises storage.disk_space.NotEnoughDiskSpace, before anything is created, if the data folder's
+        drive is too full to record a meeting safely."""
+        check_room_to_record(settings.data_dir)
         self._settings = settings
         self._db = db
+        self._disk_watch = LowDiskWatch(settings.data_dir)
         self.project = db.get_or_create_project(project_name)
         self.meeting_id = db.create_meeting(self.project.id, title)
         self.title = title
@@ -577,8 +583,10 @@ class MeetingSession:
     def input_problems(self) -> tuple[str, ...]:
         """What currently looks wrong with what's being captured — a microphone producing digital
         silence, an input that has heard nothing while the other track was busy, a clipping device.
-        Empty while both inputs look healthy; recomputed per call, so it clears if the input recovers."""
-        return self._recorder.input_problems()
+        Empty while both inputs look healthy; recomputed per call, so it clears if the input recovers.
+        Also the disk running low, which ends a recording as surely as a dead microphone does."""
+        disk_problem = self._disk_watch.problem()
+        return self._recorder.input_problems() + ((disk_problem,) if disk_problem else ())
 
     def abandon(self) -> None:
         """Stops capturing without transcribing — for the app closing mid-meeting. The WAV files and the
@@ -638,6 +646,9 @@ class MeetingSession:
         # that comes out of it is genuinely incomplete, and the reason is worth having on the record.
         for message in recorded.notices:
             report(message)
+        disk_summary = self._disk_watch.summary()
+        if disk_summary is not None:
+            report(disk_summary)
 
         return _finish_meeting(
             self._settings,

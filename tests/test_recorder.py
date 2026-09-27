@@ -270,6 +270,20 @@ def test_a_part_holding_more_audio_than_time_passed_is_reported(tmp_path):
     )
 
 
+def test_part_timing_reports_audio_lost_along_the_way(tmp_path):
+    lost = PartTiming(tmp_path / "mic.wav", started_seconds=0.0, ended_seconds=3600.0, audio_seconds=3480.0)
+    jitter = PartTiming(tmp_path / "mic.wav", started_seconds=0.0, ended_seconds=3600.0, audio_seconds=3560.0)
+    short_part = PartTiming(tmp_path / "mic.part2.wav", started_seconds=10.0, ended_seconds=14.0, audio_seconds=0.5)
+
+    assert describe_part_timing("Microphone", lost) == (
+        "Microphone: about 2 min 00 s of audio was lost from mic.wav — it holds 58 min 00 s of audio from "
+        "60 min 00 s of recording. The device fell behind or dropped audio, or the computer slept; lines "
+        "later in that part may be timed early, and anything said while it was lost isn't in the transcript."
+    )
+    assert describe_part_timing("Microphone", jitter) is None  # 40 s over an hour is ordinary
+    assert describe_part_timing("Microphone", short_part) is None  # under the floor
+
+
 def test_stop_returns_each_parts_start_time(tmp_path):
     recorder = Recorder(tmp_path)
     recorder._started_at = 0.0

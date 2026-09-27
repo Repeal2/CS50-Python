@@ -1664,3 +1664,44 @@ def test_transcription_is_steered_towards_the_meetings_own_words(tmp_path):
     assert MockTranscriber.return_value.transcribe_parts.call_args.kwargs["vocabulary"] == expected
     assert MockTranscriber.return_value.transcribe_parts.call_args.kwargs["language"] == "fr"
     assert (MockRunpod.call_args.kwargs["vocabulary"], MockRunpod.call_args.kwargs["language"]) == (expected, "fr")
+
+
+def test_a_meeting_is_refused_before_anything_is_created_when_the_disk_is_nearly_full(tmp_path, monkeypatch):
+    from meeting_scribe.session import MeetingSession
+    from meeting_scribe.storage import disk_space
+
+    monkeypatch.setattr(disk_space, "free_bytes", lambda path: 100 * 1024**2)
+
+    with Database(tmp_path / "test.db") as db:
+        with pytest.raises(disk_space.NotEnoughDiskSpace):
+            MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+        assert db.list_recent_meetings() == []
+
+
+def test_the_disk_running_low_is_shown_live_and_kept_in_the_meetings_log(tmp_path, monkeypatch):
+    from meeting_scribe.session import MeetingSession
+    from meeting_scribe.storage import disk_space
+
+    free = [10 * 1024**3]
+    monkeypatch.setattr(disk_space, "free_bytes", lambda path: free[0])
+    with (
+        patch("meeting_scribe.session.Recorder") as MockRecorder,
+        patch("meeting_scribe.session.ScreenWatcher"),
+        patch("meeting_scribe.session.WhisperTranscriber") as MockTranscriber,
+    ):
+        MockRecorder.return_value.input_problems.return_value = ()
+        MockRecorder.return_value.stop.return_value = RecordedAudio(
+            mic_paths=(), system_paths=(), started_at_monotonic=0.0
+        )
+        MockTranscriber.return_value.transcribe_parts.return_value = []
+
+        with Database(tmp_path / "test.db") as db:
+            session = MeetingSession(_settings(tmp_path), db, "Test Project", "Kickoff")
+            session.start()
+            free[0] = 300 * 1024**2
+            problems = session.input_problems()
+            progress = []
+            session.stop(on_progress=progress.append)
+
+    assert any(problem.startswith("Disk nearly full: 300 MB left") for problem in problems)
+    assert any("disk ran low while recording (300 MB free at its lowest)" in line for line in progress)

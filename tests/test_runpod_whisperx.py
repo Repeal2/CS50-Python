@@ -212,6 +212,18 @@ def test_every_job_carries_the_language_and_vocabulary(tmp_path, monkeypatch):
     assert (payload["input"]["language"], payload["input"]["initial_prompt"]) == ("en", "Acme")
 
 
+def test_stock_subtitle_phrases_are_left_out_of_the_cloud_transcript(tmp_path, monkeypatch):
+    _env(monkeypatch)
+    audio = tmp_path / "system.wav"
+    _write_wav(audio, seconds=1.0)
+    runpod = FakeRunpod([_completed((0.2, "SPEAKER_00", "hi"), (0.6, "SPEAKER_00", "Thanks for watching!"))])
+    transcriber = RunpodWhisperXTranscriber(session=runpod, poll_seconds=0)
+
+    lines = transcriber.transcribe_parts([audio], source="system")
+
+    assert [line.text for line in lines] == ["hi"]
+
+
 def test_a_long_recording_is_split_into_chunks_placed_on_the_meetings_clock(tmp_path, monkeypatch):
     _env(monkeypatch)
     monkeypatch.setattr(runpod_whisperx, "_MAX_CHUNK_SECONDS", 1.0)
