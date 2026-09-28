@@ -265,3 +265,54 @@ def test_csv_export_has_the_browser_trackers_columns():
     assert header.startswith('"ID","Action","Owner","Mine"')
     assert '"In progress"' in row and '"Yes"' in row
     assert '"2026-09-23: chased | 2026-09-24: again"' in row
+
+
+# --- finding the folder and saving without asking ---
+
+
+def test_actions_root_is_the_sync_folder_or_its_parent_when_the_inbox_or_a_project_was_chosen(tmp_path):
+    (tmp_path / "Inbox").mkdir()
+    (tmp_path / "Canford").mkdir()
+    _write_list(tmp_path / "Canford" / "Canford - Actions.json", [])
+    assert at.actions_root(tmp_path) == tmp_path
+    assert at.actions_root(tmp_path / "Inbox") == tmp_path
+    assert at.actions_root(tmp_path / "Canford") == tmp_path
+
+
+def test_guess_sync_dir_finds_the_meeting_minutes_folder_under_onedrive_documents(tmp_path):
+    minutes = tmp_path / "OneDrive - AMERESCO" / "Documents" / "Ameresco" / "Meeting minutes"
+    (minutes / "Inbox").mkdir(parents=True)
+    (tmp_path / "OneDrive - AMERESCO" / "Documents" / "Other" / "Meeting minutes").mkdir(parents=True)  # no Inbox
+
+    assert at.guess_sync_dir({"OneDriveCommercial": str(tmp_path / "OneDrive - AMERESCO")}) == minutes
+    assert at.guess_sync_dir({}) is None
+    assert at.guess_sync_dir({"OneDrive": str(tmp_path / "missing")}) is None
+
+
+def test_save_merging_saves_straight_away_when_nothing_changed_underneath(tmp_path):
+    path = tmp_path / "Canford - Actions.json"
+    _write_list(path, [_action(1)])
+    loaded = at.read_action_list(path)
+    loaded.actions[0]["status"] = "closed"
+
+    saved, merged = at.save_merging(path, loaded, {1})
+
+    assert not merged
+    assert json.loads(path.read_text(encoding="utf-8"))["actions"][0]["status"] == "closed"
+    assert saved.digest == at.file_digest(path)
+
+
+def test_save_merging_reapplies_this_sessions_changes_onto_a_newer_list(tmp_path):
+    path = tmp_path / "Canford - Actions.json"
+    _write_list(path, [_action(1), _action(2)])
+    loaded = at.read_action_list(path)
+    loaded.actions[0]["status"] = "closed"
+    loaded.actions[0]["touched"] = True
+    _write_list(path, [_action(1), _action(2, status="blocked"), _action(3)])  # the weekly run
+
+    saved, merged = at.save_merging(path, loaded, {1})
+
+    assert merged
+    on_disk = {a["id"]: a["status"] for a in json.loads(path.read_text(encoding="utf-8"))["actions"]}
+    assert on_disk == {1: "closed", 2: "blocked", 3: "open"}
+    assert [a["id"] for a in saved.actions] == [1, 2, 3]

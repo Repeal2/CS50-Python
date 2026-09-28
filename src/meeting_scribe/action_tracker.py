@@ -128,6 +128,48 @@ def find_action_files(root: Path) -> list[ActionsFile]:
     return sorted(found, key=lambda f: f.project.casefold())
 
 
+def actions_root(sync_dir: Path) -> Path:
+    """The folder whose subfolders are the projects — the sync folder the Inbox is in. Also right when the
+    folder chosen was the Inbox itself, or one of the project folders."""
+    if sync_dir.name.casefold() == "inbox":
+        return sync_dir.parent
+    try:
+        if any(_ACTIONS_FILENAME_RE.match(p.name) for p in sync_dir.iterdir() if p.is_file()):
+            return sync_dir.parent
+    except OSError:
+        pass
+    return sync_dir
+
+
+MINUTES_FOLDER_NAME = "Meeting minutes"
+
+
+def guess_sync_dir(environ=None, *, depth: int = 3) -> Path | None:
+    """Where the minutes usually are when no sync folder has been chosen: a "Meeting minutes" folder under
+    OneDrive's Documents (up to `depth` folders down) that has an Inbox or a project's action list in it."""
+    environ = os.environ if environ is None else environ
+    for variable in ("OneDriveCommercial", "OneDrive"):
+        base = environ.get(variable)
+        if not base:
+            continue
+        level = [Path(base) / "Documents"]
+        for _ in range(depth + 1):
+            below = []
+            for folder in level:
+                try:
+                    children = [child for child in folder.iterdir() if child.is_dir() and not child.name.startswith(".")]
+                except OSError:
+                    continue
+                for child in children:
+                    if child.name.casefold() == MINUTES_FOLDER_NAME.casefold() and (
+                        (child / "Inbox").is_dir() or find_action_files(child)
+                    ):
+                        return child
+                below.extend(children)
+            level = below
+    return None
+
+
 def _parse(raw: bytes) -> LoadedActions:
     data = json.loads(raw.decode("utf-8-sig"))
     if not isinstance(data, dict) or not isinstance(data.get("actions"), list):
@@ -171,6 +213,23 @@ def save_action_list(path: Path, loaded: LoadedActions, *, now: datetime | None 
     temporary.write_bytes(raw)
     os.replace(temporary, path)
     return LoadedActions(data, hashlib.sha256(raw).hexdigest())
+
+
+def save_merging(
+    path: Path, loaded: LoadedActions, changed_ids: set, *, now: datetime | None = None, attempts: int = 3
+) -> tuple[LoadedActions, bool]:
+    """Saves `loaded`; if the file changed since it was read (the weekly run, most likely), first reapplies
+    the actions in `changed_ids` onto the newer list (see merge_local_onto) and saves that instead. Returns
+    what's on disk now, and whether a newer list was merged in. Raises ActionsConflict only if the file kept
+    changing under every attempt."""
+    merged = False
+    for _ in range(attempts):
+        try:
+            return save_action_list(path, loaded, now=now), merged
+        except ActionsConflict as conflict:
+            loaded, _carried = merge_local_onto(conflict.fresh, loaded.actions, changed_ids)
+            merged = True
+    raise ActionsConflict(read_action_list(path))
 
 
 def merge_local_onto(

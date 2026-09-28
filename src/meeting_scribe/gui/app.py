@@ -509,6 +509,11 @@ class _ScrollableFrame(ttk.Frame):
         if over_page and self.inner.winfo_height() > self._canvas.winfo_height():
             self._canvas.yview_scroll(int(-event.delta / 120), "units")
 
+    def scroll_with(self, event) -> None:
+        """Scrolls by a mouse-wheel event that arrived on a child that would otherwise scroll itself."""
+        if self.inner.winfo_height() > self._canvas.winfo_height():
+            self._canvas.yview_scroll(int(-event.delta / 120), "units")
+
     def scroll_position(self) -> float:
         return self._canvas.yview()[0]
 
@@ -1008,7 +1013,7 @@ class MeetingScribeApp(tk.Tk):
                 )
             if not messagebox.askyesno(APP_NAME, message, icon="warning", parent=self):
                 return
-        if not self.actions_page.confirm_discard_changes():
+        if not self.actions_page.flush_and_save():
             return
         if self._hotkey_listener is not None:
             self._hotkey_listener.stop()
@@ -2316,16 +2321,24 @@ def _action_column_widths(total: int) -> dict[str, int]:
 
 class ActionsPage(ttk.Frame):
     """Each project's action list — the "<Project> - Actions.json" the weekly run keeps in the project's
-    folder under the sync folder — laid out like the browser tracker: category tabs, and a row per action
-    to tick off, re-prioritise, annotate and correct, then Save back to the file. See action_tracker.py for
-    how a save avoids writing over the weekly run's changes."""
+    folder, next to the Inbox meetings are pushed to — laid out like the browser tracker: category tabs, and
+    a row per action to tick off, re-prioritise, annotate and correct. Every change is saved back to the
+    file a moment later; see action_tracker.save_merging for how that avoids writing over the weekly run.
+
+    Each action's row is built once per list and then only shown, hidden or moved as the tab, filters and
+    search change, so switching between them doesn't redraw anything; a changed action rebuilds just its
+    own row."""
 
     _POLL_MS = 30_000  # how often to notice the file changing under the page
+    _SAVE_DELAY_MS = 1000  # a change is saved this long after the last one
+    _RETRY_MS = 10_000  # after a save that failed (OneDrive busy, file locked)
+    _BATCH = 10  # rows built at a time, so the first ones show straight away
     _RECORD = "record"  # the category tab showing decisions, items closed this week and gaps
+    _FIRST_ROW = 4  # grid rows 0-3: the add form, the headings, their rule, "nothing matches"
     _FILTER_LABELS = {"all": "All", "mine": "Mine", "flagged": "Flagged", "blocked": "Blocked", "open": "Not done"}
     _NO_FOLDER_TEXT = (
-        "Action lists live in the project folders under the Copilot sync folder, as “<Project> - Actions.json”. "
-        "Choose the sync folder in Settings to see them here."
+        "No action lists found. They're read from the project folders next to the Inbox meetings are pushed "
+        "to — set the Copilot sync folder in Settings to the folder the Inbox is in."
     )
     _NO_LISTS_TEXT = "No project folder under {root} has an action list (“<Project> - Actions.json”) yet."
 
@@ -2334,25 +2347,35 @@ class ActionsPage(ttk.Frame):
         self.app = app
         palette, fonts = app.palette, app.fonts
         self._badges = badge_colours(palette)
+        self._lists_root: Path | None = None  # the folder the project folders are in
         self._files: dict[str, action_tracker.ActionsFile] = {}  # project folder -> its list
         self._file: action_tracker.ActionsFile | None = None
         self._loaded: action_tracker.LoadedActions | None = None
-        self._conflict: action_tracker.LoadedActions | None = None
         self._dirty = False
         self._changed_ids: set = set()  # actions changed since the list was loaded — what a merge carries over
+        self._save_after_id: str | None = None
+        self._save_error: str | None = None
+        self._saved_at: datetime | None = None
         self._category: str | None = None  # None: every category; _RECORD: decisions, closed and gaps
         self._quick_filter = "all"
-        self._adding = False
         self._scan_running = False
         self._search_after_id: str | None = None
         self._resize_after_id: str | None = None
-        self._widths = _action_column_widths(900)
+        self._widths: dict[str, int] | None = None  # None until the list has been laid out at its real width
+
+        # The list's widgets, rebuilt only when a different list (or version of it) is loaded.
+        self._rows: dict[int, list[tuple[tk.Widget, int, str]]] = {}  # id(action) -> (widget, column, sticky)
+        self._build_queue: list[dict] = []
+        self._build_after_id: str | None = None
+        self._headings: list[tuple[tk.Widget, int]] = []
+        self._heading_rule: ttk.Separator | None = None
+        self._nothing: tk.Label | None = None
+        self._add_form: ttk.Frame | None = None
+        self._record: ttk.Frame | None = None
+        self._tabs_by_category: dict = {}
         self._wrapped: list[tuple[tk.Widget, str, int]] = []  # (label, column, margin) to re-wrap on resize
-        self._notes: list[tuple[dict, tk.Text]] = []  # each shown action's notes box
+        self._notes: list[tuple[dict, tk.Text]] = []  # each built action's notes box
         self._row_vars: list[tk.Variable] = []  # kept alive: Tk forgets a variable once Python does
-        self._rows: dict[int, tuple[int, list[tk.Widget]]] = {}  # id(action) -> (grid row, its widgets)
-        self._row_parts: list[tk.Widget] = []  # the widgets of the row being drawn
-        self._generation = 0  # bumped by each redraw, so a stale batch of rows stops drawing
 
         self._title_font = tkfont.Font(font=fonts.strong)
         self._done_font = tkfont.Font(font=fonts.strong)
@@ -2361,6 +2384,9 @@ class ActionsPage(ttk.Frame):
         self._badge_font.configure(weight="bold")
         self._heading_font = tkfont.Font(font=fonts.small)
         self._heading_font.configure(weight="bold")
+        self._notes_font = tkfont.Font(font=fonts.small)
+        self._notes_placeholder_font = tkfont.Font(font=fonts.small)
+        self._notes_placeholder_font.configure(slant="italic")
         style = ttk.Style(self)
         style.configure("Select.TButton", anchor="w", padding=(10, 4), font=fonts.body)
 
@@ -2376,40 +2402,19 @@ class ActionsPage(ttk.Frame):
         self.search.var.trace_add("write", self._on_search_changed)
         self.search.bind("<Escape>", lambda _e: self.search.var.set(""))
 
-        # Which file, whether it's saved, and what can be done with it.
+        # Which file, and whether everything's saved.
         status_card, status = _card(self, padding=(14, 8, 8, 8))
         status_card.pack(fill="x")
-        self.save_button = ttk.Button(status, text="Save", style="Accent.TButton", command=self.save, state="disabled")
-        self.save_button.pack(side="right", padx=(8, 0))
         self._file_buttons = []
-        for text, command in (
-            ("Export CSV…", self._export_csv),
-            ("Open folder", self._open_folder),
-            ("Reload", self._reload),
-        ):
+        for text, command in (("Export CSV…", self._export_csv), ("Open folder", self._open_folder)):
             button = ttk.Button(status, text=text, style="Link.TButton", command=command, state="disabled")
             button.pack(side="right", padx=(4, 0))
             self._file_buttons.append(button)
         self._status_label = ttk.Label(status, style="Card.Muted.TLabel", justify="left")
         self._status_label.pack(side="left", fill="x", expand=True)
-        _wrap_to_width(self._status_label, status, margin=420)
+        _wrap_to_width(self._status_label, status, margin=260)
 
-        # Shown when the file changed under unsaved changes: how to combine them.
-        self._conflict_bar = ttk.Frame(self, style="Card.TFrame", padding=(14, 8))
-        self._conflict_label = ttk.Label(self._conflict_bar, style="Banner.TLabel", justify="left")
-        self._conflict_label.pack(fill="x")
-        _wrap_to_width(self._conflict_label, self._conflict_bar, margin=40)
-        conflict_buttons = ttk.Frame(self._conflict_bar, style="Card.TFrame", borderwidth=0)
-        conflict_buttons.pack(fill="x", pady=(8, 0))
-        for text, button_style, mode in (
-            ("Take the new list, keep my changes", "Accent.TButton", "merge"),
-            ("Take the new list, drop mine", "TButton", "theirs"),
-            ("Overwrite with mine…", "Danger.TButton", "mine"),
-        ):
-            ttk.Button(conflict_buttons, text=text, style=button_style,
-                       command=lambda m=mode: self._resolve_conflict(m)).pack(side="left", padx=(0, 8))
-
-        filters = self._filters_row = ttk.Frame(self)
+        filters = ttk.Frame(self)
         filters.pack(fill="x", pady=(12, 0))
         self._filter_buttons: dict[str, ttk.Button] = {}
         for key, label in self._FILTER_LABELS.items():
@@ -2466,46 +2471,48 @@ class ActionsPage(ttk.Frame):
         self._check_file_changed()
 
     def refresh_projects(self) -> None:
-        """Looks for the project folders' action lists, on a background thread since they're on OneDrive."""
-        root = self.app.settings.copilot_sync_dir
-        if root is None:
-            self._files = {}
-            self.project_combo["values"] = ()
-            self._show_state()
-            return
+        """Looks for the project folders' action lists, on a background thread since they're on OneDrive:
+        in the folder the Inbox is in — or, with no sync folder chosen, in OneDrive's "Meeting minutes"."""
         if self._scan_running:
             return
         self._scan_running = True
+        sync_dir = self.app.settings.copilot_sync_dir
 
         def worker() -> None:
-            found = action_tracker.find_action_files(root)
             try:
-                self.after(0, self._on_projects_found, found)
+                root = action_tracker.actions_root(sync_dir) if sync_dir else action_tracker.guess_sync_dir()
+                found = action_tracker.find_action_files(root) if root else []
+            except Exception:  # a folder problem mustn't stop the page
+                root, found = None, []
+            try:
+                self.after(0, self._on_projects_found, root, found)
             except (RuntimeError, tk.TclError):
                 pass  # the window closed while looking
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_projects_found(self, found: "list[action_tracker.ActionsFile]") -> None:
+    def _on_projects_found(self, root: Path | None, found: "list[action_tracker.ActionsFile]") -> None:
         self._scan_running = False
+        self._lists_root = root
         self._files = {f.project: f for f in found}
         self.project_combo["values"] = list(self._files)
         if self._file is not None and self._file.project in self._files:
-            if self._files[self._file.project].path != self._file.path and not self._dirty:
+            if self._files[self._file.project].path != self._file.path and self.flush_and_save(ask=False):
                 self._open(self._files[self._file.project])  # a conflict copy was renamed back, say
             return
-        if self._file is None and self._files:
+        if self._files:
             recording = self.app.record_page.project_var.get().strip().casefold()
             preferred = next((name for name in self._files if name.casefold() == recording), next(iter(self._files)))
             self._open(self._files[preferred])
         else:
+            self._file, self._loaded = None, None
             self._show_state()
 
     def _on_project_chosen(self, _event=None) -> None:
         chosen = self._files.get(self.project_var.get())
         if chosen is None or (self._file is not None and chosen.path == self._file.path):
             return
-        if not self.confirm_discard_changes():
+        if not self.flush_and_save():
             self.project_var.set(self._file.project if self._file else "")
             return
         self._open(chosen)
@@ -2518,24 +2525,17 @@ class ActionsPage(ttk.Frame):
             return
         self._file = actions_file
         self.project_var.set(actions_file.project)
-        self._set_loaded(loaded, dirty=False)
+        self._saved_at, self._save_error = None, None
+        self._set_loaded(loaded, dirty=False, keep_scroll=False)
 
-    def _set_loaded(self, loaded: "action_tracker.LoadedActions", *, dirty: bool) -> None:
+    def _set_loaded(self, loaded: "action_tracker.LoadedActions", *, dirty: bool, keep_scroll: bool = True) -> None:
         self._loaded = loaded
-        self._conflict = None
         self._dirty = dirty
-        self._notes = []  # they belonged to the list being replaced (and were flushed onto it already)
         if not dirty:
             self._changed_ids = set()
         if self._category not in (None, self._RECORD, *action_tracker.categories(loaded.data)):
             self._category = None
-        self._show_state()
-
-    def _reload(self) -> None:
-        if self._file is None or not self.confirm_discard_changes():
-            return
-        self._open(self._file)
-        self.app.toast(f"Reloaded {self._file.path.name}")
+        self._show_state(keep_scroll=keep_scroll)
 
     def _poll(self) -> None:
         try:
@@ -2546,8 +2546,8 @@ class ActionsPage(ttk.Frame):
 
     def _check_file_changed(self) -> None:
         """Picks up a list the weekly run (or the browser tracker) rewrote while this page had it open — or,
-        with unsaved changes here, asks how to combine them."""
-        if self._file is None or self._loaded is None or self._conflict is not None:
+        with changes of its own still to save, saves them now, merged onto the newer list."""
+        if self._file is None or self._loaded is None:
             return
         self._flush_notes()
         try:
@@ -2557,130 +2557,109 @@ class ActionsPage(ttk.Frame):
         except (OSError, ValueError):
             return  # mid-sync; try again next time
         if self._dirty:
-            self._conflict = fresh
-            self._show_state()
+            self._autosave()
         else:
             self._set_loaded(fresh, dirty=False)
             self.app.toast("Picked up a newer action list")
 
     # -- saving ---------------------------------------------------------------------------------------
 
-    def save(self) -> bool:
-        """Writes the list back to its file — unless the file changed since it was loaded, in which case
-        nothing is written and the page asks how to combine the two. True if it saved."""
-        if self._file is None or self._loaded is None:
-            return False
+    def _schedule_save(self, delay: int | None = None) -> None:
+        if self._save_after_id is not None:
+            self.after_cancel(self._save_after_id)
+        self._save_after_id = self.after(self._SAVE_DELAY_MS if delay is None else delay, self._autosave)
+
+    def _autosave(self) -> bool:
+        """Writes the changes made here back to the file — merged onto a newer list if the weekly run has
+        rewritten it meanwhile. A save that fails (OneDrive busy, the file open elsewhere) is retried.
+        True once everything's saved."""
+        if self._save_after_id is not None:
+            self.after_cancel(self._save_after_id)
+            self._save_after_id = None
         self._flush_notes()
+        if not self._dirty or self._file is None or self._loaded is None:
+            return True
         try:
-            self._loaded = action_tracker.save_action_list(self._file.path, self._loaded)
-        except action_tracker.ActionsConflict as conflict:
-            self._conflict = conflict.fresh
-            self._show_state()
+            saved, merged = action_tracker.save_merging(self._file.path, self._loaded, self._changed_ids)
+        except (OSError, ValueError, action_tracker.ActionsConflict) as exc:
+            self._save_error = str(exc) or type(exc).__name__
+            self._show_file_status()
+            self._schedule_save(self._RETRY_MS)
             return False
-        except (OSError, ValueError) as exc:
-            messagebox.showerror(APP_NAME, f"Couldn't save {self._file.path.name}: {exc}")
-            return False
-        self._dirty = False
-        self._changed_ids = set()
-        self._show_file_status()
-        self.app.toast(f"Saved {self._file.path.name}")
+        self._save_error = None
+        self._saved_at = datetime.now()
+        if merged:
+            self._set_loaded(saved, dirty=False)  # it has the weekly run's changes too: show them
+            self.app.toast("Saved — merged with a newer list from the weekly run")
+        else:
+            self._loaded = saved  # the same actions, now matching the file
+            self._dirty = False
+            self._changed_ids = set()
+            self._show_file_status()
         return True
 
-    def _resolve_conflict(self, mode: str) -> None:
-        fresh, loaded = self._conflict, self._loaded
-        if fresh is None or loaded is None:
-            return
-        self._flush_notes()
-        if mode == "merge":
-            merged, carried = action_tracker.merge_local_onto(fresh, loaded.actions, self._changed_ids)
-            self._set_loaded(merged, dirty=True)
-            self.app.toast(f"Loaded the newer list and kept {carried} of your change{'' if carried == 1 else 's'} — "
-                           "press Save")
-        elif mode == "theirs":
-            self._set_loaded(fresh, dirty=False)
-            self.app.toast("Loaded the newer list; your changes were dropped")
-        else:
-            if not messagebox.askyesno(
-                APP_NAME,
-                "Overwrite the file with what's on screen? Anything the weekly run added since you opened it "
-                "will be lost.", icon="warning", default="no", parent=self,
-            ):
-                return
-            self._loaded = action_tracker.LoadedActions(loaded.data, fresh.digest)
-            self._conflict = None
-            if not self.save():
-                return
-            self._show_state()
-
-    def confirm_discard_changes(self) -> bool:
-        """Before the list on screen is replaced (or the app closes): offers to save unsaved changes.
-        False means stay put."""
-        self._flush_notes()
-        if not self._dirty:
+    def flush_and_save(self, *, ask: bool = True) -> bool:
+        """Saves anything not yet saved now — before another list is opened, or the app closes. If that
+        fails, asks whether to carry on regardless (unless not to `ask`). False means stay put."""
+        if self._autosave():
             return True
-        answer = messagebox.askyesnocancel(
-            APP_NAME, f"Save your changes to {self._file.path.name} first?", parent=self
-        )
-        if answer is None:
+        if not ask:
             return False
-        return self.save() if answer else True
+        return messagebox.askyesno(
+            APP_NAME,
+            f"Couldn't save your latest changes to {self._file.path.name}:\n\n{self._save_error}\n\n"
+            "Carry on anyway? Those changes will be lost.",
+            icon="warning", default="no", parent=self,
+        )
+
+    def _show_file_status(self) -> None:
+        if self._file is None or self._loaded is None:
+            self._status_label.configure(text="No action list open.", style="Card.Muted.TLabel")
+            return
+        parts = [f"{self._file.path.name} in the {self._file.project} folder"]
+        if self._save_error:
+            parts.append(f"couldn't save ({self._save_error}) — trying again")
+        elif self._dirty:
+            parts.append("saving…")
+        elif self._saved_at is not None:
+            parts.append(f"saved automatically at {self._saved_at:%H:%M}")
+        else:
+            stamp = action_tracker.last_saved(self._loaded.data)
+            parts.append("changes save automatically" + (f" · list saved {str(stamp).replace('T', ' ')[:16]}" if stamp else ""))
+        text = "   ·   ".join(parts)
+        if self._file.conflict_copy:
+            text += (f"\nThis is a OneDrive conflict copy — there's no “{self._file.project}{action_tracker.ACTIONS_SUFFIX}” "
+                     "in the folder. Worth renaming it back.")
+        self._status_label.configure(text=text, style="Card.Danger.TLabel" if self._save_error else "Card.Muted.TLabel")
 
     # -- the page -------------------------------------------------------------------------------------
 
-    def _show_state(self) -> None:
-        """Brings every part of the page in line with the loaded list, filters and tab."""
-        for widget in (self._empty, self._conflict_bar, self._tabs_area, self._list_card, self._stats_label):
+    def _show_state(self, *, keep_scroll: bool = True) -> None:
+        """Brings the page in line with the loaded list: rebuilds its tabs and rows."""
+        for widget in (self._empty, self._tabs_area, self._list_card, self._stats_label):
             widget.pack_forget()
         has_list = self._loaded is not None and self._file is not None
         for button in self._file_buttons:
             button.configure(state="normal" if has_list else "disabled")
         self._add_button.configure(state="normal" if has_list else "disabled")
-        for key, button in self._filter_buttons.items():
-            button.configure(style="Accent.TButton" if key == self._quick_filter else "TButton")
+        self._show_filter_buttons()
         self._show_file_status()
         if not has_list:
-            root = self.app.settings.copilot_sync_dir
-            self._empty.configure(text=self._NO_FOLDER_TEXT if root is None else self._NO_LISTS_TEXT.format(root=root))
+            self._clear_list()
+            self._empty.configure(
+                text=self._NO_FOLDER_TEXT if self._lists_root is None else self._NO_LISTS_TEXT.format(root=self._lists_root)
+            )
             self._empty.pack(fill="x", pady=(12, 0))
             return
-        if self._conflict is not None:
-            self._show_conflict()
-            self._conflict_bar.pack(fill="x", pady=(8, 0), before=self._filters_row)
         self._stats_label.pack(side="bottom", fill="x", pady=(10, 0))
         self._tabs_area.pack(fill="x", pady=(10, 12))
         self._list_card.pack(fill="both", expand=True)
-        self._render()
+        self._build_tabs()
+        self._rebuild_list(keep_scroll=keep_scroll)
 
-    def _show_file_status(self) -> None:
-        self.save_button.configure(
-            text="Save •" if self._dirty else "Save",
-            state="normal" if self._loaded is not None and self._conflict is None else "disabled",
-        )
-        if self._file is None or self._loaded is None:
-            self._status_label.configure(text="No action list open.", style="Card.Muted.TLabel")
-            return
-        stamp = action_tracker.last_saved(self._loaded.data)
-        parts = [f"{self._file.path.name} in the {self._file.project} folder"]
-        if stamp:
-            parts.append(f"list saved {str(stamp).replace('T', ' ')[:16]}")
-        parts.append("unsaved changes — press Save" if self._dirty else "up to date")
-        text = "   ·   ".join(parts)
-        if self._file.conflict_copy:
-            text += (f"\nThis is a OneDrive conflict copy — there's no “{self._file.project}{action_tracker.ACTIONS_SUFFIX}” "
-                     "in the folder. Worth renaming it back.")
-        self._status_label.configure(text=text, style="Card.Danger.TLabel" if self._dirty else "Card.Muted.TLabel")
-
-    def _show_conflict(self) -> None:
-        fresh = self._conflict
-        changed = len(self._changed_ids)
-        listing = fresh.data.get("list") if isinstance(fresh.data.get("list"), dict) else {}
-        generated = listing.get("generated")
-        self._conflict_label.configure(text=(
-            f"{self._file.path.name} has changed since you opened it — the weekly run has most likely refreshed it. "
-            f"It now holds {len(fresh.actions)} actions" + (f", generated {generated}" if generated else "")
-            + f". You have {changed} changed action{'' if changed == 1 else 's'} on screen. Nothing has been "
-            "written; choose how to combine them."
-        ))
+    def _show_filter_buttons(self) -> None:
+        for key, button in self._filter_buttons.items():
+            button.configure(style="Accent.TButton" if key == self._quick_filter else "TButton")
 
     def _visible_actions(self, category: str | None) -> list[dict]:
         return [
@@ -2688,54 +2667,45 @@ class ActionsPage(ttk.Frame):
             if action_tracker.matches(action, category=category, quick_filter=self._quick_filter, query=self.search.value())
         ]
 
-    def _render(self, *, keep_scroll: bool = True) -> None:
-        """Redraws the tabs, the list and the totals. The rows are drawn a batch at a time, so the first
-        ones show straight away on a long list."""
-        position = self._scroller.scroll_position() if keep_scroll else 0.0
-        self._flush_notes()
-        self._generation += 1
-        self._render_tabs()
-        self._render_stats()
-        for child in self._grid.winfo_children():
-            child.destroy()
-        self._wrapped, self._notes, self._row_vars, self._rows = [], [], [], {}
-        for index, (key, _heading, _width) in enumerate(_ACTION_COLUMNS):
-            self._grid.columnconfigure(index, minsize=self._widths[key], weight=0)
-        if self._category == self._RECORD:
-            self._render_record()
-            self._scroller.restore_scroll(position)
-        else:
-            self._render_actions(position)
-
     # -- tabs and totals ----------------------------------------------------------------------------
 
-    def _render_tabs(self) -> None:
+    def _build_tabs(self) -> None:
         palette = self.app.palette
         for child in self._tabs.winfo_children():
             child.destroy()
+        self._tabs_by_category = {}
         tabs = [(None, "All actions")]
         tabs += [(c, action_tracker.category_label(c)) for c in action_tracker.categories(self._loaded.data)]
         tabs.append((self._RECORD, "Decisions, closed & gaps"))
-        for category, label in tabs:
-            active = category == self._category
+        for category, text in tabs:
             tab = tk.Frame(self._tabs, background=palette.background, cursor="hand2")
             tab.pack(side="left", padx=(0, 4))
             inner = tk.Frame(tab, background=palette.background)
             inner.pack(padx=12, pady=(8, 6))
-            parts = [tab, inner, tk.Label(inner, text=label, font=self.app.fonts.strong, background=palette.background,
-                                          foreground=palette.text if active else palette.muted)]
-            parts[-1].pack(side="left")
+            label = tk.Label(inner, text=text, font=self.app.fonts.strong, background=palette.background)
+            label.pack(side="left")
+            count = None
             if category != self._RECORD:
-                count = len(self._visible_actions(category))
-                parts.append(tk.Label(inner, text=f" {count} ", font=self._badge_font, padx=4,
-                                      background=palette.accent if active else palette.muted,
-                                      foreground=palette.surface if palette.dark else "#FFFFFF"))
-                parts[-1].pack(side="left", padx=(6, 0))
-            underline = tk.Frame(tab, height=2, background=palette.accent if active else palette.background)
+                count = tk.Label(inner, font=self._badge_font, padx=6,
+                                 foreground=palette.surface if palette.dark else "#FFFFFF")
+                count.pack(side="left", padx=(6, 0))
+            underline = tk.Frame(tab, height=2, background=palette.background)
             underline.pack(fill="x")
-            parts.append(underline)
-            for part in parts:
-                part.bind("<Button-1>", lambda _e, c=category: self._choose_category(c))
+            for part in (tab, inner, label, count, underline):
+                if part is not None:
+                    part.bind("<Button-1>", lambda _e, c=category: self._choose_category(c))
+            self._tabs_by_category[category] = (label, count, underline)
+        self._update_tabs()
+
+    def _update_tabs(self) -> None:
+        palette = self.app.palette
+        for category, (label, count, underline) in self._tabs_by_category.items():
+            active = category == self._category
+            label.configure(foreground=palette.text if active else palette.muted)
+            underline.configure(background=palette.accent if active else palette.background)
+            if count is not None:
+                count.configure(text=str(len(self._visible_actions(category))),
+                                background=palette.accent if active else palette.muted)
 
     def _fit_tabs(self) -> None:
         canvas = self._tabs_canvas
@@ -2752,41 +2722,170 @@ class ActionsPage(ttk.Frame):
             return
         self._category = category
         if category == self._RECORD:
-            self._adding = False
-        self._render(keep_scroll=False)
+            self._close_add_form()
+        self._layout(scroll_to_top=True)
 
-    def _render_stats(self) -> None:
+    def _update_totals(self) -> None:
+        """The tab counts, the list's title and count, the flagged/blocked banner and the footer."""
+        self._update_tabs()
         counts = action_tracker.summary_counts(self._loaded.actions)
         listing = self._loaded.data.get("list") if isinstance(self._loaded.data.get("list"), dict) else {}
-        parts = [
+        footer = [
             f"{counts['total']} actions", f"{counts['outstanding']} outstanding", f"{counts['done']} done",
             f"{counts['mine']} mine, outstanding", f"{counts['flagged']} flagged", f"{counts['blocked']} blocked",
             f"{counts['added']} added here",
         ]
         if listing.get("review_slot"):
-            parts.append(f"Review: {listing['review_slot']}")
-        self._stats_label.configure(text="      ".join(parts))
+            footer.append(f"Review: {listing['review_slot']}")
+        self._stats_label.configure(text="      ".join(footer))
+
+        if self._category == self._RECORD:
+            self._list_title.configure(text="Decisions, closed & gaps")
+            self._list_count.configure(text="")
+            self._banner.pack_forget()
+            return
+        rows = self._visible_actions(self._category)
+        done = sum(1 for a in rows if a.get("status") == "closed")
+        self._list_title.configure(
+            text=action_tracker.category_label(self._category) if self._category else "All actions"
+        )
+        self._list_count.configure(text=f"{len(rows)} shown · {done} done")
+        order = self._loaded.data.get("priority_order_agreed") or []
+        if counts["flagged"] or counts["blocked"]:
+            banner = f"{counts['flagged']} flagged and {counts['blocked']} blocked"
+            if order:
+                banner += " — priority order agreed at the weekly is " + " → ".join(str(o) for o in order)
+            self._banner.configure(text=banner + ".")
+            if not self._banner.winfo_ismapped():
+                self._banner.pack(fill="x", before=self._scroller)
+        else:
+            self._banner.pack_forget()
 
     def _set_filter(self, key: str) -> None:
         self._quick_filter = "all" if key == self._quick_filter else key
-        for name, button in self._filter_buttons.items():
-            button.configure(style="Accent.TButton" if name == self._quick_filter else "TButton")
+        self._show_filter_buttons()
         if self._loaded is not None:
-            self._render(keep_scroll=False)
+            self._layout(scroll_to_top=True)
 
     def _on_search_changed(self, *_args) -> None:
         if self._search_after_id is not None:
             self.after_cancel(self._search_after_id)
-        self._search_after_id = self.after(250, self._run_search)
+        self._search_after_id = self.after(200, self._run_search)
 
     def _run_search(self) -> None:
         self._search_after_id = None
         if self._loaded is not None:
-            self._render(keep_scroll=False)
+            self._flush_notes()  # search looks in notes too
+            self._layout(scroll_to_top=True)
 
-    # -- the list of actions ------------------------------------------------------------------------
+    # -- building the list --------------------------------------------------------------------------------
+
+    def _clear_list(self) -> None:
+        if self._build_after_id is not None:
+            self.after_cancel(self._build_after_id)
+            self._build_after_id = None
+        self._flush_notes()
+        for child in self._grid.winfo_children():
+            child.destroy()
+        self._rows, self._build_queue, self._headings = {}, [], []
+        self._heading_rule = self._nothing = self._add_form = self._record = None
+        self._wrapped, self._notes, self._row_vars = [], [], []
+
+    def _rebuild_list(self, *, keep_scroll: bool) -> None:
+        """Builds every action's row for the loaded list — the ones on screen first, the rest a batch at a
+        time straight after. Waits for the list's real width the first time, so it's built once, not twice."""
+        position = self._scroller.scroll_position() if keep_scroll else 0.0
+        adding = self._add_form is not None
+        self._clear_list()
+        width = self._scroller.canvas.winfo_width()
+        if width <= 1:
+            return  # not laid out yet: _on_list_resized builds it once it is
+        self._widths = _action_column_widths(width - 20)
+        for index, (key, _heading, _width) in enumerate(_ACTION_COLUMNS):
+            self._grid.columnconfigure(index, minsize=self._widths[key], weight=0)
+        palette = self.app.palette
+        for index, (key, heading, _width) in enumerate(_ACTION_COLUMNS):
+            if self._widths[key]:
+                self._headings.append((self._label(self._grid, heading.upper(), font=self._heading_font,
+                                                   foreground=palette.muted), index))
+        self._heading_rule = ttk.Separator(self._grid)
+        self._nothing = self._label(self._grid, "Nothing matches those filters.", foreground=palette.muted)
+        if adding:
+            self._open_add_form()
+        visible = sorted(self._visible_actions(self._category), key=action_tracker.sort_key)
+        shown = {id(a) for a in visible}
+        self._build_queue = visible + [a for a in self._loaded.actions if id(a) not in shown]
+        self._build_some()
+        self._scroller.restore_scroll(position)
+
+    def _build_some(self) -> None:
+        self._build_after_id = None
+        today = datetime.now().date()
+        for action in self._build_queue[:self._BATCH]:
+            self._build_row(action, today)
+        del self._build_queue[:self._BATCH]
+        self._layout()
+        if self._build_queue:
+            self._build_after_id = self.after(1, self._build_some)
+
+    def _layout(self, *, scroll_to_top: bool = False) -> None:
+        """Shows the rows that belong under the current tab, filters and search, in order, and hides the
+        rest — no widgets are created or destroyed."""
+        if self._loaded is None or self._widths is None:
+            return
+        self._update_totals()
+        record = self._category == self._RECORD
+        columns = len(_ACTION_COLUMNS)
+        if self._add_form is not None:
+            self._add_form.grid(row=0, column=0, columnspan=columns, sticky="ew")
+        for widget, index in self._headings:
+            if record:
+                widget.grid_remove()
+            else:
+                widget.grid(row=1, column=index, sticky="w", pady=(10, 6))
+        if self._heading_rule is not None:
+            if record:
+                self._heading_rule.grid_remove()
+            else:
+                self._heading_rule.grid(row=2, column=0, columnspan=columns, sticky="ew")
+
+        visible = [] if record else sorted(self._visible_actions(self._category), key=action_tracker.sort_key)
+        shown = {id(a) for a in visible}
+        for key, widgets in self._rows.items():
+            if key not in shown:
+                for widget, _column, _sticky in widgets:
+                    widget.grid_remove()
+        row = self._FIRST_ROW
+        for action in visible:
+            widgets = self._rows.get(id(action))
+            if widgets is None:
+                continue  # not built yet
+            for widget, column, sticky in widgets:
+                if column < 0:  # the rule under the row
+                    widget.grid(row=row + 1, column=0, columnspan=columns, sticky="ew")
+                else:
+                    gap = 0 if _ACTION_COLUMNS[column][0] == "due" and not self._widths["source"] else _ACTION_COLUMN_GAP
+                    widget.grid(row=row, column=column, sticky=sticky, padx=(0, gap), pady=(10, 12))
+            row += 2
+        if self._nothing is not None:
+            if not record and not visible:
+                self._nothing.grid(row=3, column=0, columnspan=columns, sticky="w", pady=24, padx=10)
+            else:
+                self._nothing.grid_remove()
+
+        if record:
+            if self._record is None:
+                self._record = self._build_record()
+            self._record.grid(row=1, column=0, columnspan=columns, sticky="ew")
+        elif self._record is not None:
+            self._record.grid_remove()
+        if scroll_to_top:
+            self._scroller.restore_scroll(0.0)
 
     def _on_list_resized(self, event) -> None:
+        if self._widths is None and self._loaded is not None and event.width > 1:
+            self._rebuild_list(keep_scroll=False)  # the first time the list has a width to build at
+            return
         if self._resize_after_id is not None:
             self.after_cancel(self._resize_after_id)
         self._resize_after_id = self.after(80, self._apply_widths, event.width - 20)
@@ -2794,19 +2893,22 @@ class ActionsPage(ttk.Frame):
     def _apply_widths(self, total: int) -> None:
         self._resize_after_id = None
         widths = _action_column_widths(total)
-        if widths == self._widths:
+        if self._widths is None or widths == self._widths:
             return
-        source_moved = bool(widths["source"]) != bool(self._widths["source"])
+        if bool(widths["source"]) != bool(self._widths["source"]):
+            self._rebuild_list(keep_scroll=True)  # the source moves in or out of its own column
+            return
         self._widths = widths
-        if source_moved and self._loaded is not None:
-            self._render()
-            return
         for index, (key, _heading, _width) in enumerate(_ACTION_COLUMNS):
             self._grid.columnconfigure(index, minsize=widths[key])
         self._wrapped = [(label, column, margin) for label, column, margin in self._wrapped if label.winfo_exists()]
         for label, column, margin in self._wrapped:
             width = total if column == "all" else widths[column]
             label.configure(wraplength=max(60, width - margin))
+        for action, box in self._notes:
+            self._fit_notes(box)
+
+    # -- one action's row ---------------------------------------------------------------------------------
 
     def _label(self, parent, text: str, *, column: str | None = None, margin: int = 14, font=None,
                foreground: str | None = None, **options) -> tk.Label:
@@ -2825,7 +2927,7 @@ class ActionsPage(ttk.Frame):
         return tk.Label(parent, text=text.upper(), font=self._badge_font, background=background,
                         foreground=foreground, padx=7, pady=1)
 
-    def _link(self, parent, text: str, command, *, tooltip: str | None = None) -> tk.Label:
+    def _link(self, parent, text: str, command) -> tk.Label:
         """A small clickable glyph (✎, ⋯, ×) that doesn't look like a button."""
         palette = self.app.palette
         link = tk.Label(parent, text=text, font=self.app.fonts.body, background=palette.surface,
@@ -2835,126 +2937,55 @@ class ActionsPage(ttk.Frame):
         link.bind("<Leave>", lambda _e: link.configure(foreground=palette.muted))
         return link
 
-    def _cell(self, row: int, column: str, widget: tk.Widget | None = None, **grid) -> tk.Widget:
-        """Puts `widget` (or a new frame for several) in one of the row's columns, as part of the row."""
-        index = [k for k, _h, _w in _ACTION_COLUMNS].index(column)
-        cell = widget if widget is not None else ttk.Frame(self._grid, style="Card.TFrame", borderwidth=0)
-        gap = 0 if column == "due" and not self._widths["source"] else _ACTION_COLUMN_GAP
-        cell.grid(row=row, column=index, sticky=grid.pop("sticky", "new"), padx=(0, gap), pady=(10, 12), **grid)
-        self._row_parts.append(cell)
-        return cell
+    def _frame(self) -> ttk.Frame:
+        return ttk.Frame(self._grid, style="Card.TFrame", borderwidth=0)
 
-    def _render_list_header(self) -> None:
-        """The list's title, how many actions it shows, and the flagged/blocked banner."""
-        rows = self._visible_actions(self._category)
-        done = sum(1 for a in rows if a.get("status") == "closed")
-        self._list_title.configure(
-            text=action_tracker.category_label(self._category) if self._category else "All actions"
-        )
-        self._list_count.configure(text=f"{len(rows)} shown · {done} done")
-        counts = action_tracker.summary_counts(self._loaded.actions)
-        order = self._loaded.data.get("priority_order_agreed") or []
-        if counts["flagged"] or counts["blocked"]:
-            banner = f"{counts['flagged']} flagged and {counts['blocked']} blocked"
-            if order:
-                banner += " — priority order agreed at the weekly is " + " → ".join(str(o) for o in order)
-            self._banner.configure(text=banner + ".")
-            if not self._banner.winfo_ismapped():
-                self._banner.pack(fill="x", before=self._scroller)
-        else:
-            self._banner.pack_forget()
-
-    _BATCH = 12  # rows drawn at a time
-
-    def _render_actions(self, position: float) -> None:
-        palette = self.app.palette
-        self._render_list_header()
-        rows = sorted(self._visible_actions(self._category), key=action_tracker.sort_key)
-        row = 0
-        if self._adding:
-            self._render_add_form(row)
-            row += 1
-        for index, (key, heading, _width) in enumerate(_ACTION_COLUMNS):
-            if self._widths[key]:
-                self._label(self._grid, heading.upper(), font=self._heading_font, foreground=palette.muted).grid(
-                    row=row, column=index, sticky="w", pady=(10, 6)
-                )
-        ttk.Separator(self._grid).grid(row=row + 1, column=0, columnspan=len(_ACTION_COLUMNS), sticky="ew")
-        row += 2
-        if not rows:
-            self._label(self._grid, "Nothing matches those filters.", foreground=palette.muted).grid(
-                row=row, column=0, columnspan=len(_ACTION_COLUMNS), sticky="w", pady=24, padx=10
-            )
-            self._scroller.restore_scroll(0.0)
-            return
-        placed = [(action, row + 2 * index) for index, action in enumerate(rows)]
-        self._render_batch(self._generation, placed, 0, position)
-
-    def _render_batch(self, generation: int, placed: list, start: int, position: float) -> None:
-        if generation != self._generation:
-            return  # redrawn since
-        today = datetime.now().date()
-        for action, row in placed[start:start + self._BATCH]:
-            self._render_row(action, row, today)
-        if start + self._BATCH < len(placed):
-            self.after(1, self._render_batch, generation, placed, start + self._BATCH, position)
-        if start == 0 or start + self._BATCH >= len(placed):
-            self._scroller.restore_scroll(position if start + self._BATCH >= len(placed) else 0.0)
-
-    def _render_row(self, action: dict, row: int, today) -> None:
+    def _build_row(self, action: dict, today) -> None:
+        """Creates an action's row, unplaced — _layout puts it in the grid."""
         palette = self.app.palette
         status, priority = action.get("status"), action.get("priority")
-        done = status == "closed"
-        self._row_parts = []
+        columns = {key: index for index, (key, _h, _w) in enumerate(_ACTION_COLUMNS)}
+        parts: list[tuple[tk.Widget, int, str]] = []
 
-        done_var = tk.BooleanVar(value=done)
+        done_var = tk.BooleanVar(value=status == "closed")
         self._row_vars.append(done_var)
-        self._cell(row, "done", ttk.Checkbutton(
-            self._grid, variable=done_var, style="Card.TCheckbutton",
-            command=lambda: self._set_done(action, done_var.get()),
-        ), sticky="nw")
-        self._cell(row, "id", self._label(self._grid, str(action.get("id", "")), font=self.app.fonts.mono,
-                                          foreground=palette.muted), sticky="nw")
-        self._fill_title_cell(self._cell(row, "title"), action)
-        self._fill_text_cell(self._cell(row, "owner"), action, "owner")
-        self._cell(row, "status", self._select(action_tracker.STATUSES, action_tracker.STATUS_LABELS, status,
-                                               lambda value: self._set_field(action, "status", value)))
-        self._cell(row, "priority", self._select(action_tracker.PRIORITIES, action_tracker.PRIORITY_LABELS, priority,
-                                                 lambda value: self._set_field(action, "priority", value)))
-        self._fill_text_cell(self._cell(row, "due"), action, "due", today=today)
-
+        parts.append((ttk.Checkbutton(self._grid, variable=done_var, style="Card.TCheckbutton",
+                                      command=lambda: self._set_done(action, done_var.get())), columns["done"], "nw"))
+        parts.append((self._label(self._grid, str(action.get("id", "")), font=self.app.fonts.mono,
+                                  foreground=palette.muted), columns["id"], "nw"))
+        title_cell = self._frame()
+        self._fill_title_cell(title_cell, action)
+        parts.append((title_cell, columns["title"], "new"))
+        owner_cell = self._frame()
+        self._fill_text_cell(owner_cell, action, "owner")
+        parts.append((owner_cell, columns["owner"], "new"))
+        parts.append((self._select(action_tracker.STATUSES, action_tracker.STATUS_LABELS, status,
+                                   lambda value: self._set_field(action, "status", value)), columns["status"], "new"))
+        parts.append((self._select(action_tracker.PRIORITIES, action_tracker.PRIORITY_LABELS, priority,
+                                   lambda value: self._set_field(action, "priority", value)), columns["priority"], "new"))
+        due_cell = self._frame()
+        self._fill_text_cell(due_cell, action, "due", today=today)
+        parts.append((due_cell, columns["due"], "new"))
         if self._widths["source"]:
-            source_cell = self._cell(row, "source")
+            source_cell = self._frame()
             source = action.get("source") if isinstance(action.get("source"), dict) else {}
             self._badge(source_cell, str(source.get("type") or "—"), "neutral").pack(anchor="w")
             details = "\n".join(str(part) for part in (source.get("date"), source.get("detail")) if part)
             if details:
                 self._label(source_cell, details, column="source", font=self.app.fonts.small,
                             foreground=palette.muted).pack(anchor="w", pady=(4, 0))
+            parts.append((source_cell, columns["source"], "new"))
+        parts.append((ttk.Separator(self._grid), -1, "ew"))
+        self._rows[id(action)] = parts
 
-        separator = ttk.Separator(self._grid)
-        separator.grid(row=row + 1, column=0, columnspan=len(_ACTION_COLUMNS), sticky="ew")
-        self._row_parts.append(separator)
-        self._rows[id(action)] = (row, self._row_parts)
-
-    def _refresh_row(self, action: dict) -> None:
-        """Redraws one action's row after a change — or takes it out of the list if it no longer belongs
-        under the current tab and filters — and the totals, without redrawing the whole list."""
+    def _rebuild_row(self, action: dict) -> None:
+        """After a change: rebuilds just this action's row and puts every row back in order."""
         self._flush_notes()
-        placed = self._rows.pop(id(action), None)
-        if placed is None:
-            self._render()
-            return
-        row, widgets = placed
-        for widget in widgets:
+        for widget, _column, _sticky in self._rows.pop(id(action), []):
             widget.destroy()
         self._notes = [(a, box) for a, box in self._notes if a is not action]
-        if action_tracker.matches(action, category=self._category, quick_filter=self._quick_filter,
-                                  query=self.search.value()):
-            self._render_row(action, row, datetime.now().date())
-        self._render_tabs()
-        self._render_stats()
-        self._render_list_header()
+        self._build_row(action, datetime.now().date())
+        self._layout()
 
     def _fill_title_cell(self, cell: ttk.Frame, action: dict, *, editing: bool = False) -> None:
         palette = self.app.palette
@@ -2968,10 +2999,9 @@ class ActionsPage(ttk.Frame):
         else:
             line = ttk.Frame(cell, style="Card.TFrame", borderwidth=0)
             line.pack(fill="x", anchor="w")
-            title = self._label(line, str(action.get("title") or ""), column="title", margin=42,
-                                font=self._done_font if done else self._title_font,
-                                foreground=palette.muted if done else palette.text)
-            title.pack(side="left", anchor="nw")
+            self._label(line, str(action.get("title") or ""), column="title", margin=42,
+                        font=self._done_font if done else self._title_font,
+                        foreground=palette.muted if done else palette.text).pack(side="left", anchor="nw")
             self._link(line, "✎", lambda: self._fill_title_cell(cell, action, editing=True)).pack(side="left", anchor="nw")
             more = self._link(line, "⋯", lambda: None)
             more.bind("<Button-1>", lambda _e: self._more_menu(more, action))
@@ -2998,16 +3028,8 @@ class ActionsPage(ttk.Frame):
             self._label(cell, f"Source: {where}", column="title", margin=10, font=self.app.fonts.small,
                         foreground=palette.muted).pack(anchor="w", pady=(4, 0))
 
-        notes = tk.Text(cell, height=2, width=10, wrap="word", font=self.app.fonts.small, relief="flat",
-                        borderwidth=0, highlightthickness=0, padx=2, pady=2, background=palette.surface,
-                        foreground=palette.muted, insertbackground=palette.text,
-                        selectbackground=palette.accent_soft, selectforeground=palette.text)
-        notes.insert("1.0", action.get("notes") or "")
-        notes.pack(fill="x", pady=(6, 0))
-        notes.bind("<FocusIn>", lambda _e: notes.configure(background=palette.background))
-        notes.bind("<FocusOut>", lambda _e: (notes.configure(background=palette.surface), self._flush_notes()))
-        self._notes = [(a, t) for a, t in self._notes if a is not action]
-        self._notes.append((action, notes))
+        self._notes = [(a, box) for a, box in self._notes if a is not action]
+        self._notes.append((action, self._notes_box(cell, action)))
 
         for index, entry in enumerate(action.get("log") or []):
             line = ttk.Frame(cell, style="Card.TFrame", borderwidth=0)
@@ -3020,6 +3042,63 @@ class ActionsPage(ttk.Frame):
         ttk.Button(cell, text="＋ note", style="Link.TButton", command=lambda: self._add_log_entry(action)).pack(
             anchor="w", pady=(4, 0)
         )
+
+    _NOTES_PLACEHOLDER = "Add a note…"
+    _NOTES_MAX_LINES = 8
+
+    def _notes_box(self, cell: ttk.Frame, action: dict) -> tk.Text:
+        """The action's notes, typed straight into the row. It grows with its text (to a point) rather than
+        scrolling, so the mouse wheel over it scrolls the list; changes save a moment after typing stops."""
+        palette = self.app.palette
+        box = tk.Text(cell, height=1, width=10, wrap="word", font=self._notes_font, relief="flat", borderwidth=0,
+                      highlightthickness=0, padx=2, pady=2, background=palette.surface, foreground=palette.muted,
+                      insertbackground=palette.text, selectbackground=palette.accent_soft,
+                      selectforeground=palette.text)
+        box.tag_configure("placeholder", font=self._notes_placeholder_font)
+        box.pack(fill="x", pady=(6, 0))
+        box.placeholder = False
+        self._set_notes_text(box, action.get("notes") or "")
+
+        def focus_in(_event) -> None:
+            box.configure(background=palette.background)
+            if box.placeholder:
+                box.delete("1.0", "end")
+                box.placeholder = False
+
+        def focus_out(_event) -> None:
+            box.configure(background=palette.surface)
+            self._flush_notes()
+            if not box.get("1.0", "end-1c"):
+                self._set_notes_text(box, "")
+
+        def typed(_event) -> None:
+            self._fit_notes(box)
+            self._schedule_save(1500)
+
+        box.bind("<FocusIn>", focus_in)
+        box.bind("<FocusOut>", focus_out)
+        box.bind("<KeyRelease>", typed)
+        box.bind("<MouseWheel>", lambda e: (self._scroller.scroll_with(e), "break")[1])
+        return box
+
+    def _set_notes_text(self, box: tk.Text, text: str) -> None:
+        box.delete("1.0", "end")
+        box.placeholder = not text
+        box.insert("1.0", text or self._NOTES_PLACEHOLDER, ("placeholder",) if not text else ())
+        self._fit_notes(box, estimate=True)
+
+    def _fit_notes(self, box: tk.Text, *, estimate: bool = False) -> None:
+        """Sizes a notes box to its text. Before it's on screen the wrapped line count can only be estimated
+        from the column width; after, Tk counts it."""
+        text = box.get("1.0", "end-1c")
+        if estimate or not box.winfo_ismapped():
+            per_line = max(10, (self._widths["title"] - 10) // max(1, self._notes_font.measure("abcdefghij") // 10))
+            lines = sum(max(1, -(-len(line) // per_line)) for line in text.split("\n"))
+        else:
+            lines = int(box.tk.call(box._w, "count", "-displaylines", "1.0", "end"))
+        height = min(self._NOTES_MAX_LINES, max(1, lines))
+        if int(box.cget("height")) != height:
+            box.configure(height=height)
 
     def _fill_text_cell(self, cell: ttk.Frame, action: dict, field: str, *, today=None, editing: bool = False) -> None:
         """The owner or due-date cell: its value and a ✎ to change it."""
@@ -3042,7 +3121,7 @@ class ActionsPage(ttk.Frame):
     def _inline_editor(self, cell: ttk.Frame, action: dict, field: str) -> None:
         """Swaps a cell's value for an entry: Enter (or Save) keeps the change, Esc (or Cancel) doesn't."""
         palette = self.app.palette
-        var = tk.StringVar(value=action.get(field) or ("" if field != "owner" else ""))
+        var = tk.StringVar(value=action.get(field) or "")
         self._row_vars.append(var)
         entry = ttk.Entry(cell, textvariable=var, width=4)  # as wide as the column, not wider
         entry.pack(fill="x")
@@ -3070,7 +3149,6 @@ class ActionsPage(ttk.Frame):
             if action.get(field) != value:
                 action[field] = value
                 self._changed(action, edited=True)
-                self.app.toast(f"Updated the {'due date' if field == 'due' else field} of action {action.get('id')}")
             redraw()
 
         ttk.Button(buttons, text="Save", style="Link.TButton", command=commit).pack(side="left")
@@ -3089,11 +3167,11 @@ class ActionsPage(ttk.Frame):
         button.configure(command=lambda: self._popup_choices(button, values, labels, current, on_pick))
         return button
 
-    def _menu(self) -> tk.Menu:
+    def _menu(self, parent: tk.Misc | None = None) -> tk.Menu:
         palette = self.app.palette
-        return tk.Menu(self, tearoff=0, background=palette.surface, foreground=palette.text,
+        return tk.Menu(parent or self, tearoff=0, background=palette.surface, foreground=palette.text,
                        activebackground=palette.accent_soft, activeforeground=palette.text,
-                       selectcolor=palette.accent, font=self.app.fonts.body, borderwidth=1, relief="solid")
+                       selectcolor=palette.accent, font=self.app.fonts.body)
 
     def _popup_choices(self, widget: tk.Widget, values, labels: dict, current, on_pick) -> None:
         menu = self._menu()
@@ -3111,19 +3189,35 @@ class ActionsPage(ttk.Frame):
         menu.vars = (mine, category)
         menu.add_checkbutton(label="Mine", variable=mine,
                              command=lambda: self._set_field(action, "is_mine", mine.get(), edited=True))
-        moves = tk.Menu(menu, tearoff=0, background=menu.cget("background"), foreground=menu.cget("foreground"),
-                        activebackground=menu.cget("activebackground"), activeforeground=menu.cget("activeforeground"),
-                        selectcolor=menu.cget("selectcolor"), font=self.app.fonts.body)
+        moves = self._menu(menu)
         for key in action_tracker.categories(self._loaded.data):
             moves.add_radiobutton(label=action_tracker.category_label(key), value=key, variable=category,
                                   command=lambda k=key: self._set_field(action, "category", k, edited=True))
         menu.add_cascade(label="Category", menu=moves)
         menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
 
-    def _render_add_form(self, row: int) -> None:
+    # -- adding, and the record ---------------------------------------------------------------------------
+
+    def _toggle_add(self) -> None:
+        if self._loaded is None or self._widths is None:
+            return
+        if self._add_form is not None:
+            self._close_add_form()
+            return
+        if self._category == self._RECORD:
+            self._category = None
+        self._open_add_form()
+        self._layout(scroll_to_top=True)
+        self._add_form.focus_entry()
+
+    def _close_add_form(self) -> None:
+        if self._add_form is not None:
+            self._add_form.destroy()
+            self._add_form = None
+
+    def _open_add_form(self) -> None:
         palette = self.app.palette
         form = ttk.Frame(self._grid, style="Card.TFrame", borderwidth=0, padding=(6, 12, 6, 12))
-        form.grid(row=row, column=0, columnspan=len(_ACTION_COLUMNS), sticky="ew")
         form.columnconfigure(0, weight=3)
         form.columnconfigure(1, weight=1)
         categories = action_tracker.categories(self._loaded.data)
@@ -3132,19 +3226,19 @@ class ActionsPage(ttk.Frame):
         category = tk.StringVar(value=action_tracker.category_label(default_category))
         priority = tk.StringVar(value=action_tracker.PRIORITY_LABELS["normal"])
         mine = tk.StringVar(value="Yes, mine")
-        self._row_vars.extend((title, owner, due, category, priority, mine))
+        form.vars = (title, owner, due, category, priority, mine)
 
-        def field(text: str, var: tk.StringVar, row_: int, column: int, **entry_options) -> ttk.Entry:
+        def field(text: str, var: tk.StringVar, column: int, **entry_options) -> ttk.Entry:
             box = ttk.Frame(form, style="Card.TFrame", borderwidth=0)
-            box.grid(row=row_, column=column, sticky="ew", padx=(0, 10), pady=(0, 8))
+            box.grid(row=0, column=column, sticky="ew", padx=(0, 10), pady=(0, 8))
             ttk.Label(box, text=text, style="Card.Muted.TLabel").pack(anchor="w")
             entry = ttk.Entry(box, textvariable=var, **entry_options)
             entry.pack(fill="x")
             return entry
 
-        title_entry = field("Action", title, 0, 0, width=10)
-        field("Owner", owner, 0, 1, width=16)
-        field("Due (YYYY-MM-DD)", due, 0, 2, width=14)
+        title_entry = field("Action", title, 0, width=10)
+        field("Owner", owner, 1, width=16)
+        field("Due (YYYY-MM-DD)", due, 2, width=14)
         second = ttk.Frame(form, style="Card.TFrame", borderwidth=0)
         second.grid(row=1, column=0, columnspan=3, sticky="w")
         for text, var, values, width in (
@@ -3175,26 +3269,28 @@ class ActionsPage(ttk.Frame):
             action["priority"] = {v: k for k, v in action_tracker.PRIORITY_LABELS.items()}[priority.get()]
             action["is_mine"] = mine.get() == "Yes, mine"
             self._loaded.actions.append(action)
-            self._adding = False
+            self._close_add_form()
             self._changed(action)
-            self._render()
+            self._build_row(action, datetime.now().date())
+            self._layout()
             self.app.toast(f"Added action {action['id']}")
 
         ttk.Button(second, text="Add action", style="Accent.TButton", command=add).pack(side="left", padx=(6, 6), pady=(16, 0))
-        ttk.Button(second, text="Cancel", command=self._toggle_add).pack(side="left", pady=(16, 0))
-        hint = self._label(form, "Actions added here are marked “Added here” and saved into the list with the rest.",
-                           column="all", margin=40, font=self.app.fonts.small, foreground=palette.muted)
-        hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Button(second, text="Cancel", command=lambda: (self._close_add_form(), self._layout())).pack(
+            side="left", pady=(16, 0)
+        )
+        self._label(form, "Actions added here are marked “Added here” and saved into the list with the rest.",
+                    font=self.app.fonts.small, foreground=palette.muted).grid(row=2, column=0, columnspan=3,
+                                                                             sticky="w", pady=(8, 0))
         title_entry.bind("<Return>", lambda _e: add())
-        title_entry.focus_set()
         ttk.Separator(form).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        form.focus_entry = title_entry.focus_set
+        self._add_form = form
 
-    def _render_record(self) -> None:
+    def _build_record(self) -> ttk.Frame:
         """Decisions recorded this week, items closed this week and the known gaps in the list, as cards."""
         palette = self.app.palette
-        self._list_title.configure(text="Decisions, closed & gaps")
-        self._list_count.configure(text="")
-        self._banner.pack_forget()
+        frame = self._frame()
         data = self._loaded.data
         sections = (
             ("Decisions recorded this week", [
@@ -3207,17 +3303,15 @@ class ActionsPage(ttk.Frame):
             ]),
             ("Gaps in this list", [(None, str(g), "") for g in data.get("gaps") or []]),
         )
-        row = 0
         for heading, items in sections:
-            top = ttk.Frame(self._grid, style="Card.TFrame", borderwidth=0)
-            top.grid(row=row, column=0, columnspan=len(_ACTION_COLUMNS), sticky="ew", pady=(16, 6), padx=6)
+            top = ttk.Frame(frame, style="Card.TFrame", borderwidth=0)
+            top.pack(fill="x", pady=(16, 6), padx=6)
             self._label(top, heading, font=self.app.fonts.title).pack(side="left")
             self._label(top, str(len(items)), foreground=palette.muted).pack(side="right")
-            ttk.Separator(self._grid).grid(row=row + 1, column=0, columnspan=len(_ACTION_COLUMNS), sticky="ew")
-            row += 2
+            ttk.Separator(frame).pack(fill="x")
             for bold, text, source in items:
-                box = ttk.Frame(self._grid, style="Card.TFrame", borderwidth=0)
-                box.grid(row=row, column=0, columnspan=len(_ACTION_COLUMNS), sticky="ew", pady=(8, 8), padx=6)
+                box = ttk.Frame(frame, style="Card.TFrame", borderwidth=0)
+                box.pack(fill="x", pady=8, padx=6)
                 if bold:
                     self._label(box, str(bold), column="all", margin=40, font=self._title_font).pack(anchor="w")
                 if text:
@@ -3225,18 +3319,15 @@ class ActionsPage(ttk.Frame):
                                 foreground=palette.text if bold is None else palette.muted).pack(anchor="w", pady=(2, 0))
                 if source:
                     self._label(box, source, font=self.app.fonts.small, foreground=palette.muted).pack(anchor="w", pady=(2, 0))
-                row += 1
             if not items:
-                self._label(self._grid, "None recorded.", foreground=palette.muted).grid(
-                    row=row, column=0, columnspan=len(_ACTION_COLUMNS), sticky="w", padx=6, pady=8
-                )
-                row += 1
+                self._label(frame, "None recorded.", foreground=palette.muted).pack(anchor="w", padx=6, pady=8)
+        return frame
 
     # -- changing actions -------------------------------------------------------------------------------
 
     def _changed(self, action: dict, *, edited: bool = False) -> None:
-        """Marks an action as changed here — which a later merge onto a newer list relies on — and the list
-        as unsaved."""
+        """Marks an action as changed here — which a merge onto a newer list relies on — and saves the list
+        a moment later."""
         action["touched"] = True
         if edited:
             action["edited"] = True
@@ -3244,11 +3335,14 @@ class ActionsPage(ttk.Frame):
         if not self._dirty:
             self._dirty = True
             self._show_file_status()
+        self._schedule_save()
 
     def _flush_notes(self) -> None:
         """Copies any notes typed into the list onto their actions."""
         for action, box in self._notes:
             try:
+                if box.placeholder:
+                    continue
                 text = box.get("1.0", "end-1c")
             except tk.TclError:
                 continue  # already gone
@@ -3261,19 +3355,11 @@ class ActionsPage(ttk.Frame):
             return
         action[field] = value
         self._changed(action, edited=edited)
-        self._refresh_row(action)
+        self._rebuild_row(action)
 
     def _set_done(self, action: dict, done: bool) -> None:
         self._set_field(action, "status", "closed" if done else "open")
         self.app.toast(f"Action {action.get('id')} {'marked done' if done else 'reopened'}")
-
-    def _toggle_add(self) -> None:
-        if self._loaded is None:
-            return
-        self._adding = not self._adding
-        if self._adding and self._category == self._RECORD:
-            self._category = None
-        self._render(keep_scroll=not self._adding)
 
     def _add_log_entry(self, action: dict) -> None:
         text = simpledialog.askstring(APP_NAME, f"Add a short note to action {action.get('id')}:", parent=self)
@@ -3281,13 +3367,12 @@ class ActionsPage(ttk.Frame):
             return
         action.setdefault("log", []).append({"date": datetime.now().date().isoformat(), "text": text.strip()})
         self._changed(action)
-        self._refresh_row(action)
-        self.app.toast(f"Note added to action {action.get('id')}")
+        self._rebuild_row(action)
 
     def _remove_log_entry(self, action: dict, index: int) -> None:
         del action["log"][index]
         self._changed(action)
-        self._refresh_row(action)
+        self._rebuild_row(action)
 
     # -- file actions ---------------------------------------------------------------------------------------
 

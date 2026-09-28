@@ -91,8 +91,8 @@ Windows' light/dark app setting.
   Flagged / Blocked / Not done** filters and a search box, and a row per action with its tags (Mine, Flagged,
   In progress, Blocked, Done), notes you can type into, its dated note log, and status and priority dropdowns.
   Tick an action off with its checkbox; ✎ corrects its title, owner or due date, and ⋯ changes whose it is
-  or moves it to another category. **+ Add action** opens a form at the top of the list. **Save** writes the
-  list back; **Export CSV…** exports it. The decisions, items closed this week and gaps the weekly run
+  or moves it to another category. **+ Add action** opens a form at the top of the list. Every change is
+  saved back to the file a moment later — there's no Save button; **Export CSV…** exports the list. The decisions, items closed this week and gaps the weekly run
   records have a tab of their own. In a narrow window, each action's source moves under its title.
 - **Pushes each finished meeting to Copilot Studio** as a named file package dropped into a folder
   OneDrive/SharePoint is already syncing (see "The Copilot push" below). The app doesn't call an AI API
@@ -319,16 +319,19 @@ A separate weekly run keeps one action list per project, in the same project fol
 ```
 
 `action_tracker.py` looks one folder down from the sync folder for these (so the Inbox, which has none, is
-skipped). If OneDrive left a conflict copy (`… - Actions-DESKTOP-AB12.json`, `… - Actions (1).json`) instead
-of the real file, the newest copy is used and the page says so; a deliberately separate file named
-`… - Actions - <something>.json` is not.
+skipped) — there's nothing to link or pick. If the sync folder in Settings is the Inbox itself or one of the
+project folders, it looks in the folder above instead; if no sync folder is set, it looks for a
+`Meeting minutes` folder with an Inbox in it under OneDrive's Documents. If OneDrive left a conflict copy
+(`… - Actions-DESKTOP-AB12.json`, `… - Actions (1).json`) instead of the real file, the newest copy is used and
+the page says so; a deliberately separate file named `… - Actions - <something>.json` is not.
 
-The file stays the single source of truth, and the weekly run rewrites it, so a save never writes over a
-version the page didn't load: it re-reads the file first, and if it has changed, nothing is written and the
-page offers to take the new list and reapply the changes made since it was loaded (recommended), take the
-new list and drop them, or overwrite it. Every 30 seconds while the page is open it also checks whether the
-file has changed, loading the new version straight away when there are no unsaved changes. Changing
-project or closing the app with unsaved changes asks to save first.
+The file stays the single source of truth, and the weekly run rewrites it, so each save re-reads the file
+first. If it has changed since the page loaded it, the actions changed on the page since then are reapplied
+onto the newer list and that is saved instead (`action_tracker.save_merging`), so neither side's changes are
+lost; the page then shows the merged list. A save that fails — OneDrive busy, the file open elsewhere — is
+retried every ten seconds, and the status line says so. Every 30 seconds while the page is open it also
+checks whether the file has changed, loading the new version when it has. Changing project or closing the
+app saves anything still pending first.
 
 The format is the one the browser action tracker (`<Project> - Action tracker.html`) uses, so both can be
 used on the same file: a changed action is marked `touched`, one whose title, owner, due date, category or
