@@ -298,3 +298,13 @@ def test_language_label_and_code_round_trip():
 def test_language_label_shows_english_for_a_code_not_offered():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     assert gui_app._language_label("xx") == "English"
+
+
+def test_action_columns_share_a_wide_list_and_fold_the_source_column_away_when_narrow():
+    gui_app = pytest.importorskip("meeting_scribe.gui.app")
+    wide = gui_app._action_column_widths(1400)
+    assert wide["source"] > 0 and wide["title"] > wide["owner"]
+    assert sum(wide.values()) + gui_app._ACTION_COLUMN_GAP * len(wide) <= 1400
+    narrow = gui_app._action_column_widths(800)
+    assert narrow["source"] == 0
+    assert narrow["title"] >= gui_app._ACTION_COLUMN_MINIMUMS["title"]

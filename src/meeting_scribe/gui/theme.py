@@ -428,3 +428,28 @@ def style_text(widget: tk.Text, palette: Palette, font, *, surface: str | None =
         spacing1=2,
         spacing3=2,
     )
+
+
+# Background and text colours of the small tags on the Actions page ("MINE", "FLAGGED", "DONE", …), the same
+# as the browser action tracker's.
+_BADGES_LIGHT = {
+    "mine": ("#EEF2FF", "#3730A3"),
+    "flagged": ("#FEF3C7", "#92400E"),
+    "blocked": ("#FEE2E2", "#991B1B"),
+    "done": ("#DCFCE7", "#166534"),
+    "in_progress": ("#E0F2FE", "#075985"),
+    "neutral": ("#F1F3EE", "#5C6B5C"),
+}
+_BADGES_DARK = {
+    "mine": ("#1E1B4B", "#C7D2FE"),
+    "flagged": ("#422006", "#FCD34D"),
+    "blocked": ("#3B1D1D", "#FCA5A5"),
+    "done": ("#052E16", "#86EFAC"),
+    "in_progress": ("#0C2A3E", "#7DD3FC"),
+    "neutral": ("#33363B", "#B9C0B9"),
+}
+
+
+def badge_colours(palette: Palette) -> dict[str, tuple[str, str]]:
+    """{badge kind: (background, foreground)} for this palette."""
+    return _BADGES_DARK if palette.dark else _BADGES_LIGHT

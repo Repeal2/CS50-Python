@@ -86,12 +86,14 @@ Windows' light/dark app setting.
   the meeting, its recording and its attached documents from this PC after asking. A meeting whose transcription didn't
   finish keeps its recording and offers **Retry**.
 - **Tracks each project's actions.** The Actions page opens the `<Project> - Actions.json` list kept in each
-  project folder under the sync folder (see "Action lists" below) — pick the project at the top. Actions are
-  grouped by category, with **All / Mine / Flagged / Blocked / Not done** filters and a search box; tick one
-  off with a click on its ☐ (or Space), change its status, priority, owner, due date or category, edit its
-  notes, add dated notes to its log, and **+ Add action** for new ones. **Save** writes the list back;
-  **Export CSV…** exports it. The decisions, items closed this week and gaps the weekly run records show
-  under **Decisions, closed & gaps**.
+  project folder under the sync folder (see "Action lists" below) — pick the project at the top. It's laid
+  out like the browser action tracker: a tab per category with how many actions it holds, **All / Mine /
+  Flagged / Blocked / Not done** filters and a search box, and a row per action with its tags (Mine, Flagged,
+  In progress, Blocked, Done), notes you can type into, its dated note log, and status and priority dropdowns.
+  Tick an action off with its checkbox; ✎ corrects its title, owner or due date, and ⋯ changes whose it is
+  or moves it to another category. **+ Add action** opens a form at the top of the list. **Save** writes the
+  list back; **Export CSV…** exports it. The decisions, items closed this week and gaps the weekly run
+  records have a tab of their own. In a narrow window, each action's source moves under its title.
 - **Pushes each finished meeting to Copilot Studio** as a named file package dropped into a folder
   OneDrive/SharePoint is already syncing (see "The Copilot push" below). The app doesn't call an AI API
   and doesn't wait for anything back.
