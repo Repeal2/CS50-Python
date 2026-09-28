@@ -20,7 +20,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
-from meeting_scribe import __version__
+from meeting_scribe import __version__, action_tracker
 from meeting_scribe.ai.minutes_import import MinutesImporter
 from meeting_scribe.audio.device_watch import device_signature
 from meeting_scribe.config import (
@@ -510,6 +510,7 @@ class MeetingScribeApp(tk.Tk):
     _NAV_LABELS = {
         "record": "●   Record",
         "library": "▤   Library",
+        "actions": "☑   Actions",
         "transcriptions": "⟳   Transcriptions",
         "settings": "⚙   Settings",
     }
@@ -578,11 +579,13 @@ class MeetingScribeApp(tk.Tk):
 
         self.record_page = RecordPage(self._content, self)
         self.library_page = LibraryPage(self._content, self)
+        self.actions_page = ActionsPage(self._content, self)
         self.transcriptions_page = TranscriptionsPage(self._content, self)
         self.settings_page = SettingsPage(self._content, self)
         self._pages = {
             "record": self.record_page,
             "library": self.library_page,
+            "actions": self.actions_page,
             "transcriptions": self.transcriptions_page,
             "settings": self.settings_page,
         }
@@ -611,6 +614,8 @@ class MeetingScribeApp(tk.Tk):
             self._nav_buttons[name].configure(style="NavActive.TButton" if name == key else "Nav.TButton")
         if key == "library":
             self.library_page.on_show(focus_search=focus_search)
+        elif key == "actions":
+            self.actions_page.on_show()
         elif key == "transcriptions":
             self.transcriptions_page.on_show()
 
@@ -983,6 +988,8 @@ class MeetingScribeApp(tk.Tk):
                 )
             if not messagebox.askyesno(APP_NAME, message, icon="warning", parent=self):
                 return
+        if not self.actions_page.confirm_discard_changes():
+            return
         if self._hotkey_listener is not None:
             self._hotkey_listener.stop()
         if session is not None:
@@ -2248,6 +2255,816 @@ class LibraryPage(ttk.Frame):
             self._banner_label.configure(text=_UNFINISHED_MEETING_NOTICE)
             self.retry_button.configure(state="normal")
         messagebox.showerror(APP_NAME, f'Couldn\'t retry "{meeting_title}": {exc}')
+
+
+# --- Actions --------------------------------------------------------------------------------------
+
+
+class ActionsPage(ttk.Frame):
+    """Each project's action list — the "<Project> - Actions.json" the weekly run keeps in the project's
+    folder under the sync folder — to tick off, re-prioritise, annotate and add to, then save back. See
+    action_tracker.py for how a save avoids writing over the weekly run's changes."""
+
+    _POLL_MS = 30_000  # how often to notice the file changing under the page
+    _ALL_ITEM = "cat:all"
+    _RECORD_ITEM = "cat:record"
+    _FILTER_LABELS = {"all": "All", "mine": "Mine", "flagged": "Flagged", "blocked": "Blocked", "open": "Not done"}
+    _NO_FOLDER_TEXT = (
+        "Action lists live in the project folders under the Copilot sync folder, as “<Project> - Actions.json”. "
+        "Choose the sync folder in Settings to see them here."
+    )
+    _NO_LISTS_TEXT = "No project folder under {root} has an action list (“<Project> - Actions.json”) yet."
+
+    def __init__(self, parent: tk.Misc, app: MeetingScribeApp):
+        super().__init__(parent, padding=(28, 24))
+        self.app = app
+        palette = app.palette
+        self._files: dict[str, action_tracker.ActionsFile] = {}  # project folder -> its list
+        self._file: action_tracker.ActionsFile | None = None
+        self._loaded: action_tracker.LoadedActions | None = None
+        self._conflict: action_tracker.LoadedActions | None = None
+        self._dirty = False
+        self._changed_ids: set = set()  # actions changed since the list was loaded — what a merge carries over
+        self._category: str | None = None  # None: every category
+        self._showing_record = False
+        self._quick_filter = "all"
+        self._rows: dict[str, dict] = {}  # tree item -> action
+        self._current: dict | None = None  # the action in the editor
+        self._editor_loaded_for: dict | None = None
+        self._loading_editor = False
+        self._scan_running = False
+        self._search_after_id: str | None = None
+
+        header = ttk.Frame(self)
+        header.pack(fill="x", pady=(0, 12))
+        ttk.Label(header, text="Actions", style="Heading.TLabel").pack(side="left")
+        self.project_var = tk.StringVar()
+        self.project_combo = ttk.Combobox(header, textvariable=self.project_var, state="readonly", width=30)
+        self.project_combo.pack(side="left", padx=(18, 0))
+        self.project_combo.bind("<<ComboboxSelected>>", self._on_project_chosen)
+        self.search = _PlaceholderEntry(header, "Search actions, owners, notes…", width=34)
+        self.search.pack(side="right")
+        self.search.var.trace_add("write", self._on_search_changed)
+        self.search.bind("<Escape>", lambda _e: self.search.var.set(""))
+
+        # Which file, whether it's saved, and what can be done with it.
+        status_card, status = _card(self, padding=(14, 8, 8, 8))
+        status_card.pack(fill="x")
+        self.save_button = ttk.Button(status, text="Save", style="Accent.TButton", command=self.save, state="disabled")
+        self.save_button.pack(side="right", padx=(8, 0))
+        self._file_buttons = []
+        for text, command in (
+            ("Export CSV…", self._export_csv),
+            ("Open folder", self._open_folder),
+            ("Reload", self._reload),
+        ):
+            button = ttk.Button(status, text=text, style="Link.TButton", command=command, state="disabled")
+            button.pack(side="right", padx=(4, 0))
+            self._file_buttons.append(button)
+        self._status_label = ttk.Label(status, style="Card.Muted.TLabel", justify="left")
+        self._status_label.pack(side="left", fill="x", expand=True)
+        _wrap_to_width(self._status_label, status, margin=420)
+
+        # Shown when the file changed under unsaved changes: how to combine them.
+        self._conflict_bar = ttk.Frame(self, style="Card.TFrame", padding=(14, 8))
+        self._conflict_label = ttk.Label(self._conflict_bar, style="Banner.TLabel", justify="left")
+        self._conflict_label.pack(fill="x")
+        _wrap_to_width(self._conflict_label, self._conflict_bar, margin=40)
+        conflict_buttons = ttk.Frame(self._conflict_bar, style="Card.TFrame", borderwidth=0)
+        conflict_buttons.pack(fill="x", pady=(8, 0))
+        for text, style, mode in (
+            ("Take the new list, keep my changes", "Accent.TButton", "merge"),
+            ("Take the new list, drop mine", "TButton", "theirs"),
+            ("Overwrite with mine…", "Danger.TButton", "mine"),
+        ):
+            ttk.Button(conflict_buttons, text=text, style=style, command=lambda m=mode: self._resolve_conflict(m)).pack(
+                side="left", padx=(0, 8)
+            )
+
+        filters = self._filters_row = ttk.Frame(self)
+        filters.pack(fill="x", pady=(12, 8))
+        self._filter_buttons: dict[str, ttk.Button] = {}
+        for key, label in self._FILTER_LABELS.items():
+            button = ttk.Button(filters, text=label, command=lambda k=key: self._set_filter(k))
+            button.pack(side="left", padx=(0, 6))
+            self._filter_buttons[key] = button
+        self._add_button = ttk.Button(filters, text="+ Add action", style="Accent.TButton", command=self._add_action,
+                                      state="disabled")
+        self._add_button.pack(side="left", padx=(10, 0))
+        self._summary_label = ttk.Label(filters, style="Muted.TLabel")
+        self._summary_label.pack(side="right")
+
+        self._empty = ttk.Label(self, style="Muted.TLabel", justify="left")
+        _wrap_to_width(self._empty, self, margin=60)
+
+        panes = self._panes = ttk.PanedWindow(self, orient="horizontal")
+
+        # Left: categories, with how many of each show under the current filter.
+        side_card, side = _card(panes, padding=0)
+        panes.add(side_card, weight=1)
+        ttk.Label(side, text="Categories", style="Card.Title.TLabel", padding=(14, 10, 8, 4)).pack(fill="x")
+        self.category_tree = ttk.Treeview(side, columns=("count",), show="tree", selectmode="browse")
+        self.category_tree.column("#0", width=190, stretch=True)
+        self.category_tree.column("count", width=40, stretch=False, anchor="e")
+        self.category_tree.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.category_tree.bind("<<TreeviewSelect>>", self._on_category_selected)
+
+        # Right: the actions over the selected one's details.
+        main_card, main = _card(panes, padding=0)
+        panes.add(main_card, weight=4)
+        self._list_title = ttk.Label(main, style="Card.Title.TLabel", padding=(14, 10, 8, 0))
+        self._list_title.pack(fill="x")
+        self._banner_label = ttk.Label(main, style="Card.Muted.TLabel", padding=(14, 2, 8, 6), justify="left")
+        self._banner_label.pack(fill="x")
+        _wrap_to_width(self._banner_label, main, margin=40)
+
+        self._split = ttk.PanedWindow(main, orient="vertical")
+        self._split.pack(fill="both", expand=True)
+        tree_frame = ttk.Frame(self._split, style="Card.TFrame", borderwidth=0)
+        self._split.add(tree_frame, weight=3)
+        self._tree_frame = tree_frame
+        self.tree = self._build_action_tree(tree_frame, palette)
+
+        self._record_frame, self._record_text = _scrolled_text(
+            self._split, palette, app.fonts.body, state="disabled"
+        )
+
+        self._editor = self._build_editor(self._split)
+        self._split.add(self._editor, weight=2)
+
+        self.after(self._POLL_MS, self._poll)
+        self._show_state()
+
+    # -- building -----------------------------------------------------------------------------------
+
+    def _build_action_tree(self, frame: ttk.Frame, palette: Palette) -> ttk.Treeview:
+        tree = ttk.Treeview(
+            frame, columns=("done", "id", "title", "owner", "status", "priority", "due"),
+            show="headings", selectmode="browse", height=6,
+        )
+        for column, heading, width, stretch, anchor in (
+            ("done", "", 30, False, "center"),
+            ("id", "#", 40, False, "e"),
+            ("title", "Action", 240, True, "w"),
+            ("owner", "Owner", 120, True, "w"),
+            ("status", "Status", 86, False, "w"),
+            ("priority", "Priority", 66, False, "w"),
+            ("due", "Due", 84, False, "w"),
+        ):
+            tree.heading(column, text=heading, anchor=anchor if anchor != "e" else "w")
+            tree.column(column, width=width, stretch=stretch, anchor=anchor)
+        tree.tag_configure("done", foreground=palette.muted)
+        tree.tag_configure("blocked", foreground=palette.danger)
+        tree.tag_configure("flagged", font=self.app.fonts.strong)
+        tree.tag_configure("due_soon", foreground=palette.danger)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        tree.bind("<<TreeviewSelect>>", self._on_action_selected)
+        tree.bind("<space>", lambda _e: self._toggle_done())
+        tree.bind("<Button-1>", self._on_tree_click, add="+")
+        return tree
+
+    def _build_editor(self, parent: tk.Misc) -> ttk.Frame:
+        palette, fonts = self.app.palette, self.app.fonts
+        editor = ttk.Frame(parent, style="Card.TFrame", borderwidth=0, padding=(14, 10, 12, 10))
+        editor.columnconfigure(1, weight=2)  # owner and status; priority and due keep their width
+        editor.columnconfigure(5, weight=1)
+
+        self._editor_heading = ttk.Label(editor, style="Card.Title.TLabel")
+        self._editor_heading.grid(row=0, column=0, columnspan=6, sticky="w")
+
+        self.title_var = tk.StringVar()
+        self.owner_var = tk.StringVar()
+        self.due_var = tk.StringVar()
+        self.status_var = tk.StringVar()
+        self.priority_var = tk.StringVar()
+        self.category_var = tk.StringVar()
+        self.mine_var = tk.BooleanVar()
+
+        def field(text: str, row: int, column: int, widget: tk.Widget, span: int = 1) -> tk.Widget:
+            ttk.Label(editor, text=text, style="Card.TLabel").grid(
+                row=row, column=column, sticky="w", padx=(0 if column == 0 else 14, 8), pady=(8, 0)
+            )
+            widget.grid(row=row, column=column + 1, columnspan=span, sticky="we", pady=(8, 0))
+            return widget
+
+        self._title_entry = field("Action", 1, 0, ttk.Entry(editor, textvariable=self.title_var), span=5)
+        owner = field("Owner", 2, 0, ttk.Entry(editor, textvariable=self.owner_var))
+        due = field("Due", 2, 2, ttk.Entry(editor, textvariable=self.due_var, width=12))
+        for entry in (self._title_entry, owner, due):
+            entry.bind("<Return>", lambda _e: self._commit_editor())
+            entry.bind("<FocusOut>", lambda _e: self._commit_editor())
+        ttk.Checkbutton(editor, text="Mine", variable=self.mine_var, style="Card.TCheckbutton",
+                        command=self._commit_editor).grid(row=2, column=4, columnspan=2, sticky="w", padx=(14, 0), pady=(8, 0))
+        status = field("Status", 3, 0, ttk.Combobox(
+            editor, textvariable=self.status_var, state="readonly", width=11,
+            values=[action_tracker.STATUS_LABELS[s] for s in action_tracker.STATUSES],
+        ))
+        priority = field("Priority", 3, 2, ttk.Combobox(
+            editor, textvariable=self.priority_var, state="readonly", width=9,
+            values=[action_tracker.PRIORITY_LABELS[p] for p in action_tracker.PRIORITIES],
+        ))
+        self._category_combo = field("Category", 3, 4, ttk.Combobox(
+            editor, textvariable=self.category_var, state="readonly", width=18
+        ))
+        for combo in (status, priority, self._category_combo):
+            combo.bind("<<ComboboxSelected>>", lambda _e: self._commit_editor())
+
+        # Notes beside the dated note log.
+        ttk.Label(editor, text="Notes", style="Card.TLabel").grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 2))
+        log_header = ttk.Frame(editor, style="Card.TFrame", borderwidth=0)
+        log_header.grid(row=4, column=2, columnspan=4, sticky="we", padx=(14, 0), pady=(10, 2))
+        ttk.Label(log_header, text="Note log", style="Card.TLabel").pack(side="left")
+        ttk.Button(log_header, text="Remove", style="Link.TButton", command=self._remove_log_entry).pack(side="right")
+        ttk.Button(log_header, text="+ Dated note", style="Link.TButton", command=self._add_log_entry).pack(side="right")
+        notes_frame, self.notes_text = _scrolled_text(editor, palette, fonts.body, height=3, width=30)
+        notes_frame.grid(row=5, column=0, columnspan=2, sticky="nsew")
+        self.notes_text.bind("<FocusOut>", lambda _e: self._commit_editor())
+        log_frame = ttk.Frame(editor, style="Card.TFrame", borderwidth=0)
+        log_frame.grid(row=5, column=2, columnspan=4, sticky="nsew", padx=(14, 0))
+        self.log_tree = ttk.Treeview(log_frame, columns=("text",), show="tree", selectmode="browse", height=3)
+        self.log_tree.column("#0", width=110, stretch=False)  # the date
+        self.log_tree.column("text", width=260, stretch=True)
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_tree.yview)
+        self.log_tree.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side="right", fill="y")
+        self.log_tree.pack(side="left", fill="both", expand=True)
+        editor.rowconfigure(5, weight=1)
+
+        self._source_label = ttk.Label(editor, style="Card.Muted.TLabel", justify="left")
+        self._source_label.grid(row=6, column=0, columnspan=6, sticky="we", pady=(8, 0))
+        _wrap_to_width(self._source_label, editor, margin=40)
+        self._editor_widgets = [self._title_entry, owner, due, status, priority, self._category_combo, self.notes_text]
+        return editor
+
+    # -- finding and loading the lists ----------------------------------------------------------------
+
+    def on_show(self) -> None:
+        self.refresh_projects()
+        self._check_file_changed()
+
+    def refresh_projects(self) -> None:
+        """Looks for the project folders' action lists, on a background thread since they're on OneDrive."""
+        root = self.app.settings.copilot_sync_dir
+        if root is None:
+            self._files = {}
+            self.project_combo["values"] = ()
+            self._show_state()
+            return
+        if self._scan_running:
+            return
+        self._scan_running = True
+
+        def worker() -> None:
+            found = action_tracker.find_action_files(root)
+            try:
+                self.after(0, self._on_projects_found, found)
+            except (RuntimeError, tk.TclError):
+                pass  # the window closed while looking
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_projects_found(self, found: "list[action_tracker.ActionsFile]") -> None:
+        self._scan_running = False
+        self._files = {f.project: f for f in found}
+        self.project_combo["values"] = list(self._files)
+        if self._file is not None and self._file.project in self._files:
+            if self._files[self._file.project].path != self._file.path and not self._dirty:
+                self._open(self._files[self._file.project])  # a conflict copy was renamed back, say
+            return
+        if self._file is None and self._files:
+            recording = self.app.record_page.project_var.get().strip().casefold()
+            preferred = next((name for name in self._files if name.casefold() == recording), next(iter(self._files)))
+            self._open(self._files[preferred])
+        else:
+            self._show_state()
+
+    def _on_project_chosen(self, _event=None) -> None:
+        chosen = self._files.get(self.project_var.get())
+        if chosen is None or (self._file is not None and chosen.path == self._file.path):
+            return
+        if not self.confirm_discard_changes():
+            self.project_var.set(self._file.project if self._file else "")
+            return
+        self._open(chosen)
+
+    def _open(self, actions_file: "action_tracker.ActionsFile") -> None:
+        try:
+            loaded = action_tracker.read_action_list(actions_file.path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't read {actions_file.path.name}: {exc}")
+            return
+        self._file = actions_file
+        self.project_var.set(actions_file.project)
+        self._set_loaded(loaded, dirty=False)
+
+    def _set_loaded(self, loaded: "action_tracker.LoadedActions", *, dirty: bool) -> None:
+        self._loaded = loaded
+        self._conflict = None
+        self._dirty = dirty
+        if not dirty:
+            self._changed_ids = set()
+        self._current = None
+        categories = action_tracker.categories(loaded.data)
+        if self._category is not None and self._category not in categories:
+            self._category = None
+        self._category_combo["values"] = [action_tracker.category_label(c) for c in categories]
+        self._show_state()
+
+    def _reload(self) -> None:
+        if self._file is None or not self.confirm_discard_changes():
+            return
+        self._open(self._file)
+        self.app.toast(f"Reloaded {self._file.path.name}")
+
+    def _poll(self) -> None:
+        try:
+            if self.winfo_ismapped():
+                self._check_file_changed()
+        finally:
+            self.after(self._POLL_MS, self._poll)
+
+    def _check_file_changed(self) -> None:
+        """Picks up a list the weekly run (or the browser tracker) rewrote while this page had it open — or,
+        with unsaved changes here, asks how to combine them."""
+        if self._file is None or self._loaded is None or self._conflict is not None:
+            return
+        try:
+            if action_tracker.file_digest(self._file.path) == self._loaded.digest:
+                return
+            fresh = action_tracker.read_action_list(self._file.path)
+        except (OSError, ValueError):
+            return  # mid-sync; try again next time
+        if self._dirty:
+            self._conflict = fresh
+            self._show_state()
+        else:
+            self._commit_editor()
+            self._set_loaded(fresh, dirty=False)
+            self.app.toast("Picked up a newer action list")
+
+    # -- saving ---------------------------------------------------------------------------------------
+
+    def save(self) -> bool:
+        """Writes the list back to its file — unless the file changed since it was loaded, in which case
+        nothing is written and the page asks how to combine the two. True if it saved."""
+        if self._file is None or self._loaded is None:
+            return False
+        self._commit_editor()
+        try:
+            self._loaded = action_tracker.save_action_list(self._file.path, self._loaded)
+        except action_tracker.ActionsConflict as conflict:
+            self._conflict = conflict.fresh
+            self._show_state()
+            return False
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't save {self._file.path.name}: {exc}")
+            return False
+        self._dirty = False
+        self._changed_ids = set()
+        self._show_state()
+        self.app.toast(f"Saved {self._file.path.name}")
+        return True
+
+    def _resolve_conflict(self, mode: str) -> None:
+        fresh, loaded = self._conflict, self._loaded
+        if fresh is None or loaded is None:
+            return
+        self._commit_editor()
+        selected = self._current.get("id") if self._current is not None else None
+        if mode == "merge":
+            merged, carried = action_tracker.merge_local_onto(fresh, loaded.actions, self._changed_ids)
+            self._set_loaded(merged, dirty=True)
+            self.app.toast(f"Loaded the newer list and kept {carried} of your change{'' if carried == 1 else 's'} — "
+                           "press Save")
+        elif mode == "theirs":
+            self._set_loaded(fresh, dirty=False)
+            self.app.toast("Loaded the newer list; your changes were dropped")
+        else:
+            if not messagebox.askyesno(
+                APP_NAME,
+                "Overwrite the file with what's on screen? Anything the weekly run added since you opened it "
+                "will be lost.", icon="warning", default="no", parent=self,
+            ):
+                return
+            self._loaded = action_tracker.LoadedActions(loaded.data, fresh.digest)
+            self._conflict = None
+            self.save()
+        self._select_action_id(selected)
+
+    def confirm_discard_changes(self) -> bool:
+        """Before the list on screen is replaced (or the app closes): offers to save unsaved changes.
+        False means stay put."""
+        if not self._dirty:
+            return True
+        self._commit_editor()
+        answer = messagebox.askyesnocancel(
+            APP_NAME, f"Save your changes to {self._file.path.name} first?", parent=self
+        )
+        if answer is None:
+            return False
+        return self.save() if answer else True
+
+    # -- the list ---------------------------------------------------------------------------------------
+
+    def _show_state(self) -> None:
+        """Brings every part of the page in line with the loaded list, filters and selection."""
+        loaded = self._loaded
+        for widget in (self._empty, self._panes, self._conflict_bar):
+            widget.pack_forget()
+        has_list = loaded is not None and self._file is not None
+        for button in self._file_buttons:
+            button.configure(state="normal" if has_list else "disabled")
+        self._add_button.configure(state="normal" if has_list else "disabled")
+        self.save_button.configure(text="Save •" if self._dirty else "Save",
+                                   state="normal" if has_list and self._conflict is None else "disabled")
+        for key, button in self._filter_buttons.items():
+            button.configure(style="Accent.TButton" if key == self._quick_filter else "TButton")
+        self._show_status()
+        if not has_list:
+            root = self.app.settings.copilot_sync_dir
+            self._empty.configure(text=self._NO_FOLDER_TEXT if root is None else self._NO_LISTS_TEXT.format(root=root))
+            self._empty.pack(fill="x", pady=(12, 0))
+            self._summary_label.configure(text="")
+            return
+        if self._conflict is not None:
+            self._show_conflict()
+            self._conflict_bar.pack(fill="x", pady=(8, 0), before=self._filters_row)
+        self._panes.pack(fill="both", expand=True)
+        self._refresh_categories()
+        self._refresh_actions()
+        self._refresh_summary()
+
+    def _show_status(self) -> None:
+        if self._file is None or self._loaded is None:
+            self._status_label.configure(text="No action list open.")
+            return
+        stamp = action_tracker.last_saved(self._loaded.data)
+        parts = [f"{self._file.path.name} in the {self._file.project} folder"]
+        if stamp:
+            parts.append(f"list saved {str(stamp).replace('T', ' ')[:16]}")
+        parts.append("unsaved changes — press Save" if self._dirty else "up to date")
+        text = "   ·   ".join(parts)
+        if self._file.conflict_copy:
+            text += (f"\nThis is a OneDrive conflict copy — there's no “{self._file.project}{action_tracker.ACTIONS_SUFFIX}” "
+                     "in the folder. Worth renaming it back.")
+        self._status_label.configure(text=text, style="Card.Danger.TLabel" if self._dirty else "Card.Muted.TLabel")
+
+    def _show_conflict(self) -> None:
+        fresh = self._conflict
+        changed = len(self._changed_ids)
+        generated = (fresh.data.get("list") or {}).get("generated") if isinstance(fresh.data.get("list"), dict) else None
+        self._conflict_label.configure(text=(
+            f"{self._file.path.name} has changed since you opened it — the weekly run has most likely refreshed it. "
+            f"It now holds {len(fresh.actions)} actions" + (f", generated {generated}" if generated else "")
+            + f". You have {changed} changed action{'' if changed == 1 else 's'} on screen. Nothing has been "
+            "written; choose how to combine them."
+        ))
+
+    def _visible_actions(self, category: str | None) -> list[dict]:
+        return [
+            action for action in self._loaded.actions
+            if action_tracker.matches(action, category=category, quick_filter=self._quick_filter, query=self.search.value())
+        ]
+
+    def _refresh_categories(self) -> None:
+        tree = self.category_tree
+        tree.delete(*tree.get_children())
+        tree.insert("", "end", iid=self._ALL_ITEM, text="  All actions", values=(len(self._visible_actions(None)),))
+        for category in action_tracker.categories(self._loaded.data):
+            tree.insert("", "end", iid="cat:" + category, text="  " + action_tracker.category_label(category),
+                        values=(len(self._visible_actions(category)),))
+        tree.insert("", "end", iid=self._RECORD_ITEM, text="  Decisions, closed & gaps", values=("",))
+        selected = self._RECORD_ITEM if self._showing_record else ("cat:" + self._category if self._category else self._ALL_ITEM)
+        if tree.exists(selected):
+            tree.selection_set(selected)
+
+    def _on_category_selected(self, _event=None) -> None:
+        selection = self.category_tree.selection()
+        if not selection:
+            return
+        item = selection[0]
+        showing_record = item == self._RECORD_ITEM
+        category = None if item in (self._ALL_ITEM, self._RECORD_ITEM) else item[len("cat:"):]
+        if showing_record == self._showing_record and category == self._category:
+            return
+        self._commit_editor()
+        self._showing_record, self._category = showing_record, category
+        self._refresh_actions()
+
+    def _refresh_actions(self) -> None:
+        panes = [str(pane) for pane in self._split.panes()]
+        if self._showing_record:
+            self._list_title.configure(text="Decisions, closed & gaps")
+            self._banner_label.configure(text="")
+            if str(self._tree_frame) in panes:
+                self._split.forget(self._tree_frame)
+                self._split.forget(self._editor)
+                self._split.add(self._record_frame, weight=1)
+            _set_readonly_text(self._record_text, action_tracker.record_text(self._loaded.data))
+            self._load_editor(None)
+            return
+        if str(self._record_frame) in panes:
+            self._split.forget(self._record_frame)
+            self._split.add(self._tree_frame, weight=3)
+            self._split.add(self._editor, weight=2)
+
+        rows = sorted(self._visible_actions(self._category), key=action_tracker.sort_key)
+        done = sum(1 for a in rows if a.get("status") == "closed")
+        heading = action_tracker.category_label(self._category) if self._category else "All actions"
+        self._list_title.configure(text=f"{heading}   ·   {len(rows)} shown, {done} done")
+        order = self._loaded.data.get("priority_order_agreed") or []
+        listing = self._loaded.data.get("list") if isinstance(self._loaded.data.get("list"), dict) else {}
+        banner = []
+        if order:
+            banner.append("Priority order agreed: " + " → ".join(str(o) for o in order))
+        if listing.get("review_slot"):
+            banner.append(f"Review {listing['review_slot']}")
+        self._banner_label.configure(text="   ·   ".join(banner) or "Space or a click on ☐ marks an action done.")
+
+        selected = self._current.get("id") if self._current is not None else None
+        tree = self.tree
+        tree.delete(*tree.get_children())
+        self._rows = {}
+        today = datetime.now().date()
+        reselect = None
+        for action in rows:
+            status, priority = action.get("status"), action.get("priority")
+            tags = []
+            if status == "closed":
+                tags.append("done")
+            elif status == "blocked":
+                tags.append("blocked")
+            elif action_tracker.is_due_soon(action, today):
+                tags.append("due_soon")
+            if priority == "flagged" and status != "closed":
+                tags.append("flagged")
+            title = str(action.get("title") or "")
+            marks = ("⚑ " if priority == "flagged" else "") + ("★ " if action.get("is_mine") else "")
+            item = tree.insert("", "end", tags=tags, values=(
+                "☑" if status == "closed" else "☐",
+                action.get("id", ""),
+                marks + title,
+                action.get("owner") or "",
+                action_tracker.STATUS_LABELS.get(status, status or ""),
+                action_tracker.PRIORITY_LABELS.get(priority, priority or ""),
+                action.get("due") or "—",
+            ))
+            self._rows[item] = action
+            if selected is not None and action.get("id") == selected:
+                reselect = item
+        if reselect is not None:
+            tree.selection_set(reselect)
+            tree.see(reselect)
+        else:
+            self._load_editor(None)
+
+    def _refresh_summary(self) -> None:
+        counts = action_tracker.summary_counts(self._loaded.actions)
+        self._summary_label.configure(text=(
+            f"{counts['outstanding']} outstanding · {counts['mine']} mine · {counts['flagged']} flagged · "
+            f"{counts['blocked']} blocked · {counts['done']} done"
+        ))
+
+    def _set_filter(self, key: str) -> None:
+        self._commit_editor()
+        self._quick_filter = "all" if key == self._quick_filter else key
+        if self._loaded is not None:
+            self._show_state()
+        else:
+            for name, button in self._filter_buttons.items():
+                button.configure(style="Accent.TButton" if name == self._quick_filter else "TButton")
+
+    def _on_search_changed(self, *_args) -> None:
+        if self._search_after_id is not None:
+            self.after_cancel(self._search_after_id)
+        self._search_after_id = self.after(250, self._run_search)
+
+    def _run_search(self) -> None:
+        self._search_after_id = None
+        if self._loaded is not None:
+            self._commit_editor()
+            self._refresh_categories()
+            self._refresh_actions()
+
+    def _select_action_id(self, action_id) -> None:
+        for item, action in self._rows.items():
+            if action.get("id") == action_id:
+                self.tree.selection_set(item)
+                self.tree.see(item)
+                return
+
+    def _changed(self, action: dict, *, edited: bool = False) -> None:
+        """Marks an action as changed here — which a later merge onto a newer list relies on — and the list
+        as unsaved."""
+        action["touched"] = True
+        if edited:
+            action["edited"] = True
+        self._changed_ids.add(action.get("id"))
+        self._dirty = True
+
+    def _after_change(self) -> None:
+        self.save_button.configure(text="Save •")
+        self._show_status()
+        self._refresh_categories()
+        self._refresh_actions()
+        self._refresh_summary()
+        if self._current is not None:
+            self._load_editor(self._current)  # e.g. its status, after a click on ☐
+
+    def _on_tree_click(self, event) -> None:
+        if self.tree.identify_region(event.x, event.y) == "cell" and self.tree.identify_column(event.x) == "#1":
+            item = self.tree.identify_row(event.y)
+            if item:
+                self.tree.selection_set(item)
+                self.after_idle(self._toggle_done)
+
+    def _toggle_done(self) -> None:
+        action = self._current
+        if action is None:
+            return
+        self._commit_editor()
+        closing = action.get("status") != "closed"
+        action["status"] = "closed" if closing else "open"
+        self._changed(action)
+        self._after_change()
+        self.app.toast(f"Action {action.get('id')} {'marked done' if closing else 'reopened'}")
+
+    def _add_action(self) -> None:
+        if self._loaded is None:
+            return
+        self._commit_editor()
+        categories = action_tracker.categories(self._loaded.data)
+        category = self._category or (categories[0] if categories else "")
+        action = action_tracker.new_action(
+            self._loaded.actions, title="New action", category=category, today=datetime.now().date()
+        )
+        self._loaded.actions.append(action)
+        self._changed_ids.add(action["id"])
+        self._dirty = True
+        self._showing_record = False
+        if self._quick_filter not in ("all", "mine", "open"):
+            self._quick_filter = "all"
+        self.search.var.set("")
+        self.search._show()
+        self._current = action
+        self._show_state()
+        self._select_action_id(action["id"])
+        self._title_entry.focus_set()
+        self._title_entry.select_range(0, "end")
+
+    # -- the selected action -----------------------------------------------------------------------------
+
+    def _on_action_selected(self, _event=None) -> None:
+        selection = self.tree.selection()
+        action = self._rows.get(selection[0]) if selection else None
+        if action is self._editor_loaded_for:
+            return
+        # The previous action's edits are saved onto it, but the list isn't redrawn until the newly picked
+        # action is current — redrawing re-selects whichever action is current.
+        changed = self._commit_editor(refresh=False)
+        self._load_editor(action)
+        if changed:
+            self._after_change()
+
+    def _load_editor(self, action: dict | None) -> None:
+        self._current = action
+        self._editor_loaded_for = action
+        self._loading_editor = True
+        try:
+            state = "normal" if action is not None else "disabled"
+            for widget in self._editor_widgets:
+                if isinstance(widget, ttk.Combobox):
+                    widget.configure(state="readonly" if action is not None else "disabled")
+                else:
+                    widget.configure(state=state)
+            self.log_tree.delete(*self.log_tree.get_children())
+            if action is None:
+                self._editor_heading.configure(text="Pick an action to edit it — Space or a click on ☐ marks it done.")
+                for var in (self.title_var, self.owner_var, self.due_var, self.status_var, self.priority_var,
+                            self.category_var):
+                    var.set("")
+                self.mine_var.set(False)
+                self.notes_text.configure(state="normal")
+                self.notes_text.delete("1.0", "end")
+                self.notes_text.configure(state="disabled")
+                self._source_label.configure(text="")
+                return
+            badges = [b for b, on in (("added here", action.get("user_added")), ("edited here", action.get("edited"))) if on]
+            self._editor_heading.configure(
+                text=f"Action {action.get('id', '')}" + (f"   ·   {', '.join(badges)}" if badges else "")
+            )
+            self.title_var.set(action.get("title") or "")
+            self.owner_var.set(action.get("owner") or "")
+            self.due_var.set(action.get("due") or "")
+            self.status_var.set(action_tracker.STATUS_LABELS.get(action.get("status"), action.get("status") or ""))
+            self.priority_var.set(action_tracker.PRIORITY_LABELS.get(action.get("priority"), action.get("priority") or ""))
+            self.category_var.set(action_tracker.category_label(action.get("category") or ""))
+            self.mine_var.set(bool(action.get("is_mine")))
+            self.notes_text.delete("1.0", "end")
+            self.notes_text.insert("1.0", action.get("notes") or "")
+            for index, entry in enumerate(action.get("log") or []):
+                self.log_tree.insert("", "end", iid=str(index), text=action_tracker.log_date(entry),
+                                     values=(action_tracker.log_text(entry),))
+            source = action.get("source") if isinstance(action.get("source"), dict) else {}
+            where = " · ".join(str(p) for p in (source.get("type"), source.get("date"), source.get("detail")) if p)
+            self._source_label.configure(text=f"Source: {where}" if where else "")
+        finally:
+            self._loading_editor = False
+
+    def _commit_editor(self, *, refresh: bool = True) -> bool:
+        """Copies whatever was changed in the editor onto its action, and redraws the list if anything was
+        (unless not to `refresh`). True if anything changed."""
+        action = self._current
+        if action is None or self._loaded is None or self._loading_editor or self._editor_loaded_for is not action:
+            return False
+        edited = False
+        changed = False
+        title = self.title_var.get().strip()
+        if title and title != (action.get("title") or ""):
+            action["title"], edited = title, True
+        owner = self.owner_var.get().strip() or "Unassigned"
+        if owner != (action.get("owner") or "Unassigned") or (not action.get("owner") and self.owner_var.get().strip()):
+            action["owner"], edited = owner, True
+        due = self.due_var.get().strip() or None
+        if due != (action.get("due") or None):
+            try:
+                datetime.strptime(due, "%Y-%m-%d") if due else None
+            except ValueError:
+                self.due_var.set(action.get("due") or "")
+                self.app.toast("Give the due date as YYYY-MM-DD, e.g. 2026-10-02")
+            else:
+                action["due"], edited = due, True
+        by_label = {label: key for key, label in action_tracker.STATUS_LABELS.items()}
+        status = by_label.get(self.status_var.get(), action.get("status"))
+        if status != action.get("status"):
+            action["status"], changed = status, True
+        by_label = {label: key for key, label in action_tracker.PRIORITY_LABELS.items()}
+        priority = by_label.get(self.priority_var.get(), action.get("priority"))
+        if priority != action.get("priority"):
+            action["priority"], changed = priority, True
+        by_label = {action_tracker.category_label(c): c for c in action_tracker.categories(self._loaded.data)}
+        category = by_label.get(self.category_var.get(), action.get("category"))
+        if category != action.get("category"):
+            action["category"], edited = category, True
+        if self.mine_var.get() != bool(action.get("is_mine")):
+            action["is_mine"], edited = self.mine_var.get(), True
+        notes = self.notes_text.get("1.0", "end-1c")
+        if notes != (action.get("notes") or ""):
+            action["notes"], changed = notes, True
+        if not (edited or changed):
+            return False
+        self._changed(action, edited=edited)
+        if refresh:
+            self._after_change()
+        return True
+
+    def _add_log_entry(self) -> None:
+        action = self._current
+        if action is None:
+            return
+        self._commit_editor()
+        text = simpledialog.askstring(APP_NAME, f"Add a short note to action {action.get('id')}:", parent=self)
+        if not text or not text.strip():
+            return
+        action.setdefault("log", []).append({"date": datetime.now().date().isoformat(), "text": text.strip()})
+        self._changed(action)
+        self._after_change()
+
+    def _remove_log_entry(self) -> None:
+        action = self._current
+        selection = self.log_tree.selection()
+        if action is None or not selection:
+            self.app.toast("Pick a note in the log to remove it")
+            return
+        del action["log"][int(selection[0])]
+        self._changed(action)
+        self._after_change()
+
+    # -- file actions ---------------------------------------------------------------------------------------
+
+    def _open_folder(self) -> None:
+        if self._file is None:
+            return
+        try:
+            _open_path(self._file.path.parent)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't open {self._file.path.parent}: {exc}")
+
+    def _export_csv(self) -> None:
+        if self._loaded is None or self._file is None:
+            return
+        self._commit_editor()
+        path = filedialog.asksaveasfilename(
+            title="Export actions", defaultextension=".csv", initialfile=f"{self._file.project} - Actions.csv",
+            filetypes=[("CSV file", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        Path(path).write_text(action_tracker.to_csv(self._loaded.actions), encoding="utf-8-sig", newline="")
+        self.app.toast(f"Exported to {Path(path).name}")
 
 
 # --- Transcriptions -------------------------------------------------------------------------------

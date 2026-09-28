@@ -7,8 +7,8 @@ saves everything locally, and pushes.
 
 ## What it does
 
-The window has four pages, picked from the sidebar: **Record**, **Library**, **Transcriptions** and
-**Settings**. It follows
+The window has five pages, picked from the sidebar: **Record**, **Library**, **Actions**,
+**Transcriptions** and **Settings**. It follows
 Windows' light/dark app setting.
 
 - **Records audio** from the microphone *and* the system output (WASAPI loopback), so both sides of a
@@ -85,6 +85,13 @@ Windows' light/dark app setting.
   transcript from the meeting's recording afterwards, and **Delete…** (or the Delete key), which removes
   the meeting, its recording and its attached documents from this PC after asking. A meeting whose transcription didn't
   finish keeps its recording and offers **Retry**.
+- **Tracks each project's actions.** The Actions page opens the `<Project> - Actions.json` list kept in each
+  project folder under the sync folder (see "Action lists" below) — pick the project at the top. Actions are
+  grouped by category, with **All / Mine / Flagged / Blocked / Not done** filters and a search box; tick one
+  off with a click on its ☐ (or Space), change its status, priority, owner, due date or category, edit its
+  notes, add dated notes to its log, and **+ Add action** for new ones. **Save** writes the list back;
+  **Export CSV…** exports it. The decisions, items closed this week and gaps the weekly run records show
+  under **Decisions, closed & gaps**.
 - **Pushes each finished meeting to Copilot Studio** as a named file package dropped into a folder
   OneDrive/SharePoint is already syncing (see "The Copilot push" below). The app doesn't call an AI API
   and doesn't wait for anything back.
@@ -129,10 +136,11 @@ src/meeting_scribe/
   outlook_calendar.py     # finds the meeting's Outlook invite (locally, over COM) for its invitees' names
   ai/copilot_push.py    # one-way, named-file-package drop of a finished meeting to Copilot Studio
   ai/minutes_import.py  # files the minutes Copilot Studio writes back against their meetings
+  action_tracker.py     # finds, reads, merges and safely saves each project's "<Project> - Actions.json"
   storage/database.py   # SQLite schema: projects, meetings, transcript segments, documents, transcription runs
   storage/documents.py  # Text extraction for uploaded PDFs/docx/images/text
   storage/disk_space.py # free-space checks before and during recording
-  gui/app.py             # Tkinter window: Record, Library, Transcriptions and Settings pages
+  gui/app.py             # Tkinter window: Record, Library, Actions, Transcriptions and Settings pages
   gui/theme.py           # palette (light/dark), fonts and ttk styles
   gui/meeting_prompt.py  # the "Teams meeting detected" / "Meeting ended" prompts
   main.py                 # Entry point (GUI by default; `list-projects` for scripting)
@@ -299,6 +307,31 @@ rejects in a file name, and which project folder the file is in). Two same-title
 told apart by `HH.mm`: a file belongs to the latest of them that had started by then. If the flow ran more
 than once for a meeting, the newest file wins, and a file edited later is picked up again. A meeting
 renamed or moved to another project after it was pushed no longer matches its minutes.
+
+### Action lists
+
+A separate weekly run keeps one action list per project, in the same project folder as its minutes:
+
+```
+<sync folder>/<project folder>/<project folder> - Actions.json
+```
+
+`action_tracker.py` looks one folder down from the sync folder for these (so the Inbox, which has none, is
+skipped). If OneDrive left a conflict copy (`… - Actions-DESKTOP-AB12.json`, `… - Actions (1).json`) instead
+of the real file, the newest copy is used and the page says so; a deliberately separate file named
+`… - Actions - <something>.json` is not.
+
+The file stays the single source of truth, and the weekly run rewrites it, so a save never writes over a
+version the page didn't load: it re-reads the file first, and if it has changed, nothing is written and the
+page offers to take the new list and reapply the changes made since it was loaded (recommended), take the
+new list and drop them, or overwrite it. Every 30 seconds while the page is open it also checks whether the
+file has changed, loading the new version straight away when there are no unsaved changes. Changing
+project or closing the app with unsaved changes asks to save first.
+
+The format is the one the browser action tracker (`<Project> - Action tracker.html`) uses, so both can be
+used on the same file: a changed action is marked `touched`, one whose title, owner, due date, category or
+"mine" flag was changed is also marked `edited`, one added here is marked `user_added` and numbered from
+900, and notes added to the log are `{"date", "text"}` entries. Anything else in the file is kept as it was.
 
 ## Building the .exe
 
