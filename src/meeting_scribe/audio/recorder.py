@@ -23,7 +23,7 @@ from typing import Callable
 import numpy as np
 
 from meeting_scribe.audio.call_devices import CallAudioDevices, find_call_audio_devices, match_portaudio_device
-from meeting_scribe.audio.device_picker import default_input_device_info, full_device_name, input_device_infos
+from meeting_scribe.audio.device_picker import default_input_device_info, input_device_infos
 from meeting_scribe.audio.device_watch import device_signature
 
 CHUNK_FRAMES = 1024
@@ -92,42 +92,12 @@ _NO_ACTIVITY_GRACE_SECONDS = 90.0
 # at all isn't a quiet meeting — for system audio it means nothing is playing through that output device.
 _NO_DATA_GRACE_SECONDS = 30.0
 
-# Automatic device selection (see Recorder's auto_* arguments). A chunk louder than _AUDIBLE_DBFS is
-# carrying sound someone could hear; a quiet stream never gets there. An output device another one is
-# switched to has to be clearly playing, not merely above that line — a switch is a guess about where
-# the call is, and it should only be made on good evidence.
+# A chunk louder than this is carrying sound someone could hear; a quiet stream never gets there.
 _AUDIBLE_DBFS = -60.0
-_PLAYING_DBFS = -50.0
-# How often the automation looks at the two streams, and how long it listens to a device it's
-# considering. A probe opens its own stream beside the one recording, so recording never pauses for it.
+# How often the device-following thread (see Recorder's follow_call_app) asks which devices Teams has open.
 _AUTO_DEVICE_POLL_SECONDS = 2.0
-_PROBE_SECONDS = 1.0
-# Nothing audible through the recorded output for this long means the call is probably coming out of a
-# different one. Long enough to ride out an ordinary pause in a conversation.
-_SYSTEM_QUIET_BEFORE_SEARCH_SECONDS = 8.0
-# How often, at most, the other outputs are listened to while the recorded one stays quiet.
-_SYSTEM_SEARCH_INTERVAL_SECONDS = 4.0
-# A connected headset whose microphone hands over nothing but digital silence for this long is muted at
-# the headset or switched off, so the laptop's microphone takes over.
-_HEADSET_SILENT_BEFORE_FALLBACK_SECONDS = 10.0
-# While on the laptop microphone, how often the headset is checked for having come back to life.
-_HEADSET_RECHECK_SECONDS = 15.0
-# How loud a headset has to be, in a probe, before recording moves *onto* it: someone talking into it
-# (speech into a headset mic lands around -30 to -20 dBFS). Any non-zero sample at all only shows the
-# headset is switched on — one in a bag, powered up and still paired, hands over its noise floor and the
-# odd rustle all day — so that alone is only ever used to decide the headset being recorded isn't dead.
-_HEADSET_IN_USE_DBFS = _ACTIVITY_DBFS
-# Once Teams has said which microphone it's using, how long a gap in its answers (a device renegotiating,
-# the lobby before a breakout room) is ridden out on that microphone rather than guessed through.
-# While Teams is still playing the call, its answer is kept however long the gap.
-_CALL_APP_MICROPHONE_MEMORY_SECONDS = 60.0
-# How a headset microphone is recognized by name when Settings doesn't name one. Windows' own names for
-# them ("Headset Microphone (…)", "Headset (… Hands-Free)") nearly always say so.
-_HEADSET_NAME_HINTS = ("headset", "headphone", "hands-free", "handsfree", "earbud", "earphone", "airpods")
-# Inputs that are really the computer's output looped back — never a sensible microphone fallback.
-_NOT_A_MICROPHONE_HINTS = ("stereo mix", "what u hear", "wave out", "loopback")
 # How long one answer to "which devices is Teams using" is reused. The microphone and system-audio checks
-# both ask on each pass of the automation, a moment apart; asking Windows twice for the same thing buys
+# both ask on each pass of the device-following thread, a moment apart; asking Windows twice for the same thing buys
 # nothing.
 _CALL_DEVICES_CACHE_SECONDS = 1.0
 
@@ -549,165 +519,11 @@ def _read_what_is_available(stream) -> bytes:
     return stream.read(min(available, CHUNK_FRAMES), exception_on_overflow=False)
 
 
-@dataclass(frozen=True)
-class DeviceProbe:
-    """What a short listen to one device heard — see _probe_devices."""
-
-    name: str
-    peak_dbfs: float
-    heard_signal: bool  # any non-zero sample at all: the device is live, whether or not it's loud
-
-
-class _ProbeStream:
-    def __init__(self, name: str, stream):
-        self.name = name
-        self.stream = stream
-        self.peak_dbfs = _SILENT_DBFS
-        self.heard_signal = False
-
-
-def _probe_devices(
-    pyaudio_instance, pyaudio_module, devices, seconds: float, stop_event: threading.Event
-) -> list[DeviceProbe]:
-    """Listens to every device in `devices` at once for `seconds`, each on a stream of its own opened
-    beside whatever is recording, and reports what each heard. Reads only what's buffered (see
-    _read_what_is_available), so a silent loopback device can't hang it, and it returns early once
-    `stop_event` is set. A device that won't open, or fails mid-listen, is reported as having heard
-    nothing rather than failing the rest."""
-    probes: list[_ProbeStream] = []
-    try:
-        for info in devices:
-            try:
-                stream = pyaudio_instance.open(
-                    format=pyaudio_module.paInt16,
-                    channels=int(info["maxInputChannels"]),
-                    rate=int(info["defaultSampleRate"]),
-                    input=True,
-                    input_device_index=info["index"],
-                    frames_per_buffer=CHUNK_FRAMES,
-                )
-            except Exception:
-                stream = None
-            probes.append(_ProbeStream(str(info["name"]), stream))
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline and not stop_event.is_set():
-            for probe in probes:
-                if probe.stream is None:
-                    continue
-                try:
-                    data = _read_what_is_available(probe.stream)
-                except Exception:
-                    data = b""
-                if data:
-                    stats = _analyze_pcm16(data)
-                    probe.peak_dbfs = max(probe.peak_dbfs, stats.rms_dbfs)
-                    probe.heard_signal = probe.heard_signal or not stats.all_zero
-            stop_event.wait(0.02)
-    finally:
-        for probe in probes:
-            for close in (getattr(probe.stream, "stop_stream", None), getattr(probe.stream, "close", None)):
-                try:
-                    if close is not None:
-                        close()
-                except Exception:
-                    pass
-    return [DeviceProbe(probe.name, probe.peak_dbfs, probe.heard_signal) for probe in probes]
-
-
-def looks_like_headset(name: str) -> bool:
-    lowered = name.lower()
-    return any(hint in lowered for hint in _HEADSET_NAME_HINTS)
-
-
 def _same_device(a: str, b: str) -> bool:
     """Windows lists each device once per audio API, and the oldest (MME) cuts names off at 31
     characters — "Headset Microphone (Jabra Evol" is the same headset as the full name."""
     shorter, longer = sorted((a, b), key=len)
     return a == b or (len(shorter) >= 16 and longer.startswith(shorter))
-
-
-def find_headset_microphones(input_names, configured: str | None) -> list[str]:
-    """Every headset microphone connected right now, in order of preference: the one picked in Settings
-    (`configured`) first, then each input whose name says it's a headset (see looks_like_headset). The
-    same headset listed under several of Windows' audio APIs (see _same_device) counts once."""
-    candidates = [name for name in input_names if name == configured or looks_like_headset(name)]
-    candidates.sort(key=lambda name: name != configured)  # stable: otherwise keeps Windows' order
-    headsets: list[str] = []
-    for name in candidates:
-        if not any(_same_device(name, kept) for kept in headsets):
-            headsets.append(name)
-    return headsets
-
-
-def choose_fallback_microphone(
-    input_names, *, configured: str | None, default_name: str | None, headsets
-) -> str | None:
-    """The microphone to use when no headset can be: the one chosen in Settings, else the Windows
-    default, else the first input that isn't a headset — never a headset (Windows tends to make a newly
-    connected one its default) or a loopback input like Stereo Mix."""
-
-    def usable(name: str | None) -> bool:
-        return (
-            bool(name)
-            and name in input_names
-            and not any(_same_device(name, headset) for headset in headsets)
-            and not looks_like_headset(name)
-            and not any(hint in name.lower() for hint in _NOT_A_MICROPHONE_HINTS)
-        )
-
-    for candidate in (configured, default_name, *input_names):
-        if usable(candidate):
-            return candidate
-    return None
-
-
-def next_microphone(
-    *,
-    active: str | None,
-    headsets,
-    fallback: str | None,
-    active_is_dead: bool,
-    live_headsets,
-) -> str | None:
-    """Which microphone to switch to now, or None to stay put.
-
-    `headsets` is every connected headset, most preferred first (see find_headset_microphones), and
-    `live_headsets` the ones a probe just heard any signal from, in the same order — None if none were
-    listened to this time. `active_is_dead` says the headset being recorded has handed over nothing but
-    digital silence (muted at the headset, or switched off with its dongle still plugged in) — silence a
-    working microphone never produces, so it's safe to act on.
-
-    On a headset that's still working: stay. On one that's gone dead: the first other headset that's
-    live, else the fallback. On the fallback: the first headset that's live."""
-    live = [
-        name for name in (live_headsets or ())
-        if active is None or not _same_device(name, active)
-    ]
-    on_headset = active is not None and any(_same_device(active, headset) for headset in headsets)
-    if not on_headset:
-        return live[0] if live else None
-    if not active_is_dead:
-        return None
-    if live:
-        return live[0]
-    return fallback
-
-
-def next_system_device(
-    *, active: str | None, active_seconds_without_sound: float | None, probes
-) -> str | None:
-    """Which output device to record instead, or None to stay put. Only one device plays the call, so
-    once the recorded one has been quiet for a while, whichever other output is clearly playing
-    something is the one to follow — the loudest, if more than one is."""
-    if (
-        active_seconds_without_sound is None
-        or active_seconds_without_sound < _SYSTEM_QUIET_BEFORE_SEARCH_SECONDS
-    ):
-        return None
-    playing = [probe for probe in probes if probe.name != active and probe.peak_dbfs >= _PLAYING_DBFS]
-    if not playing:
-        return None
-    return max(playing, key=lambda probe: probe.peak_dbfs).name
 
 
 class _SegmentedWavWriter:
@@ -972,16 +788,14 @@ class Recorder:
     `mic_health()` / `system_health()` and `input_problems()` go a step further and say whether what's
     being captured looks like a working input at all — see StreamHealth and describe_input_problems.
 
-    `auto_system_device` and `auto_microphone` hand the choice of device to the recorder, for someone
-    who'd otherwise have to remember to change it for every call. A background thread checks every
-    `_AUTO_DEVICE_POLL_SECONDS`: once the recorded output device has been quiet for a while, it listens
-    to the other outputs and follows whichever is playing (only one plays the call); and the
-    microphone is whichever connected headset is live (`headset_microphone_name` first, then any
-    recognized by name), the usual microphone only when none is — see next_system_device /
-    next_microphone.
-    Listening is done on separate streams, so recording carries on throughout, and every switch lands
-    in capture_notices() with its reason. Picking a device by hand mid-meeting turns that stream's
-    automation off for the rest of the meeting — the person has decided.
+    `follow_call_app` records whichever microphone and speaker Teams has open (see audio.call_devices),
+    for someone who'd otherwise have to remember to change devices for every call. It's asked at
+    `start()` and then every `_AUTO_DEVICE_POLL_SECONDS` by a background thread; when Teams says it's
+    using a different device, that stream switches to it. When Teams isn't using either side (not in a
+    call yet, or this isn't Windows), nothing changes — there is no guessing from device names or
+    levels. Every switch lands in capture_notices() with its reason. Picking a device by hand
+    mid-meeting turns following off for that stream for the rest of the meeting — the person has
+    decided.
     """
 
     # How often the background thread checks whether the set of audio devices, or the Windows default,
@@ -995,27 +809,18 @@ class Recorder:
         mic_device_name: str | None = None,
         system_device_name: str | None = None,
         *,
-        auto_system_device: bool = False,
-        auto_microphone: bool = False,
-        headset_microphone_name: str | None = None,
+        follow_call_app: bool = False,
     ):
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._mic_device_name = mic_device_name
         self._system_device_name = system_device_name
-        # The microphone chosen in Settings, which _mic_device_name stops being after a switch — kept as
-        # the one to fall back to when the headset goes quiet.
-        self._configured_mic_name = mic_device_name
-        self._auto_system = auto_system_device
-        self._auto_mic = auto_microphone
-        self._headset_microphone_name = headset_microphone_name
+        # Per stream, so picking one device by hand stops following only that one — see switch_mic_device.
+        self._auto_system = follow_call_app
+        self._auto_mic = follow_call_app
         self._auto_thread: threading.Thread | None = None
-        self._next_system_search = 0.0
-        self._next_headset_check = 0.0
-        # When Teams last said which microphone it was using — see _auto_select_microphone.
-        self._call_app_microphone_at: float | None = None
-        # Held while a probe has streams open on self._pyaudio, so reload_devices() can't terminate it
-        # under them. Never held while taking _lifecycle_lock, so the two can't deadlock.
+        # Held while self._pyaudio is being enumerated for Teams' devices, so reload_devices() can't
+        # terminate it underneath. Never held while taking _lifecycle_lock, so the two can't deadlock.
         self._probe_lock = threading.Lock()
         # Set by stop(): nothing may open a new capture stream after that.
         self._stopping = False
@@ -1058,8 +863,7 @@ class Recorder:
         self.device_list_version = 0
         # Injectable for tests; see audio.device_watch.
         self._device_signature: Callable[[], object | None] = device_signature
-        # Injectable for tests; see audio.call_devices. Asked by the automation (auto_* above) before
-        # any of its own guessing: when Teams has a microphone or speaker open, that's the one.
+        # Injectable for tests; see audio.call_devices. What follow_call_app follows.
         self._call_devices: Callable[[], CallAudioDevices | None] = find_call_audio_devices
         self._call_devices_cache: tuple[float, CallAudioDevices | None] | None = None
         # Set by a capture thread that died on its own (not stopped or replaced), so the device watcher
@@ -1087,14 +891,10 @@ class Recorder:
         call = self._call_app_devices(time.monotonic()) if (self._auto_mic or self._auto_system) else None
         call_mic = self._call_app_input(call) if self._auto_mic else None
         call_speaker = self._call_app_loopback(call) if self._auto_system else None
-        if call_mic is not None:
-            if call_mic != self._mic_device_name:
-                self._mic_device_name = call_mic
-                self._record_switch(f"Microphone set to {call_mic!r} — Teams is using it.")
-        # Without an answer from Teams, recording starts on the microphone chosen in Settings. It used to
-        # start on any connected headset, which is how a meeting taken on the laptop's microphone ended
-        # up recording a headset left switched on in a bag; the automation's first check, straight after
-        # start, moves to a headset only if someone is actually talking into it.
+        # Without an answer from Teams, recording starts on the devices chosen in Settings.
+        if call_mic is not None and call_mic != self._mic_device_name:
+            self._mic_device_name = call_mic
+            self._record_switch(f"Microphone set to {call_mic!r} — Teams is using it.")
         if call_speaker is not None and call_speaker != self._system_device_name:
             self._system_device_name = call_speaker
             self._record_switch(f"System audio set to {call_speaker!r} — Teams is playing the call through it.")
@@ -1306,23 +1106,16 @@ class Recorder:
             self._record_switch("Audio capture reopened after a stream stopped mid-meeting — recording continues.")
 
     def _auto_select_devices(self) -> None:
-        """Runs on its own thread for the life of the meeting when either automation is on — see the
-        class docstring. Exits promptly on stop(), same as _watch_devices; a probe in progress is cut
-        short by the same event. The microphone is checked straight away, rather than after the first
-        interval, so a meeting that starts on a headset that's switched off moves off it in a second
-        rather than after _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS."""
-        steps = [lambda now: self._auto_select_microphone(now, starting=True)]
-        while True:
-            for step in steps:
+        """Runs on its own thread for the life of the meeting when following Teams — see the class
+        docstring. Exits promptly on stop(), same as _watch_devices."""
+        while not self._watch_stop_event.wait(_AUTO_DEVICE_POLL_SECONDS):
+            for step in (self._auto_select_system_device, self._auto_select_microphone):
                 try:
                     step(time.monotonic())
                 except Exception as exc:  # a background check must never take the meeting down
                     self._record_notice(
                         f"Automatic device selection skipped a check ({type(exc).__name__}: {exc})."
                     )
-            if self._watch_stop_event.wait(_AUTO_DEVICE_POLL_SECONDS):
-                return
-            steps = [self._auto_select_system_device, self._auto_select_microphone]
 
     def _call_app_devices(self, now: float) -> CallAudioDevices | None:
         """What Teams is using right now (see audio.call_devices), briefly cached."""
@@ -1383,125 +1176,22 @@ class Recorder:
             return
         with self._probe_lock:
             target = self._call_app_loopback(self._call_app_devices(now))
-        if target is not None:
-            # Teams says where the call is coming out — no need to wait for the recorded device to go
-            # quiet and listen around for it.
-            active = self._system_active_device_name
-            if (active is None or not _same_device(active, target)) and not self._watch_stop_event.is_set():
-                self.switch_system_device(target, reason="Teams is playing the call through it", automatic=True)
-            return
-        if now < self._next_system_search:
-            return
-        quiet = self.system_health().seconds_without_sound
-        if quiet is None or quiet < _SYSTEM_QUIET_BEFORE_SEARCH_SECONDS:
-            return
-        self._next_system_search = now + _SYSTEM_SEARCH_INTERVAL_SECONDS
         active = self._system_active_device_name
-        with self._probe_lock:
-            pyaudio_instance = self._pyaudio
-            if pyaudio_instance is None:
-                return
-            candidates = [
-                info for info in pyaudio_instance.get_loopback_device_info_generator()
-                if info.get("name") != active
-            ]
-            probes = _probe_devices(
-                pyaudio_instance, self._pyaudio_module, candidates, _PROBE_SECONDS, self._watch_stop_event
-            )
-        choice = next_system_device(active=active, active_seconds_without_sound=quiet, probes=probes)
-        if choice is not None and self._auto_system and not self._watch_stop_event.is_set():
-            self.switch_system_device(choice, reason="the call's sound is playing through it", automatic=True)
+        if target is None or (active is not None and _same_device(active, target)):
+            return  # Teams isn't playing anything, or it's already what's recorded
+        if self._auto_system and not self._watch_stop_event.is_set():
+            self.switch_system_device(target, reason="Teams is playing the call through it", automatic=True)
 
-    def _auto_select_microphone(self, now: float, *, starting: bool = False) -> None:
-        """One check of the microphone — see next_microphone. Headsets are listened to only when that
-        could change anything: at the start of the meeting (all of them, the one being recorded
-        included), once the one being recorded has gone silent (the others), and every
-        _HEADSET_RECHECK_SECONDS while on the fallback (all of them)."""
+    def _auto_select_microphone(self, now: float) -> None:
         if not self._auto_mic:
             return
+        with self._probe_lock:
+            target = self._call_app_input(self._call_app_devices(now))
         active = self._mic_active_device_name
-        with self._probe_lock:
-            call = self._call_app_devices(now)
-            target = self._call_app_input(call)
-        if target is not None:
-            # Teams says which microphone it has open, which beats any guess made from names or levels —
-            # including a headset that isn't called one, or a laptop mic Teams was deliberately set to.
-            self._call_app_microphone_at = now
-            if (active is None or not _same_device(active, target)) and not self._watch_stop_event.is_set():
-                self.switch_mic_device(target, reason="Teams is using this microphone", automatic=True)
-            return
-        if self._call_app_microphone_at is not None:
-            if call is not None:
-                self._call_app_microphone_at = now  # still in the call: the gap hasn't started yet
-            if now - self._call_app_microphone_at < _CALL_APP_MICROPHONE_MEMORY_SECONDS:
-                # Teams named a microphone earlier and has only stopped saying so for now — still
-                # playing the call, or only briefly silent. Guessing from headsets here is how a single
-                # missed answer used to move the recording onto a headset in a bag, and back again on
-                # the next one.
-                return
-        silent_for = self.mic_health().seconds_without_signal
-        active_is_dead = silent_for is not None and silent_for >= _HEADSET_SILENT_BEFORE_FALLBACK_SECONDS
-        with self._probe_lock:
-            pyaudio_instance = self._pyaudio
-            if pyaudio_instance is None:
-                return
-            from meeting_scribe.audio.device_picker import input_devices_from
-
-            names = [device.name for device in input_devices_from(pyaudio_instance)]
-            headsets = find_headset_microphones(names, full_device_name(self._headset_microphone_name, names))
-            if not headsets:
-                return
-            try:
-                default_name = default_input_device_info(pyaudio_instance).get("name")
-            except Exception:  # no default input at all
-                default_name = None
-            fallback = choose_fallback_microphone(
-                names,
-                configured=full_device_name(self._configured_mic_name, names),
-                default_name=default_name,
-                headsets=headsets,
-            )
-            on_headset = active is not None and any(_same_device(active, h) for h in headsets)
-            if starting:
-                to_probe = list(headsets)
-            elif on_headset:
-                to_probe = [h for h in headsets if not _same_device(h, active)] if active_is_dead else []
-            elif now >= self._next_headset_check:
-                to_probe = list(headsets)
-            else:
-                to_probe = []
-            live_headsets = None
-            if to_probe:
-                if not on_headset:
-                    self._next_headset_check = now + _HEADSET_RECHECK_SECONDS
-                infos = [info for info in (_find_input_device(pyaudio_instance, h) for h in to_probe) if info]
-                probes = _probe_devices(
-                    pyaudio_instance, self._pyaudio_module, infos, _PROBE_SECONDS, self._watch_stop_event
-                )
-                switched_on = [probe.name for probe in probes if probe.heard_signal]
-                if starting and on_headset and not any(_same_device(active, h) for h in switched_on):
-                    active_is_dead = True
-                # Only a headset someone is talking into is worth moving to — see _HEADSET_IN_USE_DBFS.
-                live_headsets = [
-                    probe.name for probe in probes if probe.heard_signal and probe.peak_dbfs >= _HEADSET_IN_USE_DBFS
-                ]
-        choice = next_microphone(
-            active=active,
-            headsets=headsets,
-            fallback=fallback,
-            active_is_dead=active_is_dead,
-            live_headsets=live_headsets,
-        )
-        if choice is None or not self._auto_mic or self._watch_stop_event.is_set():
-            return
-        if any(_same_device(choice, h) for h in headsets):
-            reason = "someone is talking into that headset"
-            if on_headset:
-                reason = "the headset in use isn't picking anything up, and this one is"
-        else:
-            reason = "no headset is picking anything up (muted, or switched off?)"
-            self._next_headset_check = now + _HEADSET_RECHECK_SECONDS
-        self.switch_mic_device(choice, reason=reason, automatic=True)
+        if target is None or (active is not None and _same_device(active, target)):
+            return  # Teams has no microphone open, or it's already what's recorded
+        if self._auto_mic and not self._watch_stop_event.is_set():
+            self.switch_mic_device(target, reason="Teams is using this microphone", automatic=True)
 
     def _safe_device_signature(self):
         # Swallows everything: this is a background poll, not something a transient enumeration hiccup

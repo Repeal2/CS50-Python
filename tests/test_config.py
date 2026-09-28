@@ -356,29 +356,17 @@ def test_automatic_device_switching_is_on_by_default(tmp_path, monkeypatch):
     settings = load_settings()
 
     assert settings.auto_switch_audio_devices is True
-    assert settings.headset_microphone_name is None
 
 
 def test_update_audio_automation_persists_and_reloads(tmp_path, monkeypatch):
     monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
 
     settings = update_settings(load_settings(), mic_device_name="Laptop Mic", system_device_name=None)
-    update_settings(
-        settings, auto_switch_audio_devices=False, headset_microphone_name="Jabra Evolve2 65"
-    )
+    update_settings(settings, auto_switch_audio_devices=False)
 
     reloaded = load_settings()
     assert reloaded.auto_switch_audio_devices is False
-    assert reloaded.headset_microphone_name == "Jabra Evolve2 65"
     assert reloaded.mic_device_name == "Laptop Mic"
-
-
-def test_a_blank_headset_means_recognize_one_by_name(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEETING_SCRIBE_DATA_DIR", str(tmp_path))
-
-    update_settings(load_settings(), auto_switch_audio_devices=True, headset_microphone_name="")
-
-    assert load_settings().headset_microphone_name is None
 
 
 def test_the_ocr_box_position_is_saved_and_loaded(tmp_path, monkeypatch):

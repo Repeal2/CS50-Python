@@ -15,11 +15,10 @@ Windows' light/dark app setting.
   call are captured even when remote participants' audio never touches the mic. The Record page shows a
   live level meter next to each device picker, and **Test mic** listens for three seconds and says what it
   heard, right under the meters, without opening a dialog.
-- **Follows the devices Teams is using.** With "Switch devices automatically" on (Settings, on by
+- **Follows the devices Teams is using.** With "Use the devices Teams is using" on (Settings, on by
   default), the app records whichever microphone and speaker Teams has open, switching mid-meeting if
-  Teams does, and stays on Teams' microphone through brief gaps in its answer; when that can't be told
-  at all, it falls back to the speaker that's playing and a headset mic someone is actually talking into
-  (a headset merely switched on — in a bag, say — isn't moved onto). Microphones are opened through
+  Teams does. While Teams isn't using any, it stays on the devices picked on the Record page — there's
+  no guessing from device names or levels. Microphones are opened through
   WASAPI, like the system audio, one entry per device. A capture stream that dies mid-meeting is
   reopened, and silence on the system track is written out as silence so both tracks stay in step.
 - **Warns about bad input while it can still be fixed.** A device Windows no longer has, a mic producing

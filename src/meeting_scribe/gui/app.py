@@ -72,7 +72,6 @@ APP_NAME = "Meeting Scribe"
 # Shown in a device dropdown in place of a device name, meaning "follow whatever Windows currently
 # considers the default" rather than a specific device.
 SYSTEM_DEFAULT_LABEL = "System default"
-AUTO_HEADSET_LABEL = "Recognize by name"
 
 # Used when recording starts with the project field blank, so a meeting never fails to start for lack of
 # a project name. The project stays editable for the meeting's whole life, so this is never a dead end.
@@ -785,7 +784,6 @@ class MeetingScribeApp(tk.Tk):
         session = self._session
         inputs, loopbacks = session.available_devices() if session is not None else _enumerate_devices()
         self.record_page.apply_device_lists(inputs, loopbacks)
-        self.settings_page.apply_device_lists(inputs)
 
     def request_device_refresh(self) -> None:
         """The refresh button. Idle, that's a fresh enumeration. While recording, the recorder restarts
@@ -3691,19 +3689,13 @@ class SettingsPage(ttk.Frame):
         body = self._section(page, "Audio")
         self.auto_switch_var = tk.BooleanVar(value=settings.auto_switch_audio_devices)
         ttk.Checkbutton(
-            body, text="Switch devices automatically", variable=self.auto_switch_var, style="Card.TCheckbutton"
+            body, text="Use the devices Teams is using", variable=self.auto_switch_var, style="Card.TCheckbutton"
         ).grid(row=0, column=0, columnspan=2, sticky="w")
         self._hint(
             body, 1,
-            "Records the microphone and speaker Teams is using. When that can't be told, follows whichever "
-            "speaker is playing and uses a headset mic when one is live. Picking a device on the Record page "
-            "mid-meeting turns this off for that meeting.",
+            "Records the microphone and speaker Teams has open, and follows Teams if it changes them. "
+            "Picking a device on the Record page mid-meeting turns this off for that meeting.",
         )
-        self.headset_var = tk.StringVar(value=settings.headset_microphone_name or AUTO_HEADSET_LABEL)
-        self.headset_combo = self._field(body, 2, "Headset microphone", ttk.Combobox(
-            body, textvariable=self.headset_var, state="readonly", width=40
-        ))
-        self._hint(body, 3, "Your usual headset, tried first — or recognize any input Windows calls a headset.")
 
         # Transcription
         body = self._section(page, "Transcription")
@@ -3846,8 +3838,6 @@ class SettingsPage(ttk.Frame):
         footer.pack(fill="x", pady=(18, 0))
         ttk.Button(footer, text="Save settings", style="Accent.TButton", command=self._save).pack(side="left")
 
-        self.apply_device_lists(_enumerate_devices()[0])
-
     # -- layout helpers -------------------------------------------------------------------------------
 
     def _section(self, page: ttk.Frame, title: str) -> ttk.Frame:
@@ -3878,11 +3868,6 @@ class SettingsPage(ttk.Frame):
             return
         self.app.settings = update_settings(self.app.settings, transcribe_locally=local, transcribe_in_cloud=cloud)
         self.app.toast("Transcription setting saved")
-
-    def apply_device_lists(self, input_devices) -> None:
-        self.headset_combo["values"] = _device_choices(
-            [d.name for d in input_devices], self.headset_var.get(), default_label=AUTO_HEADSET_LABEL
-        )
 
     def _browse_sync_dir(self) -> None:
         chosen = filedialog.askdirectory(title="Choose a OneDrive/SharePoint-synced folder")
@@ -3939,7 +3924,6 @@ class SettingsPage(ttk.Frame):
             self.app.settings,
             copilot_sync_dir=self.sync_dir_var.get().strip(),
             auto_switch_audio_devices=self.auto_switch_var.get(),
-            headset_microphone_name=_device_from_choice(self.headset_var.get(), AUTO_HEADSET_LABEL),
             whisper_model_size=self.whisper_model_var.get(),
             transcription_language=_language_code(self.language_var.get()),
             custom_vocabulary=self.vocabulary_var.get(),

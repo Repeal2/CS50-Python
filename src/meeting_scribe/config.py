@@ -145,11 +145,8 @@ class Settings:
     mic_device_name: str | None = None
     system_device_name: str | None = None
     # On by default: during a meeting, the microphone and system audio are whichever devices Teams has
-    # open (see audio.call_devices). When that can't be told, system audio follows whichever output
-    # device is actually playing, and the microphone is the headset whenever one is connected and live,
-    # mic_device_name otherwise — see audio.recorder.Recorder. headset_microphone_name picks the headset; None recognizes one by name.
+    # open (see audio.call_devices). While Teams isn't using any, the devices above are recorded.
     auto_switch_audio_devices: bool = True
-    headset_microphone_name: str | None = None
     # Root of a folder synced by OneDrive/SharePoint — an Inbox subfolder lives under it (see
     # ai/copilot_push.py). None means nothing gets pushed anywhere: the meeting is still recorded and
     # saved locally, just not handed off.
@@ -262,7 +259,6 @@ def save_user_config(settings: Settings) -> None:
         "mic_device_name": settings.mic_device_name,
         "system_device_name": settings.system_device_name,
         "auto_switch_audio_devices": settings.auto_switch_audio_devices,
-        "headset_microphone_name": settings.headset_microphone_name,
         "copilot_sync_dir": str(settings.copilot_sync_dir) if settings.copilot_sync_dir else None,
         "whisper_model_size": settings.whisper_model_size,
         "start_meeting_hotkey": _hotkey_to_json(settings.start_meeting_hotkey),
@@ -285,7 +281,6 @@ def save_user_config(settings: Settings) -> None:
 _BLANK_MEANS_UNSET = (
     "mic_device_name",
     "system_device_name",
-    "headset_microphone_name",
     "runpod_api_key",
     "runpod_endpoint_id",
     "runpod_huggingface_token",
@@ -379,7 +374,6 @@ def load_settings() -> Settings:
         mic_device_name=user_config.get("mic_device_name"),
         system_device_name=user_config.get("system_device_name"),
         auto_switch_audio_devices=bool(user_config.get("auto_switch_audio_devices", True)),
-        headset_microphone_name=user_config.get("headset_microphone_name"),
         copilot_sync_dir=Path(copilot_sync_dir) if copilot_sync_dir else None,
         start_meeting_hotkey=_hotkey_from_json(user_config.get("start_meeting_hotkey")),
         stop_meeting_hotkey=_hotkey_from_json(user_config.get("stop_meeting_hotkey")),

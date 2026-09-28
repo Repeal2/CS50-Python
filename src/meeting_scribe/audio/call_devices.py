@@ -1,9 +1,8 @@
-"""Which microphone and speaker the call app (Teams) is actually using right now.
+"""Which microphone and speaker the call app (Teams) is actually using right now — what audio.recorder
+follows during a meeting.
 
-Everything else in audio.recorder that picks a device does it from the outside: it guesses from device
-names ("Headset Microphone (…)") and from which device happens to be making noise. Windows can just be
-asked. Every app that opens an audio device gets an *audio session* on that device's endpoint — the same
-sessions the Volume Mixer lists, one per app per device — and each session knows the process that owns
+Windows can just be asked. Every app that opens an audio device gets an *audio session* on that device's
+endpoint — the same sessions the Volume Mixer lists, one per app per device — and each session knows the process that owns
 it and whether its stream is running. So "the endpoint where a Teams process has an active capture
 session" is the microphone Teams is using, whatever it's called and whether or not it's the Windows
 default; the same on the render side is where the call's sound is coming out. That's the question the
@@ -14,7 +13,7 @@ process is excluded — the recorder has sessions of its own on the same devices
 
 Windows-only (Core Audio over COM, via pycaw/comtypes, and psutil for the process tree). Anywhere else,
 or if anything in that chain fails, find_call_audio_devices() returns None — "can't tell" — and the
-recorder carries on with its name/level heuristics.
+recorder stays on the devices it's already recording.
 """
 
 from __future__ import annotations

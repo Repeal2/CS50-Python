@@ -585,9 +585,7 @@ class MeetingSession:
             meeting_dir,
             mic_device_name=settings.mic_device_name,
             system_device_name=settings.system_device_name,
-            auto_system_device=settings.auto_switch_audio_devices,
-            auto_microphone=settings.auto_switch_audio_devices,
-            headset_microphone_name=settings.headset_microphone_name,
+            follow_call_app=settings.auto_switch_audio_devices,
         )
         self._screen_text = _ScreenTextLog(meeting_dir / SCREEN_TEXT_FILENAME)
         self._screen_watcher = ScreenWatcher(

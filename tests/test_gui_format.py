@@ -180,7 +180,6 @@ def test_device_from_choice_maps_the_default_label_to_none():
     gui_app = pytest.importorskip("meeting_scribe.gui.app")
     assert gui_app._device_from_choice(gui_app.SYSTEM_DEFAULT_LABEL) is None
     assert gui_app._device_from_choice("Jabra Evolve") == "Jabra Evolve"
-    assert gui_app._device_from_choice(gui_app.AUTO_HEADSET_LABEL, gui_app.AUTO_HEADSET_LABEL) is None
 
 
 def test_meeting_export_text_includes_every_recorded_section_and_skips_empty_ones():
