@@ -1228,7 +1228,11 @@ class Recorder:
                 if retired is not None:
                     retired.set()
                 getattr(self, stream[2]).set()
-            stuck = False
+            # A thread left behind by an earlier switch or reload counts too: terminating PortAudio frees
+            # its stream, and when its read finally returns, closing that stream closes Windows handles a
+            # second time — by then reused by something else entirely (a subprocess, a thread lock),
+            # which Python reports as "The handle is invalid" and can then abort on with a Fatal error.
+            stuck = any(thread.is_alive() for thread, _ in self._orphaned_threads)
             for thread, stream in zip(old_threads, streams):
                 if thread is not None and self._join_capture_thread(thread):
                     self._orphaned_threads.append((thread, stream[0]))
@@ -1514,8 +1518,10 @@ class Recorder:
             nonlocal poll
             polled_once = False
             stream = None
+            # The PortAudio instance the stream belongs to — see the finally block.
+            opened_on = self._pyaudio
             try:
-                stream = self._pyaudio.open(
+                stream = opened_on.open(
                     format=pyaudio_module.paInt16,
                     channels=channels,
                     rate=rate,
@@ -1571,9 +1577,13 @@ class Recorder:
                 if not (stop_event.is_set() or retired.is_set() or self._stopping):
                     self._stream_failed.set()  # the device watcher reopens it — see _recover_failed_streams
             finally:
+                # If PortAudio was restarted (reload_devices) while this thread was blocked, terminating
+                # it already closed this stream; closing it again would close its Windows handles twice.
+                # reload_devices waits for stuck threads, so this is only a backstop.
+                portaudio_gone = self._pyaudio is not opened_on
                 for close in (
-                    getattr(stream, "stop_stream", None),
-                    getattr(stream, "close", None),
+                    None if portaudio_gone else getattr(stream, "stop_stream", None),
+                    None if portaudio_gone else getattr(stream, "close", None),
                     None if retired.is_set() else writer.close,
                 ):
                     try:

@@ -1255,6 +1255,71 @@ def test_reload_devices_keeps_portaudio_when_a_capture_thread_is_stuck(tmp_path,
     assert any("Couldn't reload the audio device list" in n for n in recorder.capture_notices())
 
 
+def test_reload_devices_keeps_portaudio_while_a_thread_from_an_earlier_switch_is_still_stuck(tmp_path):
+    # Terminating PortAudio under a thread a previous switch gave up on frees that thread's stream; when
+    # its read returns, closing the stream again closes Windows handles already reused elsewhere — seen
+    # in the field as "[WinError 6] The handle is invalid" and then a fatal error that took the app down.
+    built_in = _mic("Built-in Mic", 0)
+    speakers = {"name": "Speakers", "index": 1, "maxInputChannels": 0, "defaultSampleRate": 48000}
+    host = _ReloadHost([built_in, speakers], built_in, [_loopback("Speakers [Loopback]", 3)], 1)
+    recorder = _reload_ready_recorder(tmp_path, host)
+    host.recorder = recorder
+    release = threading.Event()
+    stuck = threading.Thread(target=release.wait, daemon=True)
+    stuck.start()
+    recorder._orphaned_threads.append((stuck, "Microphone"))
+    try:
+        recorder.reload_devices()
+        recorder._mic_thread.join(timeout=5)
+        recorder._system_thread.join(timeout=5)
+    finally:
+        release.set()
+        stuck.join(timeout=5)
+
+    assert host.terminated == 0 and recorder._pyaudio_module.created == 0
+    assert any("Couldn't reload the audio device list" in n for n in recorder.capture_notices())
+
+
+def test_reload_devices_restarts_portaudio_once_an_earlier_stuck_thread_has_finished(tmp_path):
+    built_in = _mic("Built-in Mic", 0)
+    speakers = {"name": "Speakers", "index": 1, "maxInputChannels": 0, "defaultSampleRate": 48000}
+    host = _ReloadHost([built_in, speakers], built_in, [_loopback("Speakers [Loopback]", 3)], 1)
+    recorder = _reload_ready_recorder(tmp_path, host)
+    host.recorder = recorder
+    recorder._orphaned_threads.append((_finished_thread(), "Microphone"))
+
+    recorder.reload_devices()
+    recorder._mic_thread.join(timeout=5)
+    recorder._system_thread.join(timeout=5)
+
+    assert host.terminated == 1
+
+
+def test_a_capture_thread_does_not_close_its_stream_again_after_portaudio_was_restarted(tmp_path):
+    # Backstop for the above: terminating PortAudio already closed the stream.
+    recorder = Recorder(tmp_path)
+    writer = _SegmentedWavWriter(tmp_path / "system.wav", 2, SAMPLE_WIDTH_BYTES, 48000)
+    hung = _HungStream(b"\x09\x00\x09\x00" * 5)
+    closed = []
+    hung.stop_stream = lambda: closed.append("stop_stream")
+    hung.close = lambda: closed.append("close")
+    recorder._pyaudio = _FakePyAudio(hung)
+    device = {"name": "Speakers [Loopback]", "index": 5, "maxInputChannels": 2, "defaultSampleRate": 48000}
+    thread = recorder._spawn_capture_thread(
+        SimpleNamespace(paInt16=8), device, writer, "system_level", recorder._system_monitor,
+        "System audio", recorder._system_stop_event,
+    )
+    assert hung.entered_read.wait(timeout=5)
+
+    recorder._pyaudio = _FakePyAudio(_FakeStream([]))  # reload_devices put a new instance in place
+    recorder._system_stop_event.set()
+    hung.release.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert closed == []
+
+
 def test_the_watcher_reloads_devices_when_the_device_signature_changes(tmp_path):
     built_in = _mic("Built-in Mic", 0)
     speakers = {"name": "Speakers", "index": 1, "maxInputChannels": 0, "defaultSampleRate": 48000}
