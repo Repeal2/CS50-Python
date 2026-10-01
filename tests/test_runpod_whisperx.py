@@ -131,6 +131,11 @@ def test_build_payload_includes_huggingface_token_when_given():
     assert "model" not in payload["input"]  # not a recognized field on this worker's schema
 
 
+def test_build_payload_sets_a_batch_size_below_the_workers_default_of_64():
+    payload = _build_payload("https://example.com/a.wav", huggingface_token=None)
+    assert payload["input"]["batch_size"] == 32
+
+
 def test_build_payload_omits_huggingface_token_when_not_given():
     payload = _build_payload("https://example.com/a.wav", huggingface_token=None)
     assert "huggingface_access_token" not in payload["input"]

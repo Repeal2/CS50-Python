@@ -57,6 +57,10 @@ _MAX_CHUNK_SECONDS = 45 * 60
 _CHUNK_OVERLAP_SECONDS = 120.0
 # How many seconds of speech two labels must share in an overlap before they're taken to be one person.
 _MIN_SHARED_SPEECH_SECONDS = 2.0
+# How many of WhisperX's ~30 s speech windows the worker decodes at once. Left unsent, the worker uses 64,
+# which ran a 24 GB GPU out of memory: large-v3 in float16 shares the card with the alignment and pyannote
+# diarization models. Memory grows with this roughly linearly; speed gains flatten well before 64.
+_BATCH_SIZE = 32
 
 
 # A request that fails for a reason that's usually passing — the connection dropped or reset (Windows' error
@@ -460,13 +464,13 @@ def _build_payload(
     vocabulary: str | None = None,
 ) -> dict:
     """kodxana/whisperx-worker_v2's input schema (verified against its rp_schema.py, not just its README):
-    `audio_file` (a URL or base64 audio, not `audio`), `diarization`, and optionally
-    `huggingface_access_token`, which overrides its endpoint-side `HF_TOKEN` env var when given,
+    `audio_file` (a URL or base64 audio, not `audio`), `diarization`, `batch_size` (see _BATCH_SIZE), and
+    optionally `huggingface_access_token`, which overrides its endpoint-side `HF_TOKEN` env var when given,
     `language` (left out to have the worker detect it) and `initial_prompt`, which carries the vocabulary —
     WhisperX decodes every window on its own, so the prompt reaches all of them, not just the first. Its
     schema validator rejects any key it doesn't recognize — there's no `model` parameter to pick a Whisper
     size, so don't add one. Adjust this function if a different worker image ever replaces it."""
-    payload = {"input": {"audio_file": audio_url, "diarization": diarize}}
+    payload = {"input": {"audio_file": audio_url, "diarization": diarize, "batch_size": _BATCH_SIZE}}
     if huggingface_token:
         payload["input"]["huggingface_access_token"] = huggingface_token
     if language:
