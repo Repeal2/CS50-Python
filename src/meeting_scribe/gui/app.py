@@ -59,6 +59,8 @@ from meeting_scribe.session import (
     delete_meeting,
     meeting_in_progress,
     meeting_transcripts,
+    move_meeting,
+    rename_meeting,
     retry_meeting_transcription,
 )
 from meeting_scribe.storage.database import Database, Meeting
@@ -1785,6 +1787,26 @@ class RecordPage(ttk.Frame):
 # --- Library --------------------------------------------------------------------------------------
 
 
+class _ProjectChoiceDialog(simpledialog.Dialog):
+    """Asks for a project: pick an existing one from the list, or type a new name (created on use).
+    `result` is the name, or None if cancelled."""
+
+    def __init__(self, parent: tk.Misc, prompt: str, names: list[str], initial: str):
+        self._prompt, self._names, self._initial = prompt, names, initial
+        super().__init__(parent, "Move meeting")
+
+    def body(self, master):
+        ttk.Label(master, text=self._prompt).pack(anchor="w", padx=8, pady=(8, 4))
+        self._var = tk.StringVar(value=self._initial)
+        combo = ttk.Combobox(master, textvariable=self._var, values=self._names, width=40)
+        combo.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(master, text="Type a new name to create a project.").pack(anchor="w", padx=8, pady=(0, 8))
+        return combo
+
+    def apply(self):
+        self.result = self._var.get()
+
+
 class LibraryPage(ttk.Frame):
     def __init__(self, parent: tk.Misc, app: MeetingScribeApp):
         super().__init__(parent, padding=(28, 24))
@@ -1853,6 +1875,8 @@ class LibraryPage(ttk.Frame):
             ("Attach document", self._upload_document),
             ("Open folder", self._open_folder),
             ("Check for minutes", lambda: self.app.check_for_minutes(report=True)),
+            ("Rename…", self._rename_meeting),
+            ("Move…", self._move_meeting),
             ("Delete…", self._delete_meeting),
         ):
             button = ttk.Button(toolbar, text=text, style="Link.TButton", command=command, state="disabled")
@@ -2146,6 +2170,43 @@ class LibraryPage(ttk.Frame):
         if name is not None:
             self._load_documents(meeting.id)
             self.app.toast(f"Attached {name} to “{meeting.title}”")
+
+    def _rename_meeting(self) -> None:
+        """Renames the selected meeting — one saved under the wrong title."""
+        meeting = self._current
+        if meeting is None:
+            return
+        title = simpledialog.askstring("Rename meeting", "Meeting title:", initialvalue=meeting.title, parent=self)
+        if title is None or title.strip() == meeting.title:
+            return
+        try:
+            rename_meeting(self.app.db, meeting.id, title)
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self.app.refresh_project_lists()
+        self.app.toast(f"Renamed to “{title.strip()}”")
+
+    def _move_meeting(self) -> None:
+        """Moves the selected meeting to another project — one saved under the wrong project."""
+        meeting = self._current
+        if meeting is None:
+            return
+        current = self.app.db.get_project(meeting.project_id)
+        names = [project.name for project in self.app.db.list_projects()]
+        dialog = _ProjectChoiceDialog(self, f"Move “{meeting.title}” to project:", names, current.name if current else "")
+        name = (dialog.result or "").strip()
+        if not name or (current is not None and name == current.name):
+            return
+        try:
+            move_meeting(self.app.db, meeting.id, name)
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        # open_meeting selects the new project, so the meeting stays in view where it now lives.
+        self.app.refresh_project_lists()
+        self.open_meeting(meeting.id)
+        self.app.toast(f"Moved “{meeting.title}” to {name}")
 
     def _delete_meeting(self) -> None:
         """Deletes the selected meeting and everything recorded for it, after asking."""

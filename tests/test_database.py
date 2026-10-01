@@ -117,6 +117,20 @@ def test_move_meeting_to_project_reassigns_it(tmp_path):
         assert db.list_meetings(old_project.id) == []
 
 
+def test_move_meeting_to_project_takes_its_attached_documents_along(tmp_path):
+    with Database(tmp_path / "test.db") as db:
+        old_project = db.create_project("Old Project")
+        new_project = db.create_project("New Project")
+        meeting_id = db.create_meeting(old_project.id, "Kickoff")
+        db.add_document(old_project.id, "agenda.pdf", "agenda", meeting_id=meeting_id)
+        db.add_document(old_project.id, "brief.pdf", "brief")  # the project's own, not the meeting's
+
+        db.move_meeting_to_project(meeting_id, new_project.id)
+
+        assert [row["filename"] for row in db.list_documents(new_project.id)] == ["agenda.pdf"]
+        assert [row["filename"] for row in db.list_documents(old_project.id)] == ["brief.pdf"]
+
+
 def test_set_manual_notes_persists_and_can_be_overwritten(tmp_path):
     with Database(tmp_path / "test.db") as db:
         project = db.create_project("Manual Notes")

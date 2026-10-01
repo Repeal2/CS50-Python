@@ -11,6 +11,7 @@ doesn't wait for the previous one to finish transcribing/saving.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import threading
@@ -931,5 +932,41 @@ def delete_meeting(settings: Settings, db: Database, meeting_id: int) -> list[Pa
             except OSError:
                 left_behind.append(path)
         return left_behind
+    finally:
+        _release_meeting(meeting_id)
+
+
+def rename_meeting(db: Database, meeting_id: int, title: str) -> None:
+    """Renames a meeting from the Library — one saved under the wrong title, say. Raises ValueError if the
+    title is blank, the meeting doesn't exist, or it's being recorded or transcribed right now (the
+    Record page owns the title while recording, and a transcription in flight pushes under the title it
+    started with)."""
+    title = title.strip()
+    if not title:
+        raise ValueError("A meeting needs a title.")
+    with _claimed(meeting_id):
+        if db.get_meeting(meeting_id) is None:
+            raise ValueError(f"No meeting with id {meeting_id}")
+        db.update_meeting_title(meeting_id, title)
+
+
+def move_meeting(db: Database, meeting_id: int, project_name: str) -> None:
+    """Moves a meeting, and the documents attached to it, to the project with this name — created if
+    there isn't one yet. Same rules as rename_meeting."""
+    project_name = project_name.strip()
+    if not project_name:
+        raise ValueError("A project needs a name.")
+    with _claimed(meeting_id):
+        if db.get_meeting(meeting_id) is None:
+            raise ValueError(f"No meeting with id {meeting_id}")
+        db.move_meeting_to_project(meeting_id, db.get_or_create_project(project_name).id)
+
+
+@contextlib.contextmanager
+def _claimed(meeting_id: int):
+    if not _claim_meeting(meeting_id):
+        raise ValueError("That meeting is still being recorded or transcribed — try again once it's done.")
+    try:
+        yield
     finally:
         _release_meeting(meeting_id)

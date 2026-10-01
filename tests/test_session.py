@@ -1853,3 +1853,56 @@ def test_outlook_isnt_asked_unless_settings_say_so(tmp_path):
             retry_meeting_transcription(settings, db, meeting_id)
 
     find_meeting.assert_not_called()
+
+
+def test_a_meeting_can_be_renamed_and_moved_to_another_project_from_the_library(tmp_path):
+    from meeting_scribe.session import meeting_in_progress, move_meeting, rename_meeting
+
+    with Database(tmp_path / "test.db") as db:
+        wrong = db.get_or_create_project("Wrong Project")
+        meeting_id = db.create_meeting(wrong.id, "Wrong title")
+        db.add_document(wrong.id, "agenda.pdf", "agenda", meeting_id=meeting_id)
+
+        rename_meeting(db, meeting_id, "  Board review  ")
+        move_meeting(db, meeting_id, "Right Project")
+
+        meeting = db.get_meeting(meeting_id)
+        right = db.get_project_by_name("Right Project")
+        assert meeting.title == "Board review"
+        assert meeting.project_id == right.id
+        assert [row["filename"] for row in db.list_documents(right.id)] == ["agenda.pdf"]
+        assert db.list_meetings(wrong.id) == []
+    assert not meeting_in_progress(meeting_id)
+
+
+def test_a_meeting_being_recorded_or_transcribed_is_not_renamed_or_moved(tmp_path):
+    from meeting_scribe.session import _claim_meeting, _release_meeting, move_meeting, rename_meeting
+
+    with Database(tmp_path / "test.db") as db:
+        project = db.get_or_create_project("Project")
+        meeting_id = db.create_meeting(project.id, "Standup")
+        assert _claim_meeting(meeting_id)
+        try:
+            with pytest.raises(ValueError, match="still being recorded"):
+                rename_meeting(db, meeting_id, "Other")
+            with pytest.raises(ValueError, match="still being recorded"):
+                move_meeting(db, meeting_id, "Elsewhere")
+        finally:
+            _release_meeting(meeting_id)
+
+        assert db.get_meeting(meeting_id).title == "Standup"
+        assert db.get_project_by_name("Elsewhere") is None
+
+
+def test_renaming_or_moving_to_a_blank_name_is_refused(tmp_path):
+    from meeting_scribe.session import move_meeting, rename_meeting
+
+    with Database(tmp_path / "test.db") as db:
+        project = db.get_or_create_project("Project")
+        meeting_id = db.create_meeting(project.id, "Standup")
+        with pytest.raises(ValueError, match="title"):
+            rename_meeting(db, meeting_id, "   ")
+        with pytest.raises(ValueError, match="name"):
+            move_meeting(db, meeting_id, "")
+        with pytest.raises(ValueError, match="No meeting"):
+            rename_meeting(db, 999, "Anything")

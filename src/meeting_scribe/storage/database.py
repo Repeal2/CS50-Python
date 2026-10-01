@@ -325,10 +325,14 @@ class Database:
         """Reassigns which project a meeting belongs to — like update_meeting_title, editable any time up
         until the meeting ends, not just fixed at Start (see session.MeetingSession.set_project). A pure
         metadata change: the meeting's recording files are keyed by meeting id, not project (see
-        Settings.meeting_dir), so nothing on disk needs to move."""
+        Settings.meeting_dir), so nothing on disk needs to move. Documents attached to the meeting go with
+        it, so they're still listed under the meeting's project."""
         with self._lock:
             self._conn.execute(
                 "UPDATE meetings SET project_id = ? WHERE id = ?", (project_id, meeting_id)
+            )
+            self._conn.execute(
+                "UPDATE documents SET project_id = ? WHERE meeting_id = ?", (project_id, meeting_id)
             )
             self._conn.commit()
 
